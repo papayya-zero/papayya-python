@@ -1,0 +1,115 @@
+"""Factory for creating durable runs."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from papayya._defaults import DEFAULT_BASE_URL
+
+from .run import PapayyaRun
+from .types import CheckpointStore, DurableRunConfig
+
+
+@dataclass
+class PapayyaClientConfig:
+    """Configuration for the papayya() factory."""
+
+    api_key: str | None = None
+    base_url: str | None = None
+    store: CheckpointStore | None = None
+
+
+def _resolve_api_key(explicit: str | None = None) -> str | None:
+    """Resolve API key from explicit param, env vars, or saved config."""
+    if explicit:
+        return explicit
+    key = os.environ.get("PAPAYYA_API_KEY")
+    if key:
+        return key
+    config_path = Path.home() / ".papayya" / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text()).get("api_key")
+        except Exception:
+            pass
+    return None
+
+
+def _resolve_base_url(explicit: str | None = None) -> str:
+    """Resolve base URL from explicit param, env var, or default."""
+    if explicit:
+        return explicit
+    return os.environ.get("PAPAYYA_BASE_URL") or DEFAULT_BASE_URL
+
+
+def _auto_store(api_key: str | None, base_url: str | None) -> CheckpointStore | None:
+    """Create a CloudStore automatically if an API key is available."""
+    resolved_key = _resolve_api_key(api_key)
+    if not resolved_key:
+        return None
+    resolved_url = _resolve_base_url(base_url)
+    from .cloud_store import CloudStore, CloudStoreConfig
+    return CloudStore(CloudStoreConfig(api_key=resolved_key, base_url=resolved_url))
+
+
+class PapayyaClient:
+    """Client for creating durable runs.
+
+    Usage::
+
+        from papayya.durable import papayya
+
+        # Auto-detects API key from env/config → uses CloudStore
+        t = papayya()
+        run = t.run(agent="my-agent", budget_usd=1.0)
+    """
+
+    def __init__(self, config: PapayyaClientConfig | None = None) -> None:
+        self._config = config or PapayyaClientConfig()
+
+    def run(
+        self,
+        agent: str,
+        *,
+        run_id: str | None = None,
+        budget_usd: float | None = None,
+        metadata: dict[str, Any] | None = None,
+        store: CheckpointStore | None = None,
+    ) -> PapayyaRun:
+        """Create a new durable run."""
+        return PapayyaRun(
+            DurableRunConfig(
+                agent=agent,
+                run_id=run_id,
+                budget_usd=budget_usd,
+                metadata=metadata,
+                store=store or self._config.store,
+            )
+        )
+
+
+def papayya(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    store: CheckpointStore | None = None,
+) -> PapayyaClient:
+    """Create a Papayya client for durable agent execution.
+
+    If no store is provided, automatically uses CloudStore when an API key
+    is found (from params, PAPAYYA_API_KEY env var, or ~/.papayya/config.json).
+    Falls back to MemoryStore if no API key is available.
+
+    Usage::
+
+        from papayya.durable import papayya
+
+        t = papayya()  # auto-detects API key, persists to cloud
+        run = t.run(agent="my-agent", budget_usd=0.50)
+    """
+    resolved_store = store or _auto_store(api_key, base_url)
+    return PapayyaClient(PapayyaClientConfig(api_key=api_key, base_url=base_url, store=resolved_store))
