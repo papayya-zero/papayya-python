@@ -1,0 +1,236 @@
+/* Papayya Dev Dashboard — zero-build vanilla CSS.
+   Keep this file under ~300 lines. If it grows, something is wrong. */
+
+:root {
+    --bg:        #0f1115;
+    --panel:     #151922;
+    --panel-2:   #1c2130;
+    --border:    #262d3d;
+    --text:      #e6e9ef;
+    --muted:     #8a93a6;
+    --accent:    #ffb800;   /* papayya yellow */
+    --accent-2:  #ff7a00;
+    --ok:        #4ade80;
+    --warn:      #fbbf24;
+    --err:       #f87171;
+    --info:      #60a5fa;
+    --mono:      ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre {
+    font-family: var(--mono);
+    background: var(--panel-2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+}
+pre { padding: 12px; overflow-x: auto; white-space: pre; }
+
+/* ---- Top bar ---- */
+
+.topbar {
+    display: flex; align-items: center; gap: 24px;
+    padding: 12px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+}
+.brand a { color: var(--text); font-weight: 600; font-size: 16px; }
+.brand .badge {
+    display: inline-block;
+    background: var(--accent); color: #000;
+    padding: 1px 6px; border-radius: 3px;
+    font-size: 11px; font-weight: 700;
+    margin-left: 4px; vertical-align: middle;
+}
+.topnav { display: flex; gap: 18px; flex: 1; }
+.topnav a {
+    color: var(--muted); font-size: 13px;
+    padding: 4px 0;
+    border-bottom: 2px solid transparent;
+}
+.topnav a.active { color: var(--text); border-bottom-color: var(--accent); }
+.right button.refresh {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 12px;
+    font-size: 12px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.right button.refresh:hover { background: var(--border); }
+
+/* ---- Layout ---- */
+
+main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 24px 0 8px; color: var(--muted); font-weight: 500; }
+h2 .count { color: var(--text); font-weight: 600; }
+.subtitle { color: var(--muted); margin-bottom: 24px; }
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px; margin-bottom: 20px;
+}
+
+/* ---- Tables ---- */
+
+table {
+    width: 100%; border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+}
+th, td {
+    text-align: left; padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+th {
+    background: var(--panel-2); font-weight: 500;
+    color: var(--muted); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.05em;
+}
+tr:last-child td { border-bottom: none; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--panel-2); }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 12px; }
+td.muted { color: var(--muted); }
+
+/* ---- Badges ---- */
+
+.pill {
+    display: inline-block;
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.03em;
+}
+.pill-ok      { background: rgba(74,222,128,0.15);  color: var(--ok); }
+.pill-warn    { background: rgba(251,191,36,0.15);  color: var(--warn); }
+.pill-err     { background: rgba(248,113,113,0.15); color: var(--err); }
+.pill-info    { background: rgba(96,165,250,0.15);  color: var(--info); }
+.pill-muted   { background: rgba(138,147,166,0.15); color: var(--muted); }
+
+/* ---- Progress bar ---- */
+
+.progress {
+    position: relative; height: 8px; width: 140px;
+    background: var(--panel-2); border-radius: 4px; overflow: hidden;
+}
+.progress .bar { height: 100%; background: var(--ok); transition: width 200ms; }
+.progress .bar.failed { background: var(--err); }
+.progress-label { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+
+/* ---- Stats row ---- */
+
+.stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px; margin-bottom: 24px;
+}
+.stat {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+}
+.stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.stat .value { font-size: 20px; font-weight: 600; font-family: var(--mono); margin-top: 4px; }
+
+/* ---- Empty state ---- */
+
+.empty {
+    text-align: center; padding: 60px 20px;
+    background: var(--panel); border: 1px dashed var(--border);
+    border-radius: 8px; margin: 24px 0;
+}
+.empty h3 { margin: 0 0 8px; }
+.empty p  { color: var(--muted); margin: 0 0 16px; }
+.empty pre { display: inline-block; text-align: left; margin: 12px 0 0; font-size: 12px; }
+.empty .copy-btn {
+    display: block; margin: 8px auto 0;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px;
+    cursor: pointer; font-size: 11px;
+}
+
+/* ---- Forms (search filters) ---- */
+
+.filter-bar {
+    display: flex; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 16px; align-items: flex-end;
+}
+.filter-bar label {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+}
+.filter-bar input, .filter-bar select {
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 10px;
+    border-radius: 4px; font-size: 13px; min-width: 160px;
+}
+.filter-bar button {
+    background: var(--accent); color: #000; border: none;
+    padding: 7px 16px; border-radius: 4px;
+    cursor: pointer; font-weight: 600;
+}
+
+/* ---- Banners (upgrade card, thrashing) ---- */
+
+.banner {
+    background: linear-gradient(135deg, rgba(255,184,0,0.1), rgba(255,122,0,0.1));
+    border: 1px solid rgba(255,184,0,0.3);
+    border-radius: 8px; padding: 16px 20px; margin-bottom: 20px;
+    display: flex; justify-content: space-between; align-items: center; gap: 20px;
+}
+.banner.warn { background: rgba(248,113,113,0.1); border-color: rgba(248,113,113,0.3); }
+.banner .dismiss {
+    background: transparent; border: none;
+    color: var(--muted); cursor: pointer; font-size: 18px;
+}
+
+/* ---- Step timeline (run detail) ---- */
+
+.timeline .step {
+    display: grid; grid-template-columns: 30px 1fr auto;
+    gap: 12px; padding: 14px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 8px; align-items: center;
+}
+.timeline .idx { color: var(--muted); font-family: var(--mono); text-align: center; }
+.timeline .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.timeline .meta span { margin-right: 14px; }
+
+/* ---- SVG bar chart (cost page) ---- */
+
+.chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.chart text { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
+.chart rect { fill: var(--accent); transition: fill 100ms; }
+.chart rect:hover { fill: var(--accent-2); }
+
+/* ---- Item timeline snapshots (Slice 6) ---- */
+
+.snapshot { margin-top: 8px; }
+.snapshot pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px; margin: 4px 0 0;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    color: var(--fg); overflow-x: auto; max-height: 240px;
+}

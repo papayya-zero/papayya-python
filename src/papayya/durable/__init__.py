@@ -3,9 +3,9 @@
 from .client import PapayyaClient, PapayyaClientConfig, papayya
 from .cloud_store import CloudStore, CloudStoreConfig
 from .run import PapayyaRun
+from .sqlite_store import SQLiteStore
 from .store import FileStore, MemoryStore
 from .types import (
-    BudgetExceededError,
     CheckpointStore,
     DurableRunConfig,
     DurableRunResult,
@@ -20,9 +20,9 @@ __all__ = [
     "PapayyaRun",
     "MemoryStore",
     "FileStore",
+    "SQLiteStore",
     "CloudStore",
     "CloudStoreConfig",
-    "BudgetExceededError",
     "CheckpointStore",
     "DurableRunConfig",
     "DurableRunResult",

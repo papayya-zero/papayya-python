@@ -5,7 +5,6 @@ import tempfile
 import pytest
 
 from papayya.durable import (
-    BudgetExceededError,
     DurableRunConfig,
     FileStore,
     MemoryStore,
@@ -129,48 +128,6 @@ class TestResume:
 
 
 # --------------------------------------------------------------------------- #
-#  Budget enforcement                                                          #
-# --------------------------------------------------------------------------- #
-
-
-class TestBudget:
-    def test_throws_budget_exceeded_error(self) -> None:
-        run = PapayyaRun(DurableRunConfig(agent="test", budget_usd=0.01, store=MemoryStore()))
-        run.record_cost(0.02)
-
-        search = run.task("search", search_web)
-        with pytest.raises(BudgetExceededError):
-            search("test")
-
-    def test_tracks_budget_state(self) -> None:
-        run = PapayyaRun(DurableRunConfig(agent="test", budget_usd=1.0, store=MemoryStore()))
-
-        assert run.budget["consumed_usd"] == 0
-        assert run.budget["limit_usd"] == 1.0
-        assert run.budget["remaining"] == 1.0
-        assert run.budget["exceeded"] is False
-
-        run.record_cost(0.75)
-        assert run.budget["consumed_usd"] == 0.75
-        assert run.budget["remaining"] == 0.25
-        assert run.budget["exceeded"] is False
-
-        run.record_cost(0.30)
-        assert run.budget["exceeded"] is True
-        assert run.budget["remaining"] == 0
-
-    def test_unlimited_budget(self) -> None:
-        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
-
-        assert run.budget["limit_usd"] is None
-        assert run.budget["remaining"] is None
-        assert run.budget["exceeded"] is False
-
-        run.record_cost(1000)
-        assert run.budget["exceeded"] is False
-
-
-# --------------------------------------------------------------------------- #
 #  Task label handling                                                         #
 # --------------------------------------------------------------------------- #
 
@@ -203,6 +160,18 @@ class TestLabels:
 
         result = greet("world")
         assert result == "hello world"
+        assert run.completed_tasks == ["greet"]
+
+    def test_step_is_alias_for_task(self) -> None:
+        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
+
+        assert run.step.__func__ is run.task.__func__
+
+        @run.step("greet")
+        def greet(name: str) -> str:
+            return f"hello {name}"
+
+        assert greet("world") == "hello world"
         assert run.completed_tasks == ["greet"]
 
 
@@ -296,8 +265,6 @@ class TestFileStore:
                     agent="test",
                     tasks=[],
                     status="running",
-                    budget_consumed_usd=0,
-                    budget_limit_usd=None,
                     created_at="2024-01-01T00:00:00Z",
                     updated_at="2024-01-01T00:00:00Z",
                 )
@@ -308,7 +275,6 @@ class TestFileStore:
                 TaskEntry(
                     label="search",
                     result=["hello"],
-                    cost_usd=0.01,
                     duration_ms=100,
                     completed_at="2024-01-01T00:00:01Z",
                 ),
@@ -318,4 +284,3 @@ class TestFileStore:
             assert loaded is not None
             assert len(loaded.tasks) == 1
             assert loaded.tasks[0].label == "search"
-            assert loaded.budget_consumed_usd == 0.01

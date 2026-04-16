@@ -23,7 +23,6 @@ class MemoryStore:
         if run is None:
             raise RuntimeError(f"Run {run_id} not found — call create() first")
         run.tasks.append(entry)
-        run.budget_consumed_usd += entry.cost_usd
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
         run = self._runs.get(run_id)
@@ -56,15 +55,12 @@ class FileStore:
                 TaskEntry(
                     label=t["label"],
                     result=t["result"],
-                    cost_usd=t["cost_usd"],
                     duration_ms=t["duration_ms"],
                     completed_at=t["completed_at"],
                 )
                 for t in data.get("tasks", [])
             ],
             status=data["status"],
-            budget_consumed_usd=data["budget_consumed_usd"],
-            budget_limit_usd=data.get("budget_limit_usd"),
             created_at=data["created_at"],
             updated_at=data["updated_at"],
         )
@@ -74,7 +70,6 @@ class FileStore:
         if run is None:
             raise RuntimeError(f"Run {run_id} not found — call create() first")
         run.tasks.append(entry)
-        run.budget_consumed_usd += entry.cost_usd
         self._write(run)
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
@@ -97,15 +92,12 @@ class FileStore:
                 {
                     "label": t.label,
                     "result": t.result,
-                    "cost_usd": t.cost_usd,
                     "duration_ms": t.duration_ms,
                     "completed_at": t.completed_at,
                 }
                 for t in run.tasks
             ],
             "status": run.status,
-            "budget_consumed_usd": run.budget_consumed_usd,
-            "budget_limit_usd": run.budget_limit_usd,
             "created_at": run.created_at,
             "updated_at": run.updated_at,
         }

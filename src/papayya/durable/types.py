@@ -2,19 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
-
-
-class BudgetExceededError(Exception):
-    """Raised when a run exceeds its budget limit."""
-
-    def __init__(self, consumed_usd: float, limit_usd: float) -> None:
-        self.consumed_usd = consumed_usd
-        self.limit_usd = limit_usd
-        super().__init__(
-            f"Budget exceeded: ${consumed_usd:.4f} consumed, limit is ${limit_usd:.2f}"
-        )
 
 
 @dataclass
@@ -23,9 +12,14 @@ class TaskEntry:
 
     label: str
     result: Any
-    cost_usd: float
     duration_ms: int
     completed_at: str
+    # Slice 6: per-object state snapshots. `item_id` is the user-supplied
+    # record identifier; snapshots are arbitrary JSON-encodable payloads
+    # captured at step boundaries for lineage/drift/replay.
+    item_id: str | None = None
+    input_snapshot: Any = None
+    output_snapshot: Any = None
 
 
 @dataclass
@@ -36,10 +30,9 @@ class RunCheckpoint:
     agent: str
     tasks: list[TaskEntry]
     status: str  # "running" | "completed" | "failed"
-    budget_consumed_usd: float
-    budget_limit_usd: float | None
-    created_at: str
-    updated_at: str
+    created_at: str = ""
+    updated_at: str = ""
+    item_id: str | None = None  # Slice 6: run-level item identifier.
 
 
 @dataclass
@@ -48,9 +41,11 @@ class DurableRunConfig:
 
     agent: str
     run_id: str | None = None
-    budget_usd: float | None = None
     metadata: dict[str, Any] | None = None
     store: CheckpointStore | None = None
+    # Slice 6: run-level item_id. If set, every step inherits this item_id
+    # unless a step overrides it via run.step(..., item_id=...).
+    item_id: str | None = None
 
 
 @dataclass
@@ -61,7 +56,6 @@ class DurableRunResult:
     agent: str
     status: str
     tasks: list[TaskEntry]
-    total_cost_usd: float
     total_duration_ms: int
 
 

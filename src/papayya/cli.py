@@ -573,6 +573,126 @@ def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_i
 
 
 @main.command()
+@click.option("--port", default=8585, help="Port for the dev dashboard")
+@click.option("--host", default="127.0.0.1", help="Host to bind to")
+@click.option("--db", default=".papayya/local.db", help="Path to SQLite database")
+def dev(port: int, host: str, db: str) -> None:
+    """Launch the local development dashboard."""
+    click.echo(f"Starting Papayya Dev Dashboard...")
+    from papayya.dev.server import serve
+    serve(host=host, port=port, db_path=db)
+
+
+@main.group()
+def project() -> None:
+    """Manage local project history (export, import)."""
+
+
+@project.command("export")
+@click.option("--out", required=True, help="Output JSONL file path")
+@click.option("--db",  default=".papayya/local.db", help="Path to SQLite database")
+@click.option(
+    "--include-response-text",
+    is_flag=True,
+    default=False,
+    help="Include raw LLM response text in the export. OFF by default — "
+         "response text may contain PII, customer data, or proprietary "
+         "prompts. Only enable if you've reviewed the data.",
+)
+def project_export(out: str, db: str, include_response_text: bool) -> None:
+    """Export local history (batches, runs, steps) to a JSONL file.
+
+    Intended for uploading to Papayya Cloud after signup so your local
+    dashboard's history comes with you. Until the hosted import endpoint
+    lands, this command is local-only — the output file is saved to
+    disk, not sent anywhere.
+    """
+    import json as _json
+    import sqlite3 as _sqlite
+    from pathlib import Path as _Path
+
+    db_path = _Path(db)
+    if not db_path.exists():
+        click.echo(f"No local database at {db_path.resolve()}", err=True)
+        raise click.exceptions.Exit(1)
+
+    conn = _sqlite.connect(db_path)
+    conn.row_factory = _sqlite.Row
+
+    out_path = _Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = {"batches": 0, "runs": 0, "steps": 0}
+
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in conn.execute("SELECT * FROM batches"):
+            fh.write(_json.dumps({"type": "batch", "data": dict(row)}) + "\n")
+            written["batches"] += 1
+
+        for row in conn.execute("SELECT * FROM runs"):
+            fh.write(_json.dumps({"type": "run", "data": dict(row)}) + "\n")
+            written["runs"] += 1
+
+        for row in conn.execute("SELECT * FROM steps"):
+            data = dict(row)
+            if not include_response_text:
+                data.pop("response_text", None)
+            fh.write(_json.dumps({"type": "step", "data": data}) + "\n")
+            written["steps"] += 1
+
+    conn.close()
+    click.echo(
+        f"Exported {written['batches']} batches, {written['runs']} runs, "
+        f"{written['steps']} steps to {out_path}"
+    )
+    if not include_response_text:
+        click.echo(
+            "Note: LLM response text excluded by default. Re-run with "
+            "--include-response-text to include it."
+        )
+
+
+@project.command("import")
+@click.argument("file")
+def project_import(file: str) -> None:
+    """Import a previously-exported JSONL into Papayya Cloud.
+
+    Stub for now — the hosted import endpoint is not yet live. The
+    command validates the file shape and prints what would be uploaded.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    path = _Path(file)
+    if not path.exists():
+        click.echo(f"File not found: {path}", err=True)
+        raise click.exceptions.Exit(1)
+
+    counts: dict[str, int] = {}
+    for i, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = _json.loads(line)
+        except _json.JSONDecodeError as e:
+            click.echo(f"Line {i}: invalid JSON ({e})", err=True)
+            raise click.exceptions.Exit(1)
+        kind = obj.get("type")
+        if kind not in ("batch", "run", "step"):
+            click.echo(f"Line {i}: unknown record type {kind!r}", err=True)
+            raise click.exceptions.Exit(1)
+        counts[kind] = counts.get(kind, 0) + 1
+
+    click.echo("Validated import file:")
+    plurals = {"batch": "batches", "run": "runs", "step": "steps"}
+    for kind in ("batch", "run", "step"):
+        click.echo(f"  {plurals[kind]}: {counts.get(kind, 0)}")
+    click.echo(
+        "\nHosted import endpoint is not yet live. "
+        "Signup at https://app.getpapayya.com to be notified."
+    )
+
+
+@main.command()
 @click.option("--file", required=True, help="Path to agent definition file")
 @click.option("--input", "input_text", required=True, help="Input for the agent")
 @click.option("--local", "use_local", is_flag=True, default=False, help="Run locally (no cloud needed)")

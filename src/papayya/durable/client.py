@@ -46,14 +46,15 @@ def _resolve_base_url(explicit: str | None = None) -> str:
     return os.environ.get("PAPAYYA_BASE_URL") or DEFAULT_BASE_URL
 
 
-def _auto_store(api_key: str | None, base_url: str | None) -> CheckpointStore | None:
-    """Create a CloudStore automatically if an API key is available."""
+def _auto_store(api_key: str | None, base_url: str | None) -> CheckpointStore:
+    """Auto-select store: CloudStore if API key available, else SQLiteStore."""
     resolved_key = _resolve_api_key(api_key)
-    if not resolved_key:
-        return None
-    resolved_url = _resolve_base_url(base_url)
-    from .cloud_store import CloudStore, CloudStoreConfig
-    return CloudStore(CloudStoreConfig(api_key=resolved_key, base_url=resolved_url))
+    if resolved_key:
+        resolved_url = _resolve_base_url(base_url)
+        from .cloud_store import CloudStore, CloudStoreConfig
+        return CloudStore(CloudStoreConfig(api_key=resolved_key, base_url=resolved_url))
+    from .sqlite_store import SQLiteStore
+    return SQLiteStore()
 
 
 class PapayyaClient:
@@ -65,7 +66,7 @@ class PapayyaClient:
 
         # Auto-detects API key from env/config → uses CloudStore
         t = papayya()
-        run = t.run(agent="my-agent", budget_usd=1.0)
+        run = t.run(agent="my-agent")
     """
 
     def __init__(self, config: PapayyaClientConfig | None = None) -> None:
@@ -76,7 +77,6 @@ class PapayyaClient:
         agent: str,
         *,
         run_id: str | None = None,
-        budget_usd: float | None = None,
         metadata: dict[str, Any] | None = None,
         store: CheckpointStore | None = None,
     ) -> PapayyaRun:
@@ -85,7 +85,6 @@ class PapayyaClient:
             DurableRunConfig(
                 agent=agent,
                 run_id=run_id,
-                budget_usd=budget_usd,
                 metadata=metadata,
                 store=store or self._config.store,
             )
@@ -109,7 +108,7 @@ def papayya(
         from papayya.durable import papayya
 
         t = papayya()  # auto-detects API key, persists to cloud
-        run = t.run(agent="my-agent", budget_usd=0.50)
+        run = t.run(agent="my-agent")
     """
     resolved_store = store or _auto_store(api_key, base_url)
     return PapayyaClient(PapayyaClientConfig(api_key=api_key, base_url=base_url, store=resolved_store))

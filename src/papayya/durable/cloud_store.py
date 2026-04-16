@@ -47,18 +47,19 @@ class CloudStore:
             run_id=body["run_id"],
             agent=body["agent"],
             status=body["status"],
-            budget_consumed_usd=body["budget_consumed_usd"],
-            budget_limit_usd=body.get("budget_limit_usd"),
             tasks=[
                 TaskEntry(
                     label=cp["label"],
                     result=cp["result"],
-                    cost_usd=cp["cost_usd"],
                     duration_ms=cp["duration_ms"],
                     completed_at=cp["completed_at"],
+                    item_id=cp.get("item_id"),
+                    input_snapshot=cp.get("input_snapshot"),
+                    output_snapshot=cp.get("output_snapshot"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
+            item_id=body.get("item_id"),
             created_at=body["created_at"],
             updated_at=body["updated_at"],
         )
@@ -69,7 +70,7 @@ class CloudStore:
             json={
                 "run_id": checkpoint.run_id,
                 "agent": checkpoint.agent,
-                "budget_limit_usd": checkpoint.budget_limit_usd,
+                "item_id": checkpoint.item_id,
             },
         )
         resp.raise_for_status()
@@ -80,12 +81,12 @@ class CloudStore:
             json={
                 "label": entry.label,
                 "result": entry.result,
-                "cost_usd": entry.cost_usd,
                 "duration_ms": entry.duration_ms,
+                "item_id": entry.item_id,
+                "input_snapshot": entry.input_snapshot,
+                "output_snapshot": entry.output_snapshot,
             },
         )
-        if resp.status_code == 402:
-            raise RuntimeError("Budget exceeded")
         resp.raise_for_status()
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:

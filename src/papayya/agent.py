@@ -44,6 +44,7 @@ class AgentRegistration:
     tools: list[ToolDefinition]
     max_steps: int
     budget_usd: float | None
+    durable: bool = False
 
 
 # Global registry, keyed by agent name (slug)
@@ -71,6 +72,7 @@ def agent(
     tools: list[ToolDefinition] | None = None,
     max_steps: int = 50,
     budget_usd: float | None = None,
+    durable: bool = False,
 ) -> Callable:
     """Decorator that registers a function as a deployable agent.
 
@@ -96,6 +98,7 @@ def agent(
             tools=tools or [],
             max_steps=max_steps,
             budget_usd=budget_usd,
+            durable=durable,
         )
         _registry[name] = registration
 
