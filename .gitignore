@@ -11,4 +11,5 @@ build/
 .papayya/
 .venv/
 venv/
+.env
 .DS_Store

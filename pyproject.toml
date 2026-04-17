@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papayya"
-version = "0.1.0"
+version = "0.1.1"
 description = "Durable background jobs for AI agents"
 readme = "README.md"
 requires-python = ">=3.10"
