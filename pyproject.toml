@@ -30,9 +30,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://papayya.com"
-Documentation = "https://docs.papayya.com"
-Repository = "https://github.com/papayya-zero/sdk-python"
+Homepage = "https://getpapayya.com"
+Documentation = "https://docs.getpapayya.com"
+Repository = "https://github.com/papayya-zero/papayya-python"
 
 [project.scripts]
 papayya = "papayya.cli:main"
