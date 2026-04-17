@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import click
 
@@ -985,3 +985,231 @@ def worker(ctx: click.Context, file: str, poll_interval: float) -> None:
         run_worker(agent, api, poll_interval=poll_interval)
     finally:
         api.close()
+
+
+# ---------------------------------------------------------------------------
+# batch — submit / inspect / cancel / retry batches
+# ---------------------------------------------------------------------------
+
+def _make_papayya_client(ctx: click.Context) -> Any:
+    """Resolve auth and return a Papayya client, exiting with a friendly
+    error if no API key is configured. Callers are responsible for
+    ``client.close()`` in a finally block."""
+    from papayya import Papayya
+
+    resolved_key = _resolve_api_key(ctx.obj["api_key"])
+    if not resolved_key:
+        click.echo(
+            "Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.",
+            err=True,
+        )
+        sys.exit(1)
+    return Papayya(api_key=resolved_key, base_url=ctx.obj["base_url"])
+
+
+def _iter_jsonl_items(path: str) -> Iterator[dict[str, Any]]:
+    """Yield one dict per non-blank line of a JSONL file.
+
+    Each line must be a JSON object — we don't reshape it. The SDK accepts
+    ``{"input": ..., "metadata"?: ...}`` and the backend enforces the
+    schema, so bad rows surface as a 400 from the stream endpoint rather
+    than here.
+    """
+    filepath = Path(path)
+    if not filepath.exists():
+        click.echo(f"Error: File not found: {filepath}", err=True)
+        sys.exit(1)
+
+    with filepath.open("r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as e:
+                click.echo(f"Error: {filepath}:{lineno}: invalid JSON ({e})", err=True)
+                sys.exit(1)
+
+
+@main.group()
+def batch() -> None:
+    """Submit and manage batches of runs."""
+
+
+@batch.command("submit")
+@click.option("--agent", "agent_id", required=True, help="Agent ID to run each item against")
+@click.option("--file", "file_path", required=True, type=click.Path(exists=False), help="JSONL file — one item per line, e.g. {\"input\": ..., \"metadata\"?: ...}")
+@click.option("--budget", "budget_dollars", type=float, default=None, help="Total batch budget in whole dollars (converted to cents)")
+@click.option("--concurrency", "concurrency_cap", type=int, default=None, help="Max concurrent runs the dispatcher will launch")
+@click.option("--name", "name", default=None, help="Human-readable batch label")
+@click.option("--callback-url", "callback_url", default=None, help="Webhook URL invoked on terminal batch status")
+@click.option("--idempotency-key", "idempotency_key", default=None, help="Client-supplied key to dedupe duplicate submissions")
+@click.pass_context
+def batch_submit(
+    ctx: click.Context,
+    agent_id: str,
+    file_path: str,
+    budget_dollars: float | None,
+    concurrency_cap: int | None,
+    name: str | None,
+    callback_url: str | None,
+    idempotency_key: str | None,
+) -> None:
+    """Submit a batch of runs from a JSONL file.
+
+    Always uses the NDJSON streaming path — no item ceiling, only a 1 GiB
+    byte guard enforced by the backend. Prints the batch ID on success.
+    """
+    budget_cents_cap = int(round(budget_dollars * 100)) if budget_dollars is not None else None
+
+    client = _make_papayya_client(ctx)
+    try:
+        result = client.batches.create_stream(
+            agent_id=agent_id,
+            items=_iter_jsonl_items(file_path),
+            name=name,
+            budget_cents_cap=budget_cents_cap,
+            concurrency_cap=concurrency_cap,
+            callback_url=callback_url,
+            idempotency_key=idempotency_key,
+        )
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Batch submitted: {result.get('id', '?')}")
+    status_val = result.get("status")
+    if status_val:
+        click.echo(f"  Status: {status_val}")
+    total = result.get("total_items")
+    if total is not None:
+        click.echo(f"  Items:  {total}")
+
+
+@batch.command("status")
+@click.argument("batch_id")
+@click.pass_context
+def batch_status(ctx: click.Context, batch_id: str) -> None:
+    """Show aggregate status of a batch."""
+    client = _make_papayya_client(ctx)
+    try:
+        b = client.batches.get(batch_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Batch:     {b.get('id', batch_id)}")
+    if b.get("name"):
+        click.echo(f"Name:      {b['name']}")
+    click.echo(f"Status:    {b.get('status', '?')}")
+    click.echo(f"Agent:     {b.get('agent_id', '?')}")
+
+    total = b.get("total_items", 0) or 0
+    completed = b.get("completed", 0) or 0
+    failed = b.get("failed", 0) or 0
+    paused = b.get("paused", 0) or 0
+    click.echo(f"Items:     {completed}/{total} completed, {failed} failed, {paused} paused")
+
+    cost = b.get("aggregate_cost_cents", 0) or 0
+    cap = b.get("budget_cents_cap")
+    if cap:
+        click.echo(f"Cost:      {cost}¢ / {cap}¢")
+    else:
+        click.echo(f"Cost:      {cost}¢ (no cap)")
+
+    if b.get("created_at"):
+        click.echo(f"Created:   {b['created_at']}")
+
+
+@batch.command("results")
+@click.argument("batch_id")
+@click.option("-o", "--output", "output_path", default=None, help="Output JSONL path (default: stdout)")
+@click.option("--include-failed", is_flag=True, default=False, help="Also stream failed/cancelled/budget_exceeded runs")
+@click.option("--poll-interval", type=float, default=2.0, help="Polling cadence in seconds")
+@click.pass_context
+def batch_results(
+    ctx: click.Context,
+    batch_id: str,
+    output_path: str | None,
+    include_failed: bool,
+    poll_interval: float,
+) -> None:
+    """Stream completed child runs of a batch as JSON lines.
+
+    Blocks until the batch reaches a terminal status. Writes one JSON
+    object per line, containing the raw run record as returned by
+    ``GET /v1/batches/{id}/runs``.
+    """
+    client = _make_papayya_client(ctx)
+
+    # stdout or file, opened the same way so the write loop is identical.
+    if output_path is None:
+        sink = sys.stdout
+        close_sink = False
+    else:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        sink = out.open("w", encoding="utf-8")
+        close_sink = True
+
+    count = 0
+    try:
+        for run in client.batches.stream_results(
+            batch_id,
+            poll_interval=poll_interval,
+            include_failed=include_failed,
+        ):
+            sink.write(json.dumps(run) + "\n")
+            sink.flush()
+            count += 1
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        if close_sink:
+            sink.close()
+        client.close()
+
+    if output_path is not None:
+        click.echo(f"Wrote {count} run(s) to {output_path}")
+
+
+@batch.command("cancel")
+@click.argument("batch_id")
+@click.pass_context
+def batch_cancel(ctx: click.Context, batch_id: str) -> None:
+    """Cancel a batch. Fan-out happens server-side; this returns 202."""
+    client = _make_papayya_client(ctx)
+    try:
+        b = client.batches.cancel(batch_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Batch {b.get('id', batch_id)} cancellation accepted (status: {b.get('status', '?')})")
+
+
+@batch.command("retry")
+@click.argument("batch_id")
+@click.option("--failed", "retry_failed_flag", is_flag=True, required=True, help="Re-enqueue every failed child (currently the only retry mode)")
+@click.pass_context
+def batch_retry(ctx: click.Context, batch_id: str, retry_failed_flag: bool) -> None:
+    """Re-enqueue failed children of a batch as new runs."""
+    del retry_failed_flag  # --failed is required; no other mode exists yet
+
+    client = _make_papayya_client(ctx)
+    try:
+        b = client.batches.retry_failed(batch_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Batch {b.get('id', batch_id)} re-enqueued (total_items now {b.get('total_items', '?')})")
