@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from papayya.api import APIClient, resolve_config
 from papayya.resources.runs import Runs
+from papayya.resources.batches import Batches
 from papayya.resources.schedules import Schedules
 from papayya.resources.webhooks import Webhooks
 from papayya.resources.agents import Agents
@@ -26,6 +27,7 @@ class Papayya:
 
     All platform operations are available through namespaced resources:
         papayya.runs.create(...)
+        papayya.batches.create(...)
         papayya.schedules.create(...)
         papayya.webhooks.create(...)
         papayya.agents.list()
@@ -42,6 +44,7 @@ class Papayya:
         self._api = APIClient(config)
 
         self.runs = Runs(self._api)
+        self.batches = Batches(self._api)
         self.schedules = Schedules(self._api)
         self.webhooks = Webhooks(self._api)
         self.agents = Agents(self._api)
