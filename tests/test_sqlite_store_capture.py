@@ -361,6 +361,86 @@ class TestCaptureDisabled:
 # --------------------------------------------------------------------------- #
 
 
+class TestLlmKindRoundTrip:
+    """A ``kind="llm"`` TaskEntry persists and loads back identically.
+
+    Guards the SQLite side of the BYOF observability feature: if any of
+    the eight v5 columns get silently dropped on write or decode, the
+    dashboard sees missing usage data and the feature breaks without
+    raising.
+    """
+
+    def test_llm_task_round_trips(self, store: SQLiteStore) -> None:
+        store.create(_checkpoint("run-1"))
+        entry = TaskEntry(
+            label="call-openai",
+            result={"ok": True},
+            duration_ms=250,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            kind="llm",
+            llm_prompt_tokens=100,
+            llm_completion_tokens=30,
+            llm_total_tokens=130,
+            llm_model="gpt-4o-mini",
+            llm_stop_reason="stop",
+            llm_provider_shape="openai",
+            error_category=None,
+        )
+        store.save_task("run-1", entry)
+
+        loaded = store.load("run-1")
+        assert loaded is not None
+        assert len(loaded.tasks) == 1
+        got = loaded.tasks[0]
+        assert got.kind == "llm"
+        assert got.llm_prompt_tokens == 100
+        assert got.llm_completion_tokens == 30
+        assert got.llm_total_tokens == 130
+        assert got.llm_model == "gpt-4o-mini"
+        assert got.llm_stop_reason == "stop"
+        assert got.llm_provider_shape == "openai"
+        assert got.error_category is None
+
+    def test_non_llm_task_stores_nulls(self, store: SQLiteStore) -> None:
+        """A plain step (no ``kind``) must round-trip with LLM fields as None."""
+        store.create(_checkpoint("run-1"))
+        entry = TaskEntry(
+            label="plain",
+            result="ok",
+            duration_ms=10,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        store.save_task("run-1", entry)
+
+        loaded = store.load("run-1")
+        assert loaded is not None
+        got = loaded.tasks[0]
+        assert got.kind is None
+        assert got.llm_prompt_tokens is None
+        assert got.llm_provider_shape is None
+        assert got.error_category is None
+
+    def test_error_category_round_trips(self, store: SQLiteStore) -> None:
+        """``error_category`` persists independently of the LLM usage fields."""
+        store.create(_checkpoint("run-1"))
+        entry = TaskEntry(
+            label="classified-failure",
+            result=None,
+            duration_ms=50,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            kind="llm",
+            llm_provider_shape="unknown",
+            error_category="provider",
+        )
+        store.save_task("run-1", entry)
+
+        loaded = store.load("run-1")
+        assert loaded is not None
+        got = loaded.tasks[0]
+        assert got.error_category == "provider"
+        assert got.llm_provider_shape == "unknown"
+
+
 class TestWriteOverhead:
     """Guard the 10%-overhead budget called out in LOCAL_DEV_EXECUTION.md.
 

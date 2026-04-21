@@ -270,6 +270,47 @@ class TestRunEndpoints:
         assert status == 200
         assert len(body) >= 1
 
+    def test_run_tasks_exposes_llm_fields(
+        self, seeded_server: tuple[str, Path], tmp_path: Path
+    ) -> None:
+        """The /tasks endpoint returns the v5 BYOF observability fields.
+
+        pageRun in app.js depends on these being present on the row so
+        renderLlmBadges can decide what to draw. If the handler ever
+        stops returning them (e.g. a SELECT narrowed beyond `*`), the
+        dashboard silently loses the badges.
+        """
+        base, db_path = seeded_server
+        store = SQLiteStore(str(db_path))
+        store.create(_checkpoint("run-llm"))
+        store.save_task(
+            "run-llm",
+            TaskEntry(
+                label="call-gemini",
+                result={"ok": True},
+                duration_ms=240,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                kind="llm",
+                llm_prompt_tokens=40,
+                llm_completion_tokens=10,
+                llm_total_tokens=50,
+                llm_model="gemini-2.0-flash",
+                llm_stop_reason="STOP",
+                llm_provider_shape="gemini",
+            ),
+        )
+        store.close()
+
+        status, body = _get(base, "/api/runs/run-llm/tasks")
+        assert status == 200
+        assert len(body) == 1
+        row = body[0]
+        assert row["kind"] == "llm"
+        assert row["llm_provider_shape"] == "gemini"
+        assert row["llm_total_tokens"] == 50
+        assert row["llm_model"] == "gemini-2.0-flash"
+        assert row["llm_stop_reason"] == "STOP"
+
 
 class TestCancelEndpoint:
     def test_cancel_running_batch(

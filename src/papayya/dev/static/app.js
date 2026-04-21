@@ -309,9 +309,9 @@
 
         Promise.all([
             fetchJSON("/api/runs/" + encodeURIComponent(runId)),
-            fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/steps"),
+            fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/tasks"),
             fetchJSON("/api/thrashing?run_id=" + encodeURIComponent(runId)).catch(() => []),
-        ]).then(([run, steps, thrash]) => {
+        ]).then(([run, tasks, thrash]) => {
             const header = el("div", null,
                 el("h1", null, "Run ", el("code", null, run.run_id), " ", badgeForStatus(run.status)),
                 el("p", { class: "subtitle" }, run.agent,
@@ -319,7 +319,7 @@
                     run.item_id ? el("span", null, " · ", el("a", { href: "/item?id=" + encodeURIComponent(run.item_id) }, "item " + run.item_id)) : ""));
 
             const stats = el("div", { class: "stats-row" },
-                stat("Steps", steps.length),
+                stat("Steps", tasks.length),
                 stat("Started", timeAgo(run.created_at)));
 
             const thrashBanner = thrash && thrash.length
@@ -332,27 +332,50 @@
                             " times with identical input — a common sign of a model loop or missing stop condition.")))
                 : null;
 
-            const timeline = steps.length
+            const timeline = tasks.length
                 ? el("div", { class: "timeline" },
-                    ...steps.map((s) => el("div", { class: "step" },
-                        el("div", { class: "idx" }, "#" + s.step_index),
+                    ...tasks.map((t, i) => el("div", { class: "step" },
+                        el("div", { class: "idx" }, "#" + (i + 1)),
                         el("div", null,
                             el("div", null,
-                                s.task_label || el("em", null, "untitled"),
+                                t.label || el("em", null, "untitled"),
                                 " ",
-                                s.tool_name ? renderBadge("info", s.tool_name) : null,
+                                ...renderLlmBadges(t),
                                 " ",
-                                s.error_category ? badgeForErrorCategory(s.error_category) : null),
+                                t.error_category ? badgeForErrorCategory(t.error_category) : null),
                             el("div", { class: "meta" },
-                                el("span", null, s.model),
-                                el("span", null, fmtDuration(s.duration_ms)))),
-                        el("div", null, timeAgo(s.created_at)))))
+                                t.kind === "llm" && t.llm_model ? el("span", null, t.llm_model) : null,
+                                el("span", null, fmtDuration(t.duration_ms)))),
+                        el("div", null, timeAgo(t.completed_at)))))
                 : el("div", { class: "empty" },
                     el("h3", null, "No steps yet"),
-                    el("p", null, "Steps appear when the agent makes an LLM call or tool invocation."));
+                    el("p", null, "Steps appear when the agent wraps work in run.step(...) or run.step(..., kind=\"llm\")."));
 
             mount(el("div", null, header, thrashBanner, stats, timeline));
         }).catch(showError);
+    }
+
+    // Render badges for a task's LLM usage metadata. Returns an array of
+    // nodes (possibly empty) so callers can spread them into a parent.
+    // Only emits anything when the task was wrapped with kind="llm".
+    function renderLlmBadges(t) {
+        if (t.kind !== "llm") return [];
+        const out = [];
+        if (t.llm_provider_shape) {
+            out.push(renderBadge("info", t.llm_provider_shape));
+            out.push(" ");
+        }
+        if (t.llm_total_tokens != null) {
+            out.push(renderBadge("muted", fmtInt(t.llm_total_tokens) + " tok"));
+            out.push(" ");
+        }
+        if (t.llm_stop_reason && t.llm_stop_reason !== "stop" && t.llm_stop_reason !== "end_turn") {
+            // Only surface non-standard stop reasons — "length" and
+            // provider-specific cutoffs are the ones worth flagging.
+            out.push(renderBadge("warn", t.llm_stop_reason));
+            out.push(" ");
+        }
+        return out;
     }
 
     // ----- page: item timeline (Slice 6) -----
@@ -414,9 +437,14 @@
                 el("div", null,
                     t.label || el("em", null, "untitled"),
                     " ",
-                    t.run_agent ? renderBadge("info", t.run_agent) : null),
+                    t.run_agent ? renderBadge("info", t.run_agent) : null,
+                    " ",
+                    ...renderLlmBadges(t),
+                    " ",
+                    t.error_category ? badgeForErrorCategory(t.error_category) : null),
                 el("div", { class: "meta" },
                     el("a", { href: "/run?id=" + encodeURIComponent(t.run_id) }, "run " + t.run_id),
+                    t.kind === "llm" && t.llm_model ? el("span", null, t.llm_model) : null,
                     el("span", null, fmtDuration(t.duration_ms))),
                 diffBadges,
                 snapshotBlock("input", inSnap),

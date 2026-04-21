@@ -277,6 +277,23 @@ _V4_DROP_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
+# v5: BYOF observability columns on tasks. All nullable — a non-LLM step
+# (kind is None) writes nulls; an LLM step whose provider shape wasn't
+# recognised writes nulls for the token/model/stop_reason fields and
+# "unknown" for provider_shape. error_category fills only on classified
+# provider exceptions.
+_V5_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_TASKS, _schema.COL_TASK_KIND, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_PROMPT_TOKENS, "INTEGER"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_COMPLETION_TOKENS, "INTEGER"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_TOTAL_TOKENS, "INTEGER"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_MODEL, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_STOP_REASON, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_PROVIDER_SHAPE, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_ERROR_CATEGORY, "TEXT"),
+]
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -378,13 +395,23 @@ def _apply_v3_to_v4(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "4")
 
 
+def _apply_v4_to_v5(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "4")
+    with conn:
+        for table, column, type_decl in _V5_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        _set_schema_version(conn, "5")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → v3 → v4) so long-dormant local DBs catch up cleanly.
+    (e.g. v1 → v2 → v3 → v4 → v5) so long-dormant local DBs catch up cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -397,6 +424,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "3":
             _apply_v3_to_v4(conn, db_path)
             current = "4"
+        elif current == "4":
+            _apply_v4_to_v5(conn, db_path)
+            current = "5"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -439,6 +469,14 @@ class SQLiteStore:
                 item_id=t[_schema.COL_TASK_ITEM_ID],
                 input_snapshot=_decode_snapshot(t[_schema.COL_TASK_INPUT_SNAPSHOT]),
                 output_snapshot=_decode_snapshot(t[_schema.COL_TASK_OUTPUT_SNAPSHOT]),
+                kind=t[_schema.COL_TASK_KIND],
+                llm_prompt_tokens=t[_schema.COL_TASK_LLM_PROMPT_TOKENS],
+                llm_completion_tokens=t[_schema.COL_TASK_LLM_COMPLETION_TOKENS],
+                llm_total_tokens=t[_schema.COL_TASK_LLM_TOTAL_TOKENS],
+                llm_model=t[_schema.COL_TASK_LLM_MODEL],
+                llm_stop_reason=t[_schema.COL_TASK_LLM_STOP_REASON],
+                llm_provider_shape=t[_schema.COL_TASK_LLM_PROVIDER_SHAPE],
+                error_category=t[_schema.COL_TASK_ERROR_CATEGORY],
             )
             for t in task_rows
         ]
@@ -462,8 +500,16 @@ class SQLiteStore:
                 f"""INSERT INTO tasks (run_id, label, result, duration_ms, completed_at,
                    {_schema.COL_TASK_ITEM_ID},
                    {_schema.COL_TASK_INPUT_SNAPSHOT},
-                   {_schema.COL_TASK_OUTPUT_SNAPSHOT})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_TASK_OUTPUT_SNAPSHOT},
+                   {_schema.COL_TASK_KIND},
+                   {_schema.COL_TASK_LLM_PROMPT_TOKENS},
+                   {_schema.COL_TASK_LLM_COMPLETION_TOKENS},
+                   {_schema.COL_TASK_LLM_TOTAL_TOKENS},
+                   {_schema.COL_TASK_LLM_MODEL},
+                   {_schema.COL_TASK_LLM_STOP_REASON},
+                   {_schema.COL_TASK_LLM_PROVIDER_SHAPE},
+                   {_schema.COL_TASK_ERROR_CATEGORY})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -473,6 +519,14 @@ class SQLiteStore:
                     entry.item_id,
                     input_snapshot_json,
                     output_snapshot_json,
+                    entry.kind,
+                    entry.llm_prompt_tokens,
+                    entry.llm_completion_tokens,
+                    entry.llm_total_tokens,
+                    entry.llm_model,
+                    entry.llm_stop_reason,
+                    entry.llm_provider_shape,
+                    entry.error_category,
                 ),
             )
             self._conn.execute(

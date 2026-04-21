@@ -55,8 +55,22 @@ COL_TASK_OUTPUT_SNAPSHOT = "output_snapshot"
 COL_RUN_ITEM_ID = "item_id"
 
 
+# v5 columns — BYOF observability fields captured by run.step(kind="llm").
+# Nullable: only populate when the caller passes kind="llm" and the provider
+# shape is recognized. error_category fills on provider exceptions classified
+# by the SDK's shared classifier (provider/timeout/tool/logic).
+COL_TASK_KIND = "kind"
+COL_TASK_LLM_PROMPT_TOKENS = "llm_prompt_tokens"
+COL_TASK_LLM_COMPLETION_TOKENS = "llm_completion_tokens"
+COL_TASK_LLM_TOTAL_TOKENS = "llm_total_tokens"
+COL_TASK_LLM_MODEL = "llm_model"
+COL_TASK_LLM_STOP_REASON = "llm_stop_reason"
+COL_TASK_LLM_PROVIDER_SHAPE = "llm_provider_shape"
+COL_TASK_ERROR_CATEGORY = "error_category"
+
+
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 # Indexes — named explicitly so we can check for their presence in tests

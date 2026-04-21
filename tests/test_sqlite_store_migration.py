@@ -1,4 +1,4 @@
-"""Tests for the SQLite store forward-migration chain (v1 → v4).
+"""Tests for the SQLite store forward-migration chain (v1 → v5).
 
 Guards three properties the ``LOCAL_DEV_EXECUTION.md`` plan pins down:
 
@@ -6,8 +6,8 @@ Guards three properties the ``LOCAL_DEV_EXECUTION.md`` plan pins down:
 2. Idempotent — re-opening a current-version DB is a no-op with no ALTERs attempted.
 3. Atomic — a mid-migration crash leaves the DB at its prior version, not a half state.
 
-Plus a v4-specific check that budget/cost/token columns are dropped by
-v3→v4.
+Plus version-specific checks: v3→v4 drops the budget/cost/token columns,
+and v4→v5 adds the BYOF observability columns on tasks.
 
 The v1 fixture is built from code rather than a checked-in binary because
 the v1 schema is short and reproducible. If that ever stops being true,
@@ -22,7 +22,12 @@ from pathlib import Path
 import pytest
 
 from papayya.durable import _schema
-from papayya.durable.sqlite_store import SQLiteStore
+from papayya.durable.sqlite_store import (
+    SQLiteStore,
+    _apply_v1_to_v2,
+    _apply_v2_to_v3,
+    _apply_v3_to_v4,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +168,20 @@ class TestFreshInstall:
         assert _schema.IDX_STEPS_ERROR in indexes
         assert _schema.IDX_RUNS_BATCH in indexes
 
+    def test_fresh_db_has_llm_columns(self, tmp_db: Path) -> None:
+        """v5 adds BYOF observability fields to the tasks table."""
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert _schema.COL_TASK_KIND in task_cols
+        assert _schema.COL_TASK_LLM_PROMPT_TOKENS in task_cols
+        assert _schema.COL_TASK_LLM_COMPLETION_TOKENS in task_cols
+        assert _schema.COL_TASK_LLM_TOTAL_TOKENS in task_cols
+        assert _schema.COL_TASK_LLM_MODEL in task_cols
+        assert _schema.COL_TASK_LLM_STOP_REASON in task_cols
+        assert _schema.COL_TASK_LLM_PROVIDER_SHAPE in task_cols
+        assert _schema.COL_TASK_ERROR_CATEGORY in task_cols
+
     def test_fresh_db_drops_budget_and_cost_columns(self, tmp_db: Path) -> None:
         """v4 removes budget/cost/token columns. Fresh DBs end up v4 after the
         migration chain runs."""
@@ -252,6 +271,69 @@ class TestV1Migration:
         runs = conn.execute("SELECT run_id FROM runs").fetchall()
         assert [r[0] for r in runs] == ["run-1"]
         conn.close()
+
+
+class TestV4ToV5Migration:
+    """Exercise the v4→v5 step specifically.
+
+    A v4-shaped DB is built by running the v1→v4 migrations manually, then
+    ``SQLiteStore`` is opened to trigger v4→v5 in isolation.
+    """
+
+    def _build_v4_db(self, tmp_db: Path) -> None:
+        _build_v1_db(tmp_db)
+        conn = sqlite3.connect(tmp_db)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _apply_v1_to_v2(conn, tmp_db)
+            _apply_v2_to_v3(conn, tmp_db)
+            _apply_v3_to_v4(conn, tmp_db)
+        finally:
+            conn.close()
+
+    def test_v4_db_bumps_to_v5(self, tmp_db: Path) -> None:
+        self._build_v4_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        version = conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert version == "5"
+
+    def test_v4_db_adds_llm_columns_as_null(self, tmp_db: Path) -> None:
+        self._build_v4_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        task = conn.execute("SELECT * FROM tasks WHERE run_id='run-1'").fetchone()
+        assert task[_schema.COL_TASK_KIND] is None
+        assert task[_schema.COL_TASK_LLM_PROMPT_TOKENS] is None
+        assert task[_schema.COL_TASK_LLM_COMPLETION_TOKENS] is None
+        assert task[_schema.COL_TASK_LLM_TOTAL_TOKENS] is None
+        assert task[_schema.COL_TASK_LLM_MODEL] is None
+        assert task[_schema.COL_TASK_LLM_STOP_REASON] is None
+        assert task[_schema.COL_TASK_LLM_PROVIDER_SHAPE] is None
+        assert task[_schema.COL_TASK_ERROR_CATEGORY] is None
+
+    def test_v4_to_v5_preserves_existing_rows(self, tmp_db: Path) -> None:
+        self._build_v4_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='run-1'").fetchone()
+        task = conn.execute("SELECT * FROM tasks WHERE run_id='run-1'").fetchone()
+        assert run["agent"] == "test-agent"
+        assert task["label"] == "search"
+        # result column survived all four migrations including v3→v4 drop of
+        # cost_usd/tokens columns and v4→v5 column additions.
+        assert task["result"] == '"hit"'
+
+    def test_v4_to_v5_creates_backup(self, tmp_db: Path) -> None:
+        self._build_v4_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        backup = tmp_db.with_suffix(tmp_db.suffix + ".backup-v4")
+        assert backup.exists()
 
 
 class TestIdempotence:
