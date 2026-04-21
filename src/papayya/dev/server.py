@@ -416,7 +416,7 @@ def _h_batch_cancel(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
     ).fetchone()
     if row is None:
         raise _ApiError(404, "batch not found")
-    if row[_schema.COL_BATCH_STATUS] in ("completed", "cancelled", "failed"):
+    if row[_schema.COL_BATCH_STATUS] in ("completed", "cancelled", "failed", "partial"):
         return {"noop": True, "status": row[_schema.COL_BATCH_STATUS]}
 
     conn.execute(

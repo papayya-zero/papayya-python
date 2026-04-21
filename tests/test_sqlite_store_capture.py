@@ -216,6 +216,55 @@ class TestAggregateRollup:
         assert batch["failed"] == 1
         assert batch["completed"] == 0
 
+    def test_mixed_batch_status_is_partial(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """A batch with both successes and failures becomes 'partial', not
+        'completed'. Guards the bug where any failure was silently dressed
+        up as a clean completion."""
+        store.create_batch("b-mixed", agent="t", total_items=3)
+        for i, status in enumerate(("completed", "completed", "failed"), start=1):
+            rid = f"run-{i}"
+            store.create(_checkpoint(rid))
+            store._conn.execute(
+                "UPDATE runs SET batch_id='b-mixed' WHERE run_id=?", (rid,)
+            )
+            store._conn.commit()
+            store.set_status(rid, status, output=None)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_id='b-mixed'"
+        ).fetchone()
+        assert batch["completed"] == 2
+        assert batch["failed"] == 1
+        assert batch["status"] == "partial"
+        assert batch["completed_at"] is not None
+
+    def test_all_failed_batch_status_is_failed(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """Every item failed → batch status = 'failed', not 'partial'."""
+        store.create_batch("b-all-failed", agent="t", total_items=2)
+        for i in (1, 2):
+            rid = f"rf-{i}"
+            store.create(_checkpoint(rid))
+            store._conn.execute(
+                "UPDATE runs SET batch_id='b-all-failed' WHERE run_id=?", (rid,)
+            )
+            store._conn.commit()
+            store.set_status(rid, "failed", output=None)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_id='b-all-failed'"
+        ).fetchone()
+        assert batch["completed"] == 0
+        assert batch["failed"] == 2
+        assert batch["status"] == "failed"
+
     def test_double_terminal_transition_only_counts_once(
         self, store: SQLiteStore, tmp_path: Path
     ) -> None:

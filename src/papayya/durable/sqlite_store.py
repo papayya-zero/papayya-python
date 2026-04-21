@@ -577,12 +577,20 @@ class SQLiteStore:
                         WHERE {_schema.COL_BATCH_ID} = ?""",
                     (row["batch_id"],),
                 )
-                # Mark the batch terminal if every item has resolved. This is
-                # the hook for "batch complete" notifications once the UI
-                # surfaces them; wrong-by-null is safer than wrong-by-count.
+                # Roll the batch to its terminal status once every item has
+                # resolved. Ternary outcome: zero failures → 'completed';
+                # zero successes → 'failed'; mixed → 'partial'. The DLQ
+                # surface acts on partial-terminal batches to re-drive the
+                # failed items; once all dead letters are replayed or
+                # skipped, a later pass should promote the batch from
+                # 'partial' to 'completed'.
                 self._conn.execute(
                     f"""UPDATE {_schema.TBL_BATCHES}
-                        SET {_schema.COL_BATCH_STATUS} = 'completed',
+                        SET {_schema.COL_BATCH_STATUS} = CASE
+                                WHEN {_schema.COL_BATCH_FAILED} = 0 THEN 'completed'
+                                WHEN {_schema.COL_BATCH_COMPLETED} = 0 THEN 'failed'
+                                ELSE 'partial'
+                            END,
                             {_schema.COL_BATCH_COMPLETED_AT} = ?
                         WHERE {_schema.COL_BATCH_ID} = ?
                           AND {_schema.COL_BATCH_COMPLETED_AT} IS NULL

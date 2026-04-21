@@ -79,6 +79,7 @@
         const k = {
             completed: "ok", running: "info", queued: "muted",
             failed: "err", cancelled: "muted", paused: "warn",
+            partial: "warn",
         }[status] || "muted";
         return renderBadge(k, status || "unknown");
     }
@@ -238,7 +239,7 @@
                 stat("Completed", batch.completed),
                 stat("Failed", batch.failed));
 
-            const cancelBtn = ["completed", "failed", "cancelled"].includes(batch.status)
+            const cancelBtn = ["completed", "failed", "cancelled", "partial"].includes(batch.status)
                 ? null
                 : el("button", {
                     class: "copy-btn",
