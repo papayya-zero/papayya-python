@@ -142,8 +142,8 @@ class APIClient:
         return self._request("GET", "/v1/tool-calls/pending")
 
     def resolve_tool_call(self, tool_call_id: str, output: Any) -> dict[str, Any]:
-        import json
-        output_str = output if isinstance(output, str) else json.dumps(output)
+        from papayya._serialize import encode_user_value
+        output_str = output if isinstance(output, str) else encode_user_value(output)
         return self._request("POST", f"/v1/tool-calls/{tool_call_id}/result", json={"output": output_str})
 
     # -- Deployments ---------------------------------------------------------

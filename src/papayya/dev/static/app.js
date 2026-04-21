@@ -460,11 +460,16 @@
             out.push(renderBadge("muted", fmtInt(t.llm_total_tokens) + " tok"));
             out.push(" ");
         }
-        if (t.llm_stop_reason && t.llm_stop_reason !== "stop" && t.llm_stop_reason !== "end_turn") {
-            // Only surface non-standard stop reasons — "length" and
-            // provider-specific cutoffs are the ones worth flagging.
-            out.push(renderBadge("warn", t.llm_stop_reason));
-            out.push(" ");
+        if (t.llm_stop_reason) {
+            const normalized = String(t.llm_stop_reason).toLowerCase();
+            // Gemini returns "STOP" uppercase; OpenAI "stop" and
+            // Anthropic "end_turn" are the other standards. Only
+            // surface genuine non-standard stop reasons — "length"
+            // and provider-specific cutoffs are what operators care about.
+            if (normalized !== "stop" && normalized !== "end_turn") {
+                out.push(renderBadge("warn", t.llm_stop_reason));
+                out.push(" ");
+            }
         }
         return out;
     }

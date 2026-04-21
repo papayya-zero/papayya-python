@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .. import _serialize
 from . import _errors, _schema
 from .types import RunCheckpoint, TaskEntry
 
@@ -103,14 +104,7 @@ def _encode_snapshot(value: Any) -> str | None:
     distinction in the DB)."""
     if value is None:
         return None
-    try:
-        encoded = json.dumps(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "snapshot must be JSON-encodable. Pass a dict/list/primitive, "
-            "or store a reference (e.g. an S3 key) instead of the object. "
-            f"Original error: {exc}"
-        ) from exc
+    encoded = _serialize.encode_user_value(value, strict=True)
     if len(encoded.encode("utf-8")) <= _SNAPSHOT_BYTE_CAP:
         return encoded
     preview = encoded[:_SNAPSHOT_PREVIEW_CHARS]
@@ -583,7 +577,7 @@ class SQLiteStore:
                 (
                     run_id,
                     entry.label,
-                    json.dumps(entry.result),
+                    _serialize.encode_user_value(entry.result),
                     entry.duration_ms,
                     entry.completed_at,
                     entry.item_id,
@@ -627,7 +621,7 @@ class SQLiteStore:
         with self._conn:
             self._conn.execute(
                 "UPDATE runs SET status = ?, output = ?, updated_at = ? WHERE run_id = ?",
-                (status, json.dumps(output) if output is not None else None, now, run_id),
+                (status, _serialize.encode_user_value(output) if output is not None else None, now, run_id),
             )
             if (
                 _capture_enabled()

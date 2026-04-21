@@ -260,3 +260,51 @@ def test_decorator_form_accepts_kind():
     assert entry.kind == "llm"
     assert entry.llm_provider_shape == "openai"
     assert entry.llm_total_tokens == 3
+
+
+# ---------------------------------------------------------------------------
+# SQLite round-trip — regression for the serialization boundary bug where
+# raw json.dumps(entry.result) crashed on any non-JSON-native provider
+# response (SimpleNamespace, Pydantic, dataclass, etc.). Exercises the
+# complete save → load cycle to ensure the full BYOF kind="llm" surface
+# is durable against realistic LLM SDK return types.
+# ---------------------------------------------------------------------------
+
+def test_llm_kind_persists_to_sqlite_and_survives_reload(tmp_path):
+    from papayya.durable.sqlite_store import SQLiteStore
+
+    db_path = tmp_path / "local.db"
+    store = SQLiteStore(str(db_path))
+    run = PapayyaRun(DurableRunConfig(agent="gemini-persist-test", store=store))
+
+    def call():
+        return SimpleNamespace(
+            model_version="gemini-2.0-flash",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=40,
+                candidates_token_count=10,
+                total_token_count=50,
+            ),
+            candidates=[SimpleNamespace(finish_reason="STOP")],
+        )
+
+    run.step("gemini-call", call, kind="llm")()
+    run.complete("ok")
+
+    # Reload from a fresh store pointing at the same file — proves the
+    # write landed and the stored JSON survives json.loads on replay.
+    reloaded = SQLiteStore(str(db_path))
+    checkpoint = reloaded.load(run.run_id)
+    assert checkpoint is not None
+    assert len(checkpoint.tasks) == 1
+    task = checkpoint.tasks[0]
+    assert task.label == "gemini-call"
+    assert task.kind == "llm"
+    assert task.llm_provider_shape == "gemini"
+    assert task.llm_total_tokens == 50
+    assert task.llm_model == "gemini-2.0-flash"
+    # The raw SimpleNamespace response degraded through the ladder to a
+    # __dict__ representation; the extracted llm_* columns preserve the
+    # signal we actually care about.
+    assert isinstance(task.result, dict)
+    assert task.result["model_version"] == "gemini-2.0-flash"
