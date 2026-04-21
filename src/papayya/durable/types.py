@@ -40,10 +40,15 @@ class RunCheckpoint:
     run_id: str
     agent: str
     tasks: list[TaskEntry]
-    status: str  # "running" | "completed" | "failed"
+    status: str  # "running" | "completed" | "failed" | "partial" (batch-only)
     created_at: str = ""
     updated_at: str = ""
     item_id: str | None = None  # Slice 6: run-level item identifier.
+    # DLQ replay source — captured at run creation. When a run enters the
+    # dead letter queue (status=failed, disposition=null), an operator
+    # invokes replay which creates a new run using this payload as input.
+    # Opaque JSON-encodable value; papayya does not inspect the shape.
+    input_snapshot: Any = None
 
 
 @dataclass

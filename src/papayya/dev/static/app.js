@@ -229,7 +229,8 @@
             fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/clusters"),
             fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/outliers"),
             fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/items").catch(() => []),
-        ]).then(([batch, runs, clusters, outliers, items]) => {
+            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/dlq").catch(() => []),
+        ]).then(([batch, runs, clusters, outliers, items, dlq]) => {
             const header = el("div", null,
                 el("h1", null, "Batch ", el("code", null, batch.batch_id), " ", badgeForStatus(batch.status)),
                 el("p", { class: "subtitle" }, batch.agent));
@@ -286,10 +287,99 @@
                     ], items))
                 : null;
 
+            const dlqSection = dlq.length
+                ? el("div", null,
+                    el("h2", null, "Dead letter queue ",
+                        el("span", { class: "count" }, "(" + dlq.length + ")")),
+                    el("p", { class: "subtitle" },
+                        "Failed runs waiting for triage. Replay rebuilds the run from its captured input; skip / acknowledge resolves it without re-running."),
+                    el("div", { class: "dlq-list" },
+                        ...dlq.map((d) => renderDlqRow(batchId, d))))
+                : null;
+
             const upgradeCard = maybeRenderBatchUpgradeCard(batch);
 
-            mount(el("div", null, header, upgradeCard, cancelBtn, stats, clusterSection, outlierSection, itemsSection, runsSection));
+            mount(el("div", null, header, upgradeCard, cancelBtn, stats, dlqSection, clusterSection, outlierSection, itemsSection, runsSection));
         }).catch(showError);
+    }
+
+    function renderDlqRow(batchId, d) {
+        const snap = parseSnapshot(d.input_snapshot);
+        const snapBlock = snap === undefined
+            ? null
+            : el("pre", { class: "dlq-input" },
+                snap === null ? "null" : JSON.stringify(snap, null, 2));
+
+        const errLine = d.error
+            ? el("div", { class: "dlq-error" }, String(d.error))
+            : null;
+
+        const actions = el("div", { class: "dlq-actions" },
+            el("button", {
+                class: "dlq-btn dlq-btn-primary",
+                onclick: () => dlqReplay(batchId, d.run_id),
+            }, "Replay"),
+            el("button", {
+                class: "dlq-btn",
+                onclick: () => dlqDispose(batchId, d.run_id, "skip"),
+            }, "Skip"),
+            el("button", {
+                class: "dlq-btn",
+                onclick: () => dlqDispose(batchId, d.run_id, "acknowledge"),
+            }, "Acknowledge"));
+
+        return el("div", { class: "dlq-item" },
+            el("div", { class: "dlq-head" },
+                el("a", { href: "/run?id=" + encodeURIComponent(d.run_id) }, d.run_id),
+                d.item_id ? el("span", null, " · ",
+                    el("a", { href: "/item?id=" + encodeURIComponent(d.item_id) }, "item " + d.item_id)) : null,
+                el("span", { class: "muted" }, " · " + timeAgo(d.created_at))),
+            errLine,
+            snapBlock,
+            actions);
+    }
+
+    function dlqDispose(batchId, runId, action) {
+        const url = "/api/batches/" + encodeURIComponent(batchId)
+            + "/dlq/" + encodeURIComponent(runId) + "/" + action;
+        fetch(url, { method: "POST" })
+            .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
+            .then(({ ok, body }) => {
+                if (!ok) {
+                    alert("Action failed: " + (body.error || "unknown"));
+                    return;
+                }
+                // Refresh the batch page so the DLQ list updates.
+                pageBatch();
+            })
+            .catch((e) => alert("Action failed: " + e.message));
+    }
+
+    function dlqReplay(batchId, runId) {
+        const url = "/api/batches/" + encodeURIComponent(batchId)
+            + "/dlq/" + encodeURIComponent(runId) + "/replay";
+        // Replay can take up to ~120s (the server-side timeout). Show an
+        // inline "running..." state rather than a browser-level spinner.
+        const existingBtns = document.querySelectorAll(".dlq-btn");
+        existingBtns.forEach((b) => { b.disabled = true; });
+        fetch(url, { method: "POST" })
+            .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
+            .then(({ ok, body }) => {
+                existingBtns.forEach((b) => { b.disabled = false; });
+                if (!ok) {
+                    alert("Replay failed: " + (body.error || "unknown"));
+                    return;
+                }
+                if (body.exit_code !== 0) {
+                    alert("Replay exited " + body.exit_code
+                        + (body.stderr ? "\n\n" + body.stderr : ""));
+                }
+                pageBatch();
+            })
+            .catch((e) => {
+                existingBtns.forEach((b) => { b.disabled = false; });
+                alert("Replay failed: " + e.message);
+            });
     }
 
     function cancelBatch(id) {

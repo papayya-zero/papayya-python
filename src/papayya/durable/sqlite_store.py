@@ -294,6 +294,25 @@ _V5_ADD_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
+# v6: dead-letter-queue primitive on runs. input_snapshot captures the run's
+# replay source at create() time; the three dlq_* columns track triage state
+# for failed runs. All nullable — a successful run never touches them.
+_V6_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_RUNS, _schema.COL_RUN_INPUT_SNAPSHOT, "TEXT"),
+    (_schema.TBL_RUNS, _schema.COL_RUN_DLQ_DISPOSITION, "TEXT"),
+    (_schema.TBL_RUNS, _schema.COL_RUN_DLQ_RESOLVED_AT, "TEXT"),
+    (_schema.TBL_RUNS, _schema.COL_RUN_REPLAYED_FROM, "TEXT"),
+]
+
+# Partial index on unresolved failed runs — the DLQ list query filters
+# status='failed' AND dlq_disposition IS NULL, which this indexes directly.
+_V6_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_DLQ} "
+    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_BATCH_ID}, {_schema.COL_RUN_DLQ_DISPOSITION}) "
+    f"WHERE status = 'failed';",
+]
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -353,6 +372,40 @@ def _set_schema_version(conn: sqlite3.Connection, version: str) -> None:
     )
 
 
+def _promote_partial_if_drained(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    now: str,
+) -> None:
+    """Promote a 'partial' batch to 'completed' when its DLQ is empty.
+
+    Called after any event that could change the unresolved-dead-letter
+    count: a DLQ disposition change, or a new run resolving inside a
+    partial batch. Only transitions 'partial' → 'completed'; 'failed' and
+    'cancelled' batches stay terminal on their own terms.
+
+    The NOT EXISTS clause treats each replay's fresh run as part of the
+    batch's active surface — a failed replay keeps the batch 'partial'
+    because there's a new unresolved dead letter, which is what the
+    operator would expect.
+    """
+    conn.execute(
+        f"""UPDATE {_schema.TBL_BATCHES}
+            SET {_schema.COL_BATCH_STATUS} = 'completed',
+                {_schema.COL_BATCH_COMPLETED_AT} =
+                    COALESCE({_schema.COL_BATCH_COMPLETED_AT}, ?)
+            WHERE {_schema.COL_BATCH_ID} = ?
+              AND {_schema.COL_BATCH_STATUS} = 'partial'
+              AND NOT EXISTS (
+                  SELECT 1 FROM {_schema.TBL_RUNS}
+                  WHERE {_schema.COL_RUN_BATCH_ID} = ?
+                    AND status = 'failed'
+                    AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL
+              )""",
+        (now, batch_id, batch_id),
+    )
+
+
 def _apply_v1_to_v2(conn: sqlite3.Connection, db_path: Path) -> None:
     _backup_db(db_path, "1")
     with conn:
@@ -405,13 +458,26 @@ def _apply_v4_to_v5(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "5")
 
 
+def _apply_v5_to_v6(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "5")
+    with conn:
+        for table, column, type_decl in _V6_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        for index_sql in _V6_INDEXES:
+            conn.execute(index_sql)
+        _set_schema_version(conn, "6")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → v3 → v4 → v5) so long-dormant local DBs catch up cleanly.
+    (e.g. v1 → v2 → v3 → v4 → v5 → v6) so long-dormant local DBs catch up
+    cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -427,6 +493,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "4":
             _apply_v4_to_v5(conn, db_path)
             current = "5"
+        elif current == "5":
+            _apply_v5_to_v6(conn, db_path)
+            current = "6"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -489,6 +558,7 @@ class SQLiteStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             item_id=row[_schema.COL_RUN_ITEM_ID],
+            input_snapshot=_decode_snapshot(row[_schema.COL_RUN_INPUT_SNAPSHOT]),
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -598,6 +668,11 @@ class SQLiteStore:
                               >= {_schema.COL_BATCH_TOTAL_ITEMS}""",
                     (now, row["batch_id"]),
                 )
+                # A run resolving inside an already-terminal 'partial' batch
+                # (e.g. a replay's fresh run completing) can drain the DLQ —
+                # re-check and promote if so. No-op when the batch is still
+                # running or is already in a different terminal state.
+                _promote_partial_if_drained(self._conn, row["batch_id"], now)
 
     def create(self, checkpoint: RunCheckpoint) -> None:
         """Create a run. Auto-wraps in an implicit batch-of-1 when capture is on.
@@ -621,8 +696,8 @@ class SQLiteStore:
 
         self._conn.execute(
             f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
-               batch_id, {_schema.COL_RUN_ITEM_ID})
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
                 checkpoint.agent,
@@ -631,6 +706,7 @@ class SQLiteStore:
                 checkpoint.updated_at,
                 batch_id,
                 checkpoint.item_id,
+                _encode_snapshot(checkpoint.input_snapshot),
             ),
         )
         self._conn.commit()
@@ -716,6 +792,57 @@ class SQLiteStore:
             ),
         )
         self._conn.commit()
+
+    # --- Dead letter queue (v6) ---
+
+    def mark_dlq_disposition(
+        self,
+        run_id: str,
+        disposition: str,
+        *,
+        replayed_from: str | None = None,
+    ) -> None:
+        """Record an operator's triage decision for a failed run.
+
+        ``disposition`` must be one of the constants in ``_schema`` —
+        ``DLQ_REPLAYED``, ``DLQ_SKIPPED``, ``DLQ_ACKNOWLEDGED``. A replay
+        transitions the *old* run to ``DLQ_REPLAYED`` and should be paired
+        with a freshly created run carrying ``replayed_from=<old_run_id>``
+        so the chain is discoverable.
+
+        Write is a no-op if the run is already resolved — double-clicks
+        on the dashboard should not silently overwrite disposition.
+        """
+        if disposition not in (
+            _schema.DLQ_REPLAYED,
+            _schema.DLQ_SKIPPED,
+            _schema.DLQ_ACKNOWLEDGED,
+        ):
+            raise ValueError(
+                f"disposition must be one of replayed/skipped/acknowledged; got {disposition!r}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            batch_row = self._conn.execute(
+                f"SELECT {_schema.COL_RUN_BATCH_ID} FROM {_schema.TBL_RUNS} "
+                f"WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            self._conn.execute(
+                f"""UPDATE {_schema.TBL_RUNS}
+                    SET {_schema.COL_RUN_DLQ_DISPOSITION} = ?,
+                        {_schema.COL_RUN_DLQ_RESOLVED_AT} = ?,
+                        {_schema.COL_RUN_REPLAYED_FROM} = COALESCE(?, {_schema.COL_RUN_REPLAYED_FROM}),
+                        updated_at = ?
+                    WHERE run_id = ?
+                      AND status = 'failed'
+                      AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL""",
+                (disposition, now, replayed_from, now, run_id),
+            )
+            if batch_row is not None and batch_row["batch_id"] is not None:
+                _promote_partial_if_drained(
+                    self._conn, batch_row["batch_id"], now
+                )
 
     def close(self) -> None:
         self._conn.close()

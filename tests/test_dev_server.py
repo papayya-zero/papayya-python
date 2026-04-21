@@ -194,6 +194,106 @@ class TestBatches:
         assert durations == sorted(durations, reverse=True)
 
 
+class TestBatchDlq:
+    def test_lists_unresolved_failures(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        """b-explicit has 2 completed + 1 failed; the failed run should show
+        up as a dead letter until an operator disposes of it."""
+        base, _ = seeded_server
+        status, body = _get(base, "/api/batches/b-explicit/dlq")
+        assert status == 200
+        assert len(body) == 1
+        dl = body[0]
+        assert dl["run_id"] == "run-3"
+        assert dl["agent"] == "enrich"
+
+    def test_excludes_resolved_failures(
+        self, seeded_server: tuple[str, Path], tmp_path: Path
+    ) -> None:
+        base, db_path = seeded_server
+        store = SQLiteStore(str(db_path))
+        from papayya.durable import _schema as schema
+        store.mark_dlq_disposition("run-3", schema.DLQ_SKIPPED)
+        store.close()
+
+        status, body = _get(base, "/api/batches/b-explicit/dlq")
+        assert status == 200
+        assert body == []
+
+    def test_unknown_batch_404(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, _body = _get(base, "/api/batches/nope/dlq")
+        assert status == 404
+
+
+class TestDlqActions:
+    def test_skip_marks_disposition(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        base, _ = seeded_server
+        status, body = _post(base, "/api/batches/b-explicit/dlq/run-3/skip")
+        assert status == 200
+        assert body["disposition"] == "skipped"
+        assert body["noop"] is False
+
+        # Re-issuing is a no-op, not an error.
+        status, body = _post(base, "/api/batches/b-explicit/dlq/run-3/skip")
+        assert status == 200
+        assert body["noop"] is True
+        assert body["disposition"] == "skipped"
+
+    def test_acknowledge_marks_disposition(
+        self, seeded_server: tuple[str, Path], tmp_path: Path
+    ) -> None:
+        # Make a second failed run in the same batch so we can acknowledge
+        # it without interfering with the skip test's run-3.
+        base, db_path = seeded_server
+        store = SQLiteStore(str(db_path))
+        store.create(_checkpoint("run-ack"))
+        store._conn.execute(
+            "UPDATE runs SET batch_id='b-explicit' WHERE run_id='run-ack'"
+        )
+        store._conn.commit()
+        store.set_status("run-ack", "failed", output="nope")
+        store.close()
+
+        status, body = _post(base, "/api/batches/b-explicit/dlq/run-ack/acknowledge")
+        assert status == 200
+        assert body["disposition"] == "acknowledged"
+
+    def test_dispose_run_not_in_batch_404(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        base, _ = seeded_server
+        # run-single exists but is in a different batch
+        status, _body = _post(base, "/api/batches/b-explicit/dlq/run-single/skip")
+        assert status == 404
+
+    def test_dispose_non_failed_run_409(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        base, _ = seeded_server
+        status, _body = _post(base, "/api/batches/b-explicit/dlq/run-1/skip")
+        assert status == 409
+
+    def test_dispose_unknown_run_404(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, _body = _post(base, "/api/batches/b-explicit/dlq/nope/skip")
+        assert status == 404
+
+    def test_replay_without_snapshot_rejects(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        """The seeded b-explicit/run-3 has no input_snapshot (the seed
+        predates v6 semantics), so the replay endpoint must refuse at the
+        validation step rather than spawn a CLI that would fail anyway."""
+        base, _ = seeded_server
+        status, body = _post(base, "/api/batches/b-explicit/dlq/run-3/replay")
+        assert status == 409
+        assert "input_snapshot" in body["error"]
+
+
 class TestStepSearch:
     def test_by_tool_name(self, seeded_server: tuple[str, Path]) -> None:
         base, _ = seeded_server

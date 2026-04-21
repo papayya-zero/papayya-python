@@ -20,12 +20,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from ..durable import _schema
+from ..durable.sqlite_store import _promote_partial_if_drained
 from . import _tier
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -226,6 +228,37 @@ def _h_batch_items(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -
     return [dict(r) for r in rows]
 
 
+def _h_batch_dlq(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
+    """Dead letter queue: unresolved failed runs for this batch.
+
+    A dead letter is a run with ``status='failed'`` whose
+    ``dlq_disposition`` is still null — the operator hasn't decided what
+    to do with it yet. The response carries the replay source
+    (``input_snapshot``) and the recorded error so the UI can present a
+    triage row without additional round-trips.
+    """
+    exists = conn.execute(
+        f"SELECT 1 FROM {_schema.TBL_BATCHES} WHERE {_schema.COL_BATCH_ID} = ?",
+        (batch_id,),
+    ).fetchone()
+    if exists is None:
+        raise _ApiError(404, "batch not found")
+
+    rows = conn.execute(
+        f"""SELECT run_id, agent, created_at, updated_at,
+                   output AS error,
+                   {_schema.COL_RUN_ITEM_ID} AS item_id,
+                   {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot
+            FROM {_schema.TBL_RUNS}
+            WHERE {_schema.COL_RUN_BATCH_ID} = ?
+              AND status = 'failed'
+              AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL
+            ORDER BY created_at DESC""",
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _h_batch_clusters(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
     rows = conn.execute(
         f"""SELECT s.{_schema.COL_STEP_ERROR_CODE} AS error_code,
@@ -408,6 +441,129 @@ def _h_tier_recommendation(conn: sqlite3.Connection, _: dict[str, str]) -> dict[
     }
 
 
+def _h_dlq_disposition(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    run_id: str,
+    disposition: str,
+) -> dict[str, Any]:
+    """Mark a dead letter as skipped / acknowledged / replayed.
+
+    Replay is only half-done here: this marks the original run as
+    ``replayed`` but does NOT execute the replay — that's the
+    ``papayya dlq replay`` subprocess. Callers of this endpoint for the
+    ``replayed`` disposition are therefore expected to have already
+    created (or be about to create) the new run with
+    ``replayed_from=<run_id>``.
+
+    Idempotent by design: re-posting the same disposition on an already-
+    resolved run is a no-op at the store layer.
+    """
+    row = conn.execute(
+        f"""SELECT status, {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
+                   {_schema.COL_RUN_BATCH_ID} AS batch_id
+            FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise _ApiError(404, "run not found")
+    if row["batch_id"] != batch_id:
+        raise _ApiError(404, "run does not belong to this batch")
+    if row["status"] != "failed":
+        raise _ApiError(409, "run is not failed; cannot mark DLQ disposition")
+    if row["disp"] is not None:
+        # Already resolved — return current state without re-setting.
+        return {"noop": True, "disposition": row["disp"]}
+
+    if disposition not in (
+        _schema.DLQ_REPLAYED,
+        _schema.DLQ_SKIPPED,
+        _schema.DLQ_ACKNOWLEDGED,
+    ):
+        raise _ApiError(400, f"invalid disposition: {disposition!r}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        f"""UPDATE {_schema.TBL_RUNS}
+            SET {_schema.COL_RUN_DLQ_DISPOSITION} = ?,
+                {_schema.COL_RUN_DLQ_RESOLVED_AT} = ?,
+                updated_at = ?
+            WHERE run_id = ?""",
+        (disposition, now, now, run_id),
+    )
+    _promote_partial_if_drained(conn, batch_id, now)
+    conn.commit()
+    return {"noop": False, "disposition": disposition, "resolved_at": now}
+
+
+def _h_dlq_replay(
+    conn: sqlite3.Connection,
+    db_path: str,
+    batch_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    """Spawn ``papayya dlq replay --run <id>`` and wait for it.
+
+    Runs the CLI in a subprocess from the dashboard server's cwd — which is
+    the user's project dir, where their agent module lives. Times out at
+    120s: LLM replays are almost always <30s, and a longer-running replay
+    signals either a deep agent loop or a model that's unsuited to being
+    blocked-on from a browser. In that case the operator can re-try from
+    their terminal directly.
+
+    Validates DLQ state before dispatching so the subprocess doesn't waste
+    cycles discovering the run is already resolved.
+    """
+    import subprocess
+
+    row = conn.execute(
+        f"""SELECT status, {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
+                   {_schema.COL_RUN_BATCH_ID} AS batch_id,
+                   {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot
+            FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise _ApiError(404, "run not found")
+    if row["batch_id"] != batch_id:
+        raise _ApiError(404, "run does not belong to this batch")
+    if row["status"] != "failed":
+        raise _ApiError(409, "run is not failed; cannot replay")
+    if row["disp"] is not None:
+        return {"noop": True, "disposition": row["disp"]}
+    if row["input_snapshot"] is None:
+        raise _ApiError(
+            409,
+            "run has no captured input_snapshot; cannot replay",
+        )
+
+    try:
+        proc = subprocess.run(
+            ["papayya", "dlq", "replay", "--run", run_id, "--db", db_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        raise _ApiError(
+            504,
+            "Replay still running after 120s. Check the DLQ list — if a new "
+            "run appeared, replay is in-flight; otherwise retry from the terminal."
+        )
+    except FileNotFoundError:
+        raise _ApiError(
+            500,
+            "papayya CLI not found on PATH. Install papayya into the active "
+            "environment before using the Replay button.",
+        )
+
+    return {
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout[-2000:] if proc.stdout else "",
+        "stderr": proc.stderr[-2000:] if proc.stderr else "",
+    }
+
+
 def _h_batch_cancel(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
     row = conn.execute(
         f"SELECT {_schema.COL_BATCH_STATUS} FROM {_schema.TBL_BATCHES} "
@@ -447,7 +603,7 @@ _GET_ROUTES: dict[str, Callable[[sqlite3.Connection, dict[str, str]], Any]] = {
 # Parameterised GET routes — pattern -> (regex, handler)
 _RUN_ID_RE = re.compile(r"^/api/runs/([A-Za-z0-9_\-]+)(/tasks|/steps)?$")
 _BATCH_ID_RE = re.compile(
-    r"^/api/batches/([A-Za-z0-9_\-]+)(/runs|/clusters|/outliers|/items)?$"
+    r"^/api/batches/([A-Za-z0-9_\-]+)(/runs|/clusters|/outliers|/items|/dlq)?$"
 )
 # item_id is user-supplied so we accept a wider charset than run_id / batch_id.
 # Still restricted to URL-safe characters to avoid path traversal issues.
@@ -505,6 +661,8 @@ class DevHandler(SimpleHTTPRequestHandler):
                         self._json(_h_batch_outliers(conn, batch_id, params))
                     elif sub == "/items":
                         self._json(_h_batch_items(conn, batch_id, params))
+                    elif sub == "/dlq":
+                        self._json(_h_batch_dlq(conn, batch_id, params))
                     else:
                         self._json(_h_batch_detail(conn, batch_id, params))
                     return
@@ -543,6 +701,26 @@ class DevHandler(SimpleHTTPRequestHandler):
                 conn = self._open_db()
                 try:
                     self._json(_h_batch_cancel(conn, m.group(1)))
+                finally:
+                    conn.close()
+                return
+
+            m = re.match(
+                r"^/api/batches/([A-Za-z0-9_\-]+)/dlq/([A-Za-z0-9_\-]+)/(skip|acknowledge|replay)$",
+                path,
+            )
+            if m:
+                batch_id, run_id, action = m.group(1), m.group(2), m.group(3)
+                conn = self._open_db()
+                try:
+                    if action == "replay":
+                        self._json(_h_dlq_replay(conn, self.db_path, batch_id, run_id))
+                    else:
+                        disposition = {
+                            "skip": _schema.DLQ_SKIPPED,
+                            "acknowledge": _schema.DLQ_ACKNOWLEDGED,
+                        }[action]
+                        self._json(_h_dlq_disposition(conn, batch_id, run_id, disposition))
                 finally:
                     conn.close()
                 return

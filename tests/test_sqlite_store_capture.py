@@ -490,6 +490,185 @@ class TestLlmKindRoundTrip:
         assert got.llm_provider_shape == "unknown"
 
 
+class TestDlqDrainedPromotion:
+    """A 'partial' batch promotes to 'completed' once its DLQ is empty."""
+
+    def _setup_partial(self, store: SQLiteStore) -> None:
+        store.create_batch("b-drained", agent="t", total_items=3)
+        for i, status in enumerate(("completed", "completed", "failed"), start=1):
+            rid = f"drn-{i}"
+            store.create(_checkpoint(rid))
+            store._conn.execute(
+                "UPDATE runs SET batch_id='b-drained' WHERE run_id=?", (rid,)
+            )
+            store._conn.commit()
+            store.set_status(rid, status, output=None)
+
+    def test_skipping_last_dead_letter_promotes_to_completed(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        self._setup_partial(store)
+        # Sanity: partial first.
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        pre = conn.execute(
+            "SELECT status FROM batches WHERE batch_id='b-drained'"
+        ).fetchone()
+        assert pre["status"] == "partial"
+
+        store.mark_dlq_disposition("drn-3", _schema.DLQ_SKIPPED)
+
+        post = conn.execute(
+            "SELECT status FROM batches WHERE batch_id='b-drained'"
+        ).fetchone()
+        assert post["status"] == "completed"
+
+    def test_multiple_dead_letters_partial_until_all_resolved(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """Resolving one of two dead letters keeps the batch 'partial'."""
+        store.create_batch("b-two-dead", agent="t", total_items=3)
+        for i, status in enumerate(("completed", "failed", "failed"), start=1):
+            rid = f"td-{i}"
+            store.create(_checkpoint(rid))
+            store._conn.execute(
+                "UPDATE runs SET batch_id='b-two-dead' WHERE run_id=?", (rid,)
+            )
+            store._conn.commit()
+            store.set_status(rid, status, output=None)
+
+        store.mark_dlq_disposition("td-2", _schema.DLQ_SKIPPED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        mid = conn.execute(
+            "SELECT status FROM batches WHERE batch_id='b-two-dead'"
+        ).fetchone()
+        assert mid["status"] == "partial"
+
+        store.mark_dlq_disposition("td-3", _schema.DLQ_ACKNOWLEDGED)
+        after = conn.execute(
+            "SELECT status FROM batches WHERE batch_id='b-two-dead'"
+        ).fetchone()
+        assert after["status"] == "completed"
+
+    def test_failed_batch_stays_failed(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """Draining the DLQ of an all-failed batch does not make it
+        'completed' — it was a rout, not a partial success."""
+        store.create_batch("b-all-failed", agent="t", total_items=2)
+        for i in (1, 2):
+            rid = f"af-{i}"
+            store.create(_checkpoint(rid))
+            store._conn.execute(
+                "UPDATE runs SET batch_id='b-all-failed' WHERE run_id=?", (rid,)
+            )
+            store._conn.commit()
+            store.set_status(rid, "failed", output=None)
+
+        store.mark_dlq_disposition("af-1", _schema.DLQ_SKIPPED)
+        store.mark_dlq_disposition("af-2", _schema.DLQ_SKIPPED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        batch = conn.execute(
+            "SELECT status FROM batches WHERE batch_id='b-all-failed'"
+        ).fetchone()
+        assert batch["status"] == "failed"
+
+
+class TestRunInputSnapshot:
+    """Run-level input_snapshot is the DLQ replay source."""
+
+    def test_input_snapshot_round_trips(self, store: SQLiteStore) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        store.create(RunCheckpoint(
+            run_id="run-with-input", agent="t", tasks=[],
+            status="running", created_at=now, updated_at=now,
+            input_snapshot={"lead_id": "xyz", "email": "a@b.com"},
+        ))
+        loaded = store.load("run-with-input")
+        assert loaded is not None
+        assert loaded.input_snapshot == {"lead_id": "xyz", "email": "a@b.com"}
+
+    def test_input_snapshot_defaults_to_none(self, store: SQLiteStore) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        store.create(RunCheckpoint(
+            run_id="run-no-input", agent="t", tasks=[],
+            status="running", created_at=now, updated_at=now,
+        ))
+        loaded = store.load("run-no-input")
+        assert loaded is not None
+        assert loaded.input_snapshot is None
+
+
+class TestDlqDisposition:
+    """mark_dlq_disposition transitions a failed run out of the DLQ."""
+
+    def _failed_run(self, store: SQLiteStore, run_id: str = "dead-1") -> None:
+        store.create(_checkpoint(run_id))
+        store.set_status(run_id, "failed", output="boom")
+
+    def test_skip_sets_disposition_and_resolved_at(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        self._failed_run(store)
+        store.mark_dlq_disposition("dead-1", _schema.DLQ_SKIPPED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='dead-1'").fetchone()
+        assert run[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_SKIPPED
+        assert run[_schema.COL_RUN_DLQ_RESOLVED_AT] is not None
+
+    def test_replay_sets_replayed_from_on_new_run(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """When a replay happens, the NEW run carries replayed_from; this test
+        covers the older-run-side half: disposition=replayed, link is nullable
+        on this side (the chain points forward from the original)."""
+        self._failed_run(store, run_id="dead-2")
+        store.mark_dlq_disposition("dead-2", _schema.DLQ_REPLAYED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='dead-2'").fetchone()
+        assert run[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+
+    def test_double_disposition_is_noop(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """Second call with a different disposition must not overwrite."""
+        self._failed_run(store, run_id="dead-3")
+        store.mark_dlq_disposition("dead-3", _schema.DLQ_SKIPPED)
+        store.mark_dlq_disposition("dead-3", _schema.DLQ_ACKNOWLEDGED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='dead-3'").fetchone()
+        assert run[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_SKIPPED
+
+    def test_disposition_on_non_failed_is_noop(
+        self, store: SQLiteStore, tmp_path: Path
+    ) -> None:
+        """Don't mark a successful run as dead-letter'd. The UPDATE is guarded
+        by status='failed', so calling on a completed run is a silent no-op."""
+        store.create(_checkpoint("run-ok"))
+        store.set_status("run-ok", "completed", output="ok")
+        store.mark_dlq_disposition("run-ok", _schema.DLQ_SKIPPED)
+
+        conn = sqlite3.connect(tmp_path / "local.db")
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='run-ok'").fetchone()
+        assert run[_schema.COL_RUN_DLQ_DISPOSITION] is None
+
+    def test_invalid_disposition_raises(self, store: SQLiteStore) -> None:
+        self._failed_run(store, run_id="dead-4")
+        with pytest.raises(ValueError):
+            store.mark_dlq_disposition("dead-4", "something_else")
+
+
 class TestWriteOverhead:
     """Guard the 10%-overhead budget called out in LOCAL_DEV_EXECUTION.md.
 

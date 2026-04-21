@@ -69,8 +69,25 @@ COL_TASK_LLM_PROVIDER_SHAPE = "llm_provider_shape"
 COL_TASK_ERROR_CATEGORY = "error_category"
 
 
+# v6 columns — dead-letter-queue primitive on the runs table.
+# input_snapshot is the payload captured at run creation; it's the replay
+# source when an operator re-drives a failed run from the DLQ. dlq_disposition
+# is null while the run is pending triage and transitions to 'replayed',
+# 'skipped', or 'acknowledged' once an operator acts. replayed_from links a
+# new run to the dead letter it re-drove, forming a chain the UI can follow.
+COL_RUN_INPUT_SNAPSHOT = "input_snapshot"
+COL_RUN_DLQ_DISPOSITION = "dlq_disposition"
+COL_RUN_DLQ_RESOLVED_AT = "dlq_resolved_at"
+COL_RUN_REPLAYED_FROM = "replayed_from"
+
+# Disposition values — contract with the UI's DLQ section and the hosted CP.
+DLQ_REPLAYED = "replayed"
+DLQ_SKIPPED = "skipped"
+DLQ_ACKNOWLEDGED = "acknowledged"
+
+
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 
 # Indexes — named explicitly so we can check for their presence in tests
@@ -79,3 +96,4 @@ IDX_STEPS_ERROR = "idx_steps_error"
 IDX_RUNS_BATCH = "idx_runs_batch"
 IDX_TASKS_ITEM = "idx_tasks_item"
 IDX_RUNS_ITEM = "idx_runs_item"
+IDX_RUNS_DLQ = "idx_runs_dlq"
