@@ -20,6 +20,17 @@ class TaskEntry:
     item_id: str | None = None
     input_snapshot: Any = None
     output_snapshot: Any = None
+    # BYOF observability: populated when the step was wrapped with
+    # ``kind="llm"``. All fields are ``None`` for non-LLM steps and for
+    # LLM steps whose provider shape was not recognized.
+    kind: str | None = None
+    llm_prompt_tokens: int | None = None
+    llm_completion_tokens: int | None = None
+    llm_total_tokens: int | None = None
+    llm_model: str | None = None
+    llm_stop_reason: str | None = None
+    llm_provider_shape: str | None = None
+    error_category: str | None = None
 
 
 @dataclass
