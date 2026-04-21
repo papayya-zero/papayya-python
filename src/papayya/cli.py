@@ -697,16 +697,38 @@ def project_import(file: str) -> None:
 @click.option("--input", "input_text", required=True, help="Input for the agent")
 @click.option("--local", "use_local", is_flag=True, default=False, help="Run locally (no cloud needed)")
 @click.option("--agent-id", default=None, help="Agent ID (required for cloud runs)")
+@click.option("--name", "agent_name", default=None, help="Agent name (required when file declares multiple @agent functions)")
 @click.option("--api-key", "run_api_key", default=None, help="LLM API key for local runs")
 @click.pass_context
-def run(ctx: click.Context, file: str, input_text: str, use_local: bool, agent_id: str | None, run_api_key: str | None) -> None:
+def run(ctx: click.Context, file: str, input_text: str, use_local: bool, agent_id: str | None, agent_name: str | None, run_api_key: str | None) -> None:
     """Run an agent locally or in the cloud."""
-    agent = _load_agent_from_file(file)
-
     if use_local:
-        _run_local(agent, input_text, run_api_key)
+        _run_local(None, input_text, run_api_key)
+        return
+
+    registrations = _discover_agents(file)
+    if len(registrations) == 1:
+        reg = registrations[0]
     else:
-        _run_cloud(ctx, agent, file, input_text, agent_id)
+        if not agent_name:
+            names = ", ".join(r.name for r in registrations)
+            click.echo(
+                f"Error: {file} declares {len(registrations)} agents ({names}).\n"
+                "  Pass --name <agent-name> to pick one.",
+                err=True,
+            )
+            sys.exit(1)
+        matches = [r for r in registrations if r.name == agent_name]
+        if not matches:
+            names = ", ".join(r.name for r in registrations)
+            click.echo(
+                f"Error: no @agent named '{agent_name}' in {file}. Available: {names}",
+                err=True,
+            )
+            sys.exit(1)
+        reg = matches[0]
+
+    _run_cloud(ctx, reg, file, input_text, agent_id)
 
 
 def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> None:
@@ -735,8 +757,11 @@ def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> Non
     sys.exit(1)
 
 
-def _run_cloud(ctx: click.Context, agent: Any, file: str, input_text: str, agent_id: str | None) -> None:
-    """Trigger a cloud run."""
+def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str | None) -> None:
+    """Trigger a cloud run.
+
+    ``reg`` is an ``AgentRegistration`` produced by ``_discover_agents``.
+    """
     if not agent_id:
         click.echo(
             "Error: --agent-id is required for cloud runs.\n"
@@ -754,22 +779,24 @@ def _run_cloud(ctx: click.Context, agent: Any, file: str, input_text: str, agent
         )
         sys.exit(1)
 
+    budget_cents = int(reg.budget_usd * 100) if reg.budget_usd is not None else 500
+
     config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
     api = APIClient(config)
 
     try:
         result = api.trigger_run(
             agent_id=agent_id,
-            model=agent.model,
-            system_prompt=agent.instructions,
+            model=reg.model,
+            system_prompt=reg.instructions,
             input_data={"message": input_text},
-            max_steps=agent.max_steps,
-            budget_cents=agent.budget_cents,
+            max_steps=reg.max_steps,
+            budget_cents=budget_cents,
         )
         run_id = result["id"]
         click.echo(f"Run triggered: {run_id}")
         click.echo(f"  Status: {result.get('status', 'unknown')}")
-        click.echo(f"  Model: {agent.model}")
+        click.echo(f"  Model: {reg.model}")
 
         # Poll until complete
         click.echo("Waiting for completion...")
