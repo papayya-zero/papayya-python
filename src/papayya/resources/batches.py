@@ -7,11 +7,13 @@ if TYPE_CHECKING:
     from papayya.api import APIClient
 
 
-# Terminal statuses for a batch. Paused is included because a paused batch
-# is stuck until the caller bumps the cap and resumes — for a blocking
-# wait(), treating it as terminal forces the caller to notice rather than
-# hang forever. Non-terminal batch statuses: materializing, queued, running.
-_TERMINAL_BATCH_STATUSES = frozenset({"completed", "failed", "cancelled", "paused"})
+# Terminal statuses for a batch as far as the SDK's wait() is concerned.
+# Paused and partial are included because both are stuck states that need
+# caller intervention to leave: paused → bump the budget cap and resume;
+# partial → triage the DLQ via Runs.dlq_skip/acknowledge/replay. Treating
+# them as terminal forces the caller to notice rather than hang forever.
+# True non-terminal: materializing, queued, running.
+_TERMINAL_BATCH_STATUSES = frozenset({"completed", "failed", "cancelled", "paused", "partial"})
 
 
 class Batches:
@@ -154,8 +156,23 @@ class Batches:
 
     def retry_failed(self, batch_id: str) -> dict[str, Any]:
         """Re-enqueue every failed child of the batch as a new run. The
-        batch's total_items is bumped to match. Returns the updated batch."""
+        batch's total_items is bumped to match. Returns the updated batch.
+
+        Distinct from :meth:`dlq` — retry-failed is a blanket re-run that
+        doesn't link to the source or interact with DLQ disposition. For
+        per-run, traceable replay use ``Runs.dlq_replay``."""
         return self._api._request("POST", f"/v1/batches/{batch_id}/retry-failed")
+
+    def dlq(self, batch_id: str) -> list[dict[str, Any]]:
+        """List failed/budget_exceeded child runs in this batch's Dead
+        Letter Queue (i.e. without a dlq_disposition yet). Returns the
+        same shape as :meth:`runs` plus the ``input_snapshot`` field on
+        each row so the operator can replay from the original input.
+
+        Pair with ``Runs.dlq_skip`` / ``dlq_acknowledge`` / ``dlq_replay``
+        to drain the queue. Once empty, a batch sitting in 'partial'
+        promotes to 'completed' automatically."""
+        return self._api._request("GET", f"/v1/batches/{batch_id}/dlq")
 
     def wait(
         self,

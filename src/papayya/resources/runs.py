@@ -44,3 +44,30 @@ class Runs:
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         return self._api._request("GET", f"/v1/runs/{run_id}/steps")
+
+    # ── Dead Letter Queue ──────────────────────────────────────────────────
+    # A failed/budget_exceeded run that belongs to a batch lands in the DLQ
+    # until the operator triages it. Use one of:
+    #   - dlq_skip       — accept the failure, don't replay
+    #   - dlq_acknowledge — record review, don't replay
+    #   - dlq_replay     — re-issue the run from input_snapshot
+    # Once every failure in a batch has a disposition, the batch promotes
+    # from 'partial' to 'completed'. See Batches.dlq() for the list endpoint.
+
+    def dlq_skip(self, run_id: str) -> dict[str, Any]:
+        """Mark a failed run as 'skipped' — accept the failure as terminal.
+        Returns the updated run with dlq_disposition set."""
+        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/skip")
+
+    def dlq_acknowledge(self, run_id: str) -> dict[str, Any]:
+        """Mark a failed run as 'acknowledged' — record that the operator
+        has reviewed the failure but is choosing to leave it. Functionally
+        equivalent to skip; semantically distinct (skip ≈ "not worth
+        looking at"; acknowledge ≈ "I've looked at this")."""
+        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/acknowledge")
+
+    def dlq_replay(self, run_id: str) -> dict[str, Any]:
+        """Re-issue the failed run from its input_snapshot as a new queued
+        run. Marks the source as 'replayed' and links the new run via
+        replayed_from. Returns the new run (HTTP 202)."""
+        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/replay")
