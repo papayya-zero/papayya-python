@@ -10,9 +10,11 @@ inspected directly.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pytest
 
 from papayya.durable.cloud_store import CloudStore, CloudStoreConfig
 from papayya.durable.types import RunCheckpoint, TaskEntry
@@ -110,6 +112,77 @@ class TestLoadRestoresSnapshots:
         assert entry.item_id == "co_42"
         assert entry.input_snapshot == {"in": 0}
         assert entry.output_snapshot == {"out": 1}
+
+
+class TestNonJsonNativePayloads:
+    """User-provided values (LLM SDK responses, dataclasses) must land as
+    structured JSON, not crash httpx's internal ``json.dumps``.
+
+    Mirrors the shim-side contract proven by
+    ``runtime-images/python/papayya_shim/checkpoint_store.py``.
+    """
+
+    def test_save_task_encodes_simplenamespace_result(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(201, json={})
+
+        store = _make_store(handler)
+        fake_provider_response = SimpleNamespace(
+            model="gemini-2.5-flash",
+            usage=SimpleNamespace(total_tokens=50),
+        )
+        entry = TaskEntry(
+            label="enrich",
+            result=fake_provider_response,
+            duration_ms=50,
+            completed_at="2026-04-21T00:00:00+00:00",
+        )
+        store.save_task("r1", entry)
+
+        body = captured["body"]
+        assert body["result"]["model"] == "gemini-2.5-flash"
+        assert body["result"]["usage"]["total_tokens"] == 50
+
+    def test_set_status_encodes_simplenamespace_output(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={})
+
+        store = _make_store(handler)
+        store.set_status(
+            "r1",
+            "completed",
+            output=SimpleNamespace(answer="42", confidence=0.9),
+        )
+
+        body = captured["body"]
+        assert body["status"] == "completed"
+        assert body["output"]["answer"] == "42"
+        assert body["output"]["confidence"] == 0.9
+
+    def test_save_task_rejects_non_json_snapshot(self) -> None:
+        """Snapshots use strict=True to match SQLite's _encode_snapshot
+        contract — silent degradation to repr would poison the /item/:id
+        diff view."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json={})
+
+        store = _make_store(handler)
+        entry = TaskEntry(
+            label="enrich",
+            result={"ok": True},
+            duration_ms=50,
+            completed_at="2026-04-21T00:00:00+00:00",
+            input_snapshot=SimpleNamespace(not_json=True),
+        )
+        with pytest.raises(ValueError):
+            store.save_task("r1", entry)
 
 
 class TestBackwardCompat:

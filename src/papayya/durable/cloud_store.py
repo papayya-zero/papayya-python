@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from papayya._defaults import DEFAULT_BASE_URL
+from papayya._serialize import encode_user_value
 
 from .types import CheckpointStore, RunCheckpoint, TaskEntry
 
@@ -80,11 +82,11 @@ class CloudStore:
             f"/v1/durable/runs/{run_id}/checkpoints",
             json={
                 "label": entry.label,
-                "result": entry.result,
+                "result": json.loads(encode_user_value(entry.result)),
                 "duration_ms": entry.duration_ms,
                 "item_id": entry.item_id,
-                "input_snapshot": entry.input_snapshot,
-                "output_snapshot": entry.output_snapshot,
+                "input_snapshot": json.loads(encode_user_value(entry.input_snapshot, strict=True)),
+                "output_snapshot": json.loads(encode_user_value(entry.output_snapshot, strict=True)),
             },
         )
         resp.raise_for_status()
@@ -92,7 +94,7 @@ class CloudStore:
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
         resp = self._client.patch(
             f"/v1/durable/runs/{run_id}",
-            json={"status": status, "output": output},
+            json={"status": status, "output": json.loads(encode_user_value(output))},
         )
         resp.raise_for_status()
 
