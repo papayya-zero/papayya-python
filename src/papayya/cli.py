@@ -1122,6 +1122,181 @@ def secrets_delete(ctx: click.Context, name: str, project_id: str | None) -> Non
         api.close()
 
 
+# ---------------------------------------------------------------------------
+# rate-card — per-project per-model token pricing for dashboard $ estimates.
+# Customer provides their own rates; Papayya doesn't ship a pricing table.
+# ---------------------------------------------------------------------------
+
+
+def _dollars_per_million_to_cents(amount: float) -> int:
+    """Convert the dollar-per-million-tokens amount humans type from a
+    pricing page into the integer cents stored internally. Rounds to the
+    nearest cent — providers don't publish fractional-cent rates."""
+    return int(round(amount * 100))
+
+
+def _cents_per_million_to_dollars(cents: int) -> float:
+    return cents / 100.0
+
+
+def _require_rate_card_context(ctx: click.Context) -> tuple[APIClient, str]:
+    """Resolve API key + project id, build an APIClient. Exits on missing auth."""
+    resolved_key = _resolve_api_key(ctx.obj["api_key"])
+    if not resolved_key:
+        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
+        sys.exit(1)
+    project_id = _resolve_project_id(ctx.obj)
+    if not project_id:
+        click.echo("Error: --project-id required (or run `papayya signup` to save one).", err=True)
+        sys.exit(1)
+    api = APIClient(APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"]))
+    return api, project_id
+
+
+@main.group("rate-card")
+@click.pass_context
+def rate_card(ctx: click.Context) -> None:
+    """Manage per-model token pricing for dashboard $ estimates.
+
+    Papayya doesn't ship a built-in pricing table — you bring your own
+    rates. Token counts are always recorded; rate cards turn them into
+    dollar estimates only where you've configured pricing.
+    """
+
+
+@rate_card.command("show")
+@click.pass_context
+def rate_card_show(ctx: click.Context) -> None:
+    """Print the current rate card as JSON (cents per million tokens)."""
+    api, project_id = _require_rate_card_context(ctx)
+    try:
+        result = api.get_rate_card(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        api.close()
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
+@rate_card.command("set")
+@click.argument("model")
+@click.option("--input-per-million", type=float, required=True, help="Dollars per million input tokens (e.g. 3.00)")
+@click.option("--output-per-million", type=float, required=True, help="Dollars per million output tokens (e.g. 15.00)")
+@click.pass_context
+def rate_card_set(ctx: click.Context, model: str, input_per_million: float, output_per_million: float) -> None:
+    """Add or update pricing for a single model. Dollars in, cents stored."""
+    if input_per_million < 0 or output_per_million < 0:
+        click.echo("Error: prices must be non-negative.", err=True)
+        sys.exit(1)
+
+    api, project_id = _require_rate_card_context(ctx)
+    try:
+        current = api.get_rate_card(project_id)
+        current[model] = {
+            "input_cents_per_million":  _dollars_per_million_to_cents(input_per_million),
+            "output_cents_per_million": _dollars_per_million_to_cents(output_per_million),
+        }
+        api.set_rate_card(project_id, current)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        api.close()
+
+    click.echo(f"Rate card updated for {model}: ${input_per_million:.2f}/1M in, ${output_per_million:.2f}/1M out")
+
+
+@rate_card.command("remove")
+@click.argument("model")
+@click.pass_context
+def rate_card_remove(ctx: click.Context, model: str) -> None:
+    """Remove pricing for a single model."""
+    api, project_id = _require_rate_card_context(ctx)
+    try:
+        current = api.get_rate_card(project_id)
+        if model not in current:
+            click.echo(f"Model {model} not in rate card (nothing to remove).")
+            return
+        del current[model]
+        api.set_rate_card(project_id, current)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        api.close()
+    click.echo(f"Removed rate card entry for {model}.")
+
+
+@rate_card.command("import")
+@click.option("--file", "file_path", required=True, type=click.Path(exists=True), help="JSON file (cents per million tokens)")
+@click.pass_context
+def rate_card_import(ctx: click.Context, file_path: str) -> None:
+    """Bulk-replace the rate card from a JSON file.
+
+    The file's shape must match `papayya rate-card show` output — a JSON
+    object mapping model_id → {input_cents_per_million, output_cents_per_million}.
+    """
+    try:
+        with open(file_path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        click.echo(f"Error reading {file_path}: {e}", err=True)
+        sys.exit(1)
+
+    if not isinstance(payload, dict):
+        click.echo("Error: rate card file must contain a JSON object.", err=True)
+        sys.exit(1)
+
+    api, project_id = _require_rate_card_context(ctx)
+    try:
+        api.set_rate_card(project_id, payload)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        api.close()
+    click.echo(f"Rate card imported ({len(payload)} models).")
+
+
+@rate_card.command("edit")
+@click.pass_context
+def rate_card_edit(ctx: click.Context) -> None:
+    """Open the current rate card in $EDITOR and write back on save."""
+    api, project_id = _require_rate_card_context(ctx)
+    try:
+        current = api.get_rate_card(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    edited_raw = click.edit(json.dumps(current, indent=2, sort_keys=True) + "\n", extension=".json")
+    if edited_raw is None:
+        click.echo("No changes (editor exited without saving).")
+        api.close()
+        return
+
+    try:
+        edited = json.loads(edited_raw)
+    except json.JSONDecodeError as e:
+        click.echo(f"Error: edited content is not valid JSON: {e}", err=True)
+        api.close()
+        sys.exit(1)
+    if not isinstance(edited, dict):
+        click.echo("Error: rate card must be a JSON object.", err=True)
+        api.close()
+        sys.exit(1)
+
+    try:
+        api.set_rate_card(project_id, edited)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        api.close()
+    click.echo(f"Rate card saved ({len(edited)} models).")
+
+
 @main.command()
 @click.option("--file", required=True, help="Path to agent definition file")
 @click.option("--poll-interval", default=2.0, help="Poll interval in seconds")

@@ -184,3 +184,13 @@ class APIClient:
         resp = self._http.request("DELETE", f"/v1/projects/{project_id}/secrets/{name}")
         if not resp.is_success:
             raise PapayyaAPIError(resp.status_code, resp.text)
+
+    # -- Rate card -----------------------------------------------------------
+
+    def get_rate_card(self, project_id: str) -> dict[str, Any]:
+        """Return the project's per-model rate card. Empty dict if unset."""
+        return self._request("GET", f"/v1/projects/{project_id}/rate-card")
+
+    def set_rate_card(self, project_id: str, rate_card: dict[str, Any]) -> dict[str, Any]:
+        """Replace the project's rate card wholesale."""
+        return self._request("PUT", f"/v1/projects/{project_id}/rate-card", json=rate_card)
