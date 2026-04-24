@@ -165,6 +165,7 @@ def _resolve_api_key(ctx_key: str | None) -> str | None:
 
 
 @click.group()
+@click.version_option(package_name="papayya", prog_name="papayya")
 @click.option("--api-key", envvar="PAPAYYA_API_KEY", help="API key")
 @click.option("--base-url", envvar="PAPAYYA_BASE_URL", default=DEFAULT_BASE_URL, help="Control plane URL")
 @click.pass_context
@@ -270,7 +271,9 @@ def {name_underscore}(input_data):
     return "Max steps reached."
 
 
-# Run locally: python agent.py
+# Local smoke test: `python agent.py` runs your LLM call directly.
+# This bypasses papayya — no checkpoints, no step trace, no budget enforcement.
+# Deploy (`papayya deploy`) to run with durable execution + observability.
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
@@ -330,8 +333,10 @@ def init(name: str) -> None:
     if created > 0:
         click.echo("\nNext steps:")
         click.echo("  1. pip install -r requirements.txt")
-        click.echo("  2. Edit agent.py to define your agent and tools")
-        click.echo("  3. papayya run --local --file agent.py --input 'Hello'")
+        click.echo("  2. Set your LLM provider key (e.g. export OPENAI_API_KEY=sk-...)")
+        click.echo("  3. Test the agent file directly:  python agent.py")
+        click.echo("  4. When it works locally, deploy:  papayya deploy")
+        click.echo("  5. Then trigger a cloud run:       papayya run --file agent.py --input 'Hello'")
 
 
 # ---------------------------------------------------------------------------
@@ -889,23 +894,22 @@ def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> Non
     """Local execution is BYOF — run your agent file directly.
 
     Papayya does not ship LLM provider adapters, so the CLI cannot run an
-    agent on your behalf. Execute your agent file directly with Python
-    instead (``python agent.py``) — your code owns the LLM call, papayya
-    owns durable checkpointing via ``run.task(...)``.
+    agent on your behalf. See the deprecation message below for the two
+    supported paths (direct python invocation, or durable local wrap).
     """
     del agent, input_text, api_key_override
     click.echo(
-        "Local execution via `papayya run --local` is no longer supported.\n"
+        "`papayya run --local` was removed.\n"
         "\n"
-        "Papayya does not ship LLM provider adapters — your code calls the\n"
-        "LLM directly and wraps it with `papayya.durable.run.task()` for\n"
-        "durable execution. To run your agent locally, execute the file\n"
-        "directly:\n"
-        "\n"
+        "To run your scaffolded agent locally (no durable execution):\n"
         "    python agent.py\n"
         "\n"
-        "To run in the cloud runtime, deploy and use `papayya run` without\n"
-        "the --local flag. See docs/pages/sdk/byof for examples.",
+        "To deploy and run in papayya's cloud runtime (durable + observable):\n"
+        "    papayya deploy\n"
+        "    papayya run --file agent.py --input \"...\"\n"
+        "\n"
+        "To add durable execution without deploying, wrap your LLM calls\n"
+        "with the papayya() factory — see Path A in https://getpapayya.com/docs/quickstart",
         err=True,
     )
     sys.exit(1)
