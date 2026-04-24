@@ -13,29 +13,20 @@ from typing import Any, Iterator
 import click
 
 from papayya._cli_errors import SafeGroup
+from papayya._config import (
+    CONFIG_FILE as _CONFIG_FILE,
+    PapayyaYaml,
+    PapayyaYamlError,
+    current_env as _current_env,
+    env_config as _env_config,
+    list_envs as _list_envs,
+    load_cli_config as _load_cli_config,
+    load_yaml as _load_yaml,
+    save_cli_config as _save_cli_config,
+    set_env_config as _set_env_config,
+)
 from papayya._defaults import DEFAULT_BASE_URL
 from papayya.api import APIClient, APIConfig, PapayyaAPIError, resolve_config
-
-
-# ---------------------------------------------------------------------------
-# Config persistence (~/.papayya/config.json)
-# ---------------------------------------------------------------------------
-
-_CONFIG_DIR = Path.home() / ".papayya"
-_CONFIG_FILE = _CONFIG_DIR / "config.json"
-
-
-def _load_cli_config() -> dict[str, Any]:
-    """Load persisted CLI config (API key, base_url, project_id, etc.)."""
-    try:
-        return json.loads(_CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def _save_cli_config(data: dict[str, Any]) -> None:
-    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def _load_agent_from_file(path: str) -> Any:
@@ -117,12 +108,13 @@ def _discover_agents(path: str) -> list:
 
 
 def _resolve_project_id(ctx_obj: dict) -> str | None:
-    """Resolve project ID from flag, env, or saved config."""
+    """Resolve project ID from flag, env, or the current env's saved config."""
     pid = os.environ.get("PAPAYYA_PROJECT_ID")
     if pid:
         return pid
     cfg = _load_cli_config()
-    return cfg.get("project_id")
+    env_name = ctx_obj.get("env") or _current_env(cfg)
+    return _env_config(cfg, env_name).get("project_id")
 
 
 def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
@@ -155,26 +147,38 @@ def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
     return result["id"]
 
 
-def _resolve_api_key(ctx_key: str | None) -> str | None:
-    """Resolve API key from CLI flag, env, or saved config."""
+def _resolve_api_key(ctx_key: str | None, env: str | None = None) -> str | None:
+    """Resolve API key from CLI flag, env var, or the current env's saved config."""
     key = ctx_key or os.environ.get("PAPAYYA_API_KEY")
     if key:
         return key
-    # Fall back to saved config
     cfg = _load_cli_config()
-    return cfg.get("api_key")
+    return _env_config(cfg, env or _current_env(cfg)).get("api_key")
 
 
 @click.group(cls=SafeGroup)
 @click.version_option(package_name="papayya", prog_name="papayya")
 @click.option("--api-key", envvar="PAPAYYA_API_KEY", help="API key")
 @click.option("--base-url", envvar="PAPAYYA_BASE_URL", default=DEFAULT_BASE_URL, help="Control plane URL")
+@click.option("--env", "env", envvar="PAPAYYA_ENV", default=None,
+              help="Override the current env (defaults to envs.current_env in ~/.papayya/config.json)")
 @click.pass_context
-def main(ctx: click.Context, api_key: str | None, base_url: str) -> None:
+def main(ctx: click.Context, api_key: str | None, base_url: str, env: str | None) -> None:
     """Papayya — durable background jobs for AI agents."""
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
     ctx.obj["base_url"] = base_url
+    ctx.obj["env"] = env
+
+    # One-time notice when the legacy flat config gets wrapped into envs.dev.
+    cfg = _load_cli_config()
+    if cfg.get("_migrated_from_v1"):
+        click.echo(
+            f"Notice: migrated your existing config into env 'dev' ({_CONFIG_FILE}). "
+            f"Run `papayya envs list` to see it.",
+            err=True,
+        )
+        _save_cli_config(cfg)  # strips the marker
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +359,9 @@ def signup(ctx: click.Context, email: str, password: str, name: str, force: bool
     base_url = ctx.obj["base_url"]
 
     existing = _load_cli_config()
-    if existing.get("api_key") and not force:
-        current_email = existing.get("email", "<unknown email>")
+    existing_dev = _env_config(existing, "dev")
+    if existing_dev.get("api_key") and not force:
+        current_email = existing_dev.get("email") or (existing.get("auth") or {}).get("email", "<unknown email>")
         click.echo(
             f"Error: already signed in as {current_email} ({_CONFIG_FILE}).\n"
             "  Run `papayya logout` to clear the current config, or pass --force to overwrite.\n"
@@ -398,14 +403,21 @@ def signup(ctx: click.Context, email: str, password: str, name: str, force: bool
         api_key = key_resp.get("key") or key_resp.get("api_key") or key_resp.get("raw_key", "")
         click.echo(f"  ✓ API key generated")
 
-        # 5. Persist config
-        _save_cli_config({
+        # 5. Persist config — dev env holds the project-scoped key; JWT lives
+        # at the top level under `auth` for commands like `envs create` that
+        # need account-level credentials.
+        cfg = _load_cli_config()
+        _set_env_config(cfg, "dev", {
             "api_key": api_key,
             "base_url": base_url,
             "project_id": project_id,
             "email": email,
         })
+        cfg["current_env"] = "dev"
+        cfg["auth"] = {"jwt": jwt, "email": email}
+        _save_cli_config(cfg)
         click.echo(f"\n✓ All set! Config saved to {_CONFIG_FILE}")
+        click.echo(f"  Env: dev")
         click.echo(f"  API key: {api_key[:12]}...")
         click.echo(f"  Project: {project_id}")
         click.echo("\nNext: papayya init --name my-agent")
@@ -453,13 +465,20 @@ def login(ctx: click.Context, email: str, password: str) -> None:
             # Use JWT as fallback
             api_key = jwt
 
-        _save_cli_config({
+        cfg = _load_cli_config()
+        # Default to writing into dev unless another env is already current.
+        target_env = _current_env(cfg) if cfg.get("envs") else "dev"
+        _set_env_config(cfg, target_env, {
             "api_key": api_key,
             "base_url": base_url,
             "project_id": project_id,
             "email": email,
         })
+        cfg["current_env"] = target_env
+        cfg["auth"] = {"jwt": jwt, "email": email}
+        _save_cli_config(cfg)
         click.echo(f"✓ Logged in! Config saved to {_CONFIG_FILE}")
+        click.echo(f"  Env: {target_env}")
         click.echo(f"  Project: {project_id}")
 
     except PapayyaAPIError as e:
@@ -478,9 +497,150 @@ def logout() -> None:
         click.echo("Not signed in — no config to remove.")
         return
     existing = _load_cli_config()
-    email = existing.get("email", "<unknown>")
+    email = (existing.get("auth") or {}).get("email") or _env_config(existing).get("email", "<unknown>")
     _CONFIG_FILE.unlink()
     click.echo(f"✓ Logged out ({email}). Removed {_CONFIG_FILE}.")
+
+
+# ---------------------------------------------------------------------------
+# envs
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def envs() -> None:
+    """Manage papayya environments (each env maps to its own project + API key)."""
+
+
+@envs.command("list")
+def envs_list() -> None:
+    """List all configured envs, marking the current one with an asterisk."""
+    cfg = _load_cli_config()
+    names = _list_envs(cfg)
+    if not names:
+        click.echo(
+            "No envs configured yet.\n"
+            "  Run `papayya signup` to create your first env,\n"
+            "  or `papayya envs link <name> --project-id ... --api-key ...` "
+            "to link an existing project."
+        )
+        return
+    current = _current_env(cfg)
+    for name in names:
+        env_block = _env_config(cfg, name)
+        project = env_block.get("project_id") or "<no project>"
+        marker = "*" if name == current else " "
+        click.echo(f" {marker} {name}  (project: {project})")
+
+
+@envs.command("use")
+@click.argument("name")
+def envs_use(name: str) -> None:
+    """Switch the current env. Subsequent commands use this env's credentials."""
+    cfg = _load_cli_config()
+    if name not in _list_envs(cfg):
+        configured = ", ".join(_list_envs(cfg)) or "(none)"
+        click.echo(
+            f"Error: env '{name}' is not configured. Configured envs: {configured}",
+            err=True,
+        )
+        sys.exit(1)
+    cfg["current_env"] = name
+    _save_cli_config(cfg)
+    click.echo(f"✓ Current env: {name}")
+
+
+@envs.command("link")
+@click.argument("name")
+@click.option("--project-id", required=True, help="Existing project ID (from the dashboard)")
+@click.option("--api-key", "api_key", required=True, help="Project-scoped API key (cpk_...)")
+@click.option("--base-url", default=None, help="Override the control plane URL for this env")
+@click.pass_context
+def envs_link(ctx: click.Context, name: str, project_id: str, api_key: str, base_url: str | None) -> None:
+    """Link an existing project + API key into a named env."""
+    if not name or not name.strip():
+        click.echo("Error: env name must be non-empty.", err=True)
+        sys.exit(1)
+    cfg = _load_cli_config()
+    _set_env_config(cfg, name, {
+        "api_key": api_key,
+        "base_url": base_url or ctx.obj["base_url"],
+        "project_id": project_id,
+    })
+    if _current_env(cfg) not in _list_envs(cfg):
+        cfg["current_env"] = name
+    _save_cli_config(cfg)
+    click.echo(f"✓ Linked env '{name}' to project {project_id}.")
+    click.echo(f"  Switch to it with: papayya envs use {name}")
+
+
+@envs.command("create")
+@click.argument("name")
+@click.pass_context
+def envs_create(ctx: click.Context, name: str) -> None:
+    """Provision a new project + API key and persist it as an env.
+
+    Requires an account-level session (JWT) in ~/.papayya/config.json.
+    Run `papayya login` if the command rejects your stored credentials.
+    """
+    if not name or not name.strip():
+        click.echo("Error: env name must be non-empty.", err=True)
+        sys.exit(1)
+
+    cfg = _load_cli_config()
+    if name in _list_envs(cfg):
+        click.echo(
+            f"Error: env '{name}' already exists. Use `papayya envs use {name}` "
+            f"to switch, or pick a different name.",
+            err=True,
+        )
+        sys.exit(1)
+
+    jwt = (cfg.get("auth") or {}).get("jwt")
+    if not jwt:
+        click.echo(
+            "Error: no account session found. Run `papayya login` first — "
+            "`envs create` needs account-level credentials to create projects.",
+            err=True,
+        )
+        sys.exit(1)
+
+    base_url = ctx.obj["base_url"]
+    api = APIClient(APIConfig(api_key=jwt, base_url=base_url))
+    try:
+        slug = f"env-{name.lower()}"[:60]
+        click.echo(f"Creating project for env '{name}'...")
+        try:
+            project = api.create_project(name=f"papayya env {name}", slug=slug)
+        except PapayyaAPIError as exc:
+            if exc.status in (401, 403):
+                click.echo(
+                    "Error: stored credentials were rejected. "
+                    "Run `papayya login` to refresh, then retry.",
+                    err=True,
+                )
+                sys.exit(1)
+            raise
+        project_id = project["id"]
+        click.echo(f"  ✓ Project created ({project_id})")
+
+        click.echo("Generating API key...")
+        key_resp = api.create_api_key(project_id, name=f"cli-env-{name}")
+        api_key = key_resp.get("key") or key_resp.get("api_key") or key_resp.get("raw_key", "")
+        click.echo(f"  ✓ API key generated")
+
+        _set_env_config(cfg, name, {
+            "api_key": api_key,
+            "base_url": base_url,
+            "project_id": project_id,
+        })
+        cfg["current_env"] = name
+        _save_cli_config(cfg)
+        click.echo(f"\n✓ Env '{name}' is ready and selected as current.")
+        click.echo(f"  Project: {project_id}")
+        click.echo(f"  API key: {api_key[:12]}...")
+    finally:
+        api.close()
 
 
 # ---------------------------------------------------------------------------
@@ -493,16 +653,31 @@ def logout() -> None:
 @click.option("--project-id", default=None, envvar="PAPAYYA_PROJECT_ID", help="Project ID")
 @click.option("--runtime", default="python", type=click.Choice(["python", "node"]), help="Runtime type")
 @click.option("--entrypoint", default=None, help="Entrypoint file (default: auto-detected)")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="Show planned trigger changes without applying them.")
 @click.pass_context
-def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_id: str | None, runtime: str, entrypoint: str | None) -> None:
+def deploy(
+    ctx: click.Context,
+    file: str | None,
+    agent_id: str | None,
+    project_id: str | None,
+    runtime: str,
+    entrypoint: str | None,
+    dry_run: bool,
+) -> None:
     """Deploy agent code to the control plane.
 
     \b
     Usage:
       papayya deploy              # auto-discover agent.py in cwd
       papayya deploy agents.py    # explicit file
+      papayya deploy --dry-run    # preview trigger reconciliation
+
+    If a `papayya.yaml` is present, schedules and webhooks declared in it are
+    reconciled against the selected env's project after the bundle upload.
     """
     from papayya.bundler import bundle_project
+    from papayya import _reconcile
 
     # Auto-discover file
     if file is None:
@@ -512,8 +687,20 @@ def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_i
             click.echo("Error: No agent.py found in current directory. Specify a file:\n  papayya deploy my_agents.py", err=True)
             sys.exit(1)
 
+    # Detect optional papayya.yaml
+    yaml_path = Path("papayya.yaml")
+    spec: PapayyaYaml | None = None
+    env_name: str | None = None
+    if yaml_path.exists():
+        try:
+            spec = _load_yaml(yaml_path)
+        except PapayyaYamlError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        env_name = _pick_yaml_env(spec, ctx.obj.get("env"))
+
     # Resolve auth
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
+    resolved_key = _resolve_api_key(ctx.obj["api_key"], env=env_name)
     if not resolved_key:
         click.echo(
             "Error: No API key found.\n"
@@ -541,12 +728,16 @@ def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_i
 
         # Resolve project ID for agent lookup/create
         if not project_id:
-            project_id = _resolve_project_id(ctx.obj)
+            project_id = _resolve_project_id({**ctx.obj, "env": env_name or ctx.obj.get("env")})
         if not project_id and not agent_id:
             click.echo("Error: No project ID. Set PAPAYYA_PROJECT_ID or run `papayya signup`.", err=True)
             sys.exit(1)
 
-        # Deploy each agent
+        if spec is not None:
+            click.echo(f"Using env '{env_name}' (project {project_id})")
+
+        # Deploy each agent; track slug -> agent_id for the reconciler.
+        deployed: dict[str, str] = {}
         for reg in agents:
             click.echo(f"\nDeploying {reg.name}...")
 
@@ -587,8 +778,132 @@ def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_i
                 else:
                     click.echo(f"  Status: {state}...")
 
+            slug = reg.name.lower().replace(" ", "-")
+            deployed[slug] = resolved_agent_id
+            click.echo(f"  Deployed {slug} → {resolved_agent_id}")
+
+        # Reconcile triggers if a yaml was present.
+        if spec is not None and env_name is not None:
+            env_spec = spec.envs[env_name]
+            has_triggers = any(a.schedules or a.webhooks for a in env_spec.agents.values())
+            if not has_triggers:
+                click.echo("\nNo triggers declared.")
+            else:
+                click.echo(f"\nReconciling triggers for env '{env_name}'...")
+                try:
+                    plan = _reconcile.diff_env(env_spec, deployed, api)
+                except _reconcile.ReconcileError as e:
+                    click.echo(f"Error: {e}", err=True)
+                    sys.exit(1)
+
+                _print_reconcile_plan(plan, api_base_url=ctx.obj["base_url"])
+
+                if dry_run:
+                    click.echo("\nDry run — no changes applied.")
+                    return
+
+                if plan.is_noop:
+                    click.echo("\nNo changes to apply.")
+                else:
+                    result = _reconcile.apply_plan(plan, api)
+                    _print_apply_result(result, api_base_url=ctx.obj["base_url"])
+                    if result.error is not None:
+                        sys.exit(1)
+
     finally:
         api.close()
+
+
+def _pick_yaml_env(spec: PapayyaYaml, cli_env: str | None) -> str:
+    """Choose the env to reconcile against, or fail loud."""
+    envs = sorted(spec.envs.keys())
+    if not envs:
+        click.echo("Error: papayya.yaml has no `envs:` block.", err=True)
+        sys.exit(1)
+    if cli_env is not None:
+        if cli_env not in spec.envs:
+            click.echo(
+                f"Error: env '{cli_env}' not defined in papayya.yaml. Available: {envs}.",
+                err=True,
+            )
+            sys.exit(1)
+        return cli_env
+    if len(envs) == 1:
+        return envs[0]
+    click.echo(
+        f"Error: papayya.yaml defines multiple envs {envs}. Pass --env NAME "
+        "(or set PAPAYYA_ENV).",
+        err=True,
+    )
+    sys.exit(1)
+
+
+def _print_reconcile_plan(plan, *, api_base_url: str) -> None:
+    """Render the plan to stdout before apply (and as the dry-run output)."""
+    for agent_plan in plan.agents:
+        click.echo(f"\nagent: {agent_plan.slug} ({agent_plan.agent_id})")
+        if agent_plan.is_noop:
+            click.echo("  (no changes)")
+            continue
+        # Schedules
+        for op in agent_plan.schedule_ops:
+            prefix = "+" if op.kind == "create" else "-"
+            suffix = "create" if op.kind == "create" else "delete (not in yaml)"
+            click.echo(f"  {prefix} schedule {op.cron:<22} {suffix}")
+        # Webhooks — surface rotation warning before the delete/create pair.
+        rotating_names = {
+            op.name for op in agent_plan.webhook_ops
+            if op.kind == "create" and op.reason == "rename"
+        }
+        if rotating_names:
+            for name in sorted(rotating_names):
+                click.echo(
+                    f"  WARNING: rotating webhook '{name}' — downstream senders "
+                    "must update URL and secret"
+                )
+        for op in agent_plan.webhook_ops:
+            prefix = "+" if op.kind == "create" else "-"
+            if op.kind == "create":
+                tag = "create (rename)" if op.reason == "rename" else "create"
+            else:
+                tag = "delete (rename)" if op.reason == "removed" else "delete (not in yaml)"
+            click.echo(f"  {prefix} webhook  {op.name:<22} {tag}")
+            if op.kind == "create" and op.secret_env:
+                if not os.environ.get(op.secret_env):
+                    click.echo(
+                        f"      note: $ {op.secret_env} is not set locally — "
+                        "you'll need the secret printed after create"
+                    )
+
+
+def _print_apply_result(result, *, api_base_url: str) -> None:
+    """Render apply output (webhook secrets/URLs + final summary)."""
+    for created in result.created_webhooks:
+        name = created.get("name", "?")
+        secret = created.get("secret", "")
+        trigger_url = created.get("trigger_url") or ""
+        if trigger_url and not trigger_url.startswith("http"):
+            trigger_url = f"{api_base_url.rstrip('/')}{trigger_url}"
+        secret_env = created.get("secret_env")
+        click.echo(f"\nWebhook '{name}' created:")
+        click.echo(f"  URL:    {trigger_url}")
+        if secret_env:
+            unset_note = " (not set locally)" if not os.environ.get(secret_env) else ""
+            click.echo(
+                f"  secret: {secret}  "
+                f"(store in ${secret_env} — only shown once{unset_note})"
+            )
+        else:
+            click.echo(f"  secret: {secret}  (only shown once)")
+
+    if result.error is not None:
+        click.echo(f"\nError: {result.error}", err=True)
+        click.echo(
+            f"Applied {result.applied} of {result.total} operations.",
+            err=True,
+        )
+    else:
+        click.echo(f"\nApplied {result.applied} of {result.total} operations.")
 
 
 @main.command()

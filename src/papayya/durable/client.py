@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
+from papayya._config import env_config, load_cli_config
 from papayya._defaults import DEFAULT_BASE_URL
 
 from .run import PapayyaRun
@@ -30,13 +29,8 @@ def _resolve_api_key(explicit: str | None = None) -> str | None:
     key = os.environ.get("PAPAYYA_API_KEY")
     if key:
         return key
-    config_path = Path.home() / ".papayya" / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text()).get("api_key")
-        except Exception:
-            pass
-    return None
+    cfg = load_cli_config()
+    return env_config(cfg).get("api_key")
 
 
 def _resolve_base_url(explicit: str | None = None) -> str:

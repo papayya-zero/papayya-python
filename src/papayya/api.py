@@ -185,6 +185,46 @@ class APIClient:
         if not resp.is_success:
             raise PapayyaAPIError(resp.status_code, resp.text)
 
+    # -- Schedules -----------------------------------------------------------
+
+    def list_schedules(self, agent_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/v1/agents/{agent_id}/schedules")
+
+    def create_schedule(
+        self,
+        agent_id: str,
+        cron_expression: str,
+        timezone: str = "UTC",
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/agents/{agent_id}/schedules",
+            json={"cron_expression": cron_expression, "timezone": timezone},
+        )
+
+    def delete_schedule(self, schedule_id: str) -> None:
+        resp = self._http.request("DELETE", f"/v1/schedules/{schedule_id}")
+        if not resp.is_success:
+            raise PapayyaAPIError(resp.status_code, resp.text)
+
+    # -- Webhooks ------------------------------------------------------------
+
+    def list_webhooks(self, agent_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/v1/agents/{agent_id}/webhooks")
+
+    def create_webhook(self, agent_id: str, name: str) -> dict[str, Any]:
+        """Create a webhook. Response `secret` + `trigger_url` are only visible here."""
+        return self._request(
+            "POST",
+            f"/v1/agents/{agent_id}/webhooks",
+            json={"name": name},
+        )
+
+    def delete_webhook(self, webhook_id: str) -> None:
+        resp = self._http.request("DELETE", f"/v1/webhooks/{webhook_id}")
+        if not resp.is_success:
+            raise PapayyaAPIError(resp.status_code, resp.text)
+
     # -- Rate card -----------------------------------------------------------
 
     def get_rate_card(self, project_id: str) -> dict[str, Any]:

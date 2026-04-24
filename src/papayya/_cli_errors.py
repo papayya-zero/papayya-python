@@ -24,7 +24,7 @@ class SafeGroup(click.Group):
     def invoke(self, ctx: click.Context):
         try:
             return super().invoke(ctx)
-        except (click.ClickException, click.Abort, KeyboardInterrupt, SystemExit):
+        except (click.ClickException, click.Abort, click.exceptions.Exit, KeyboardInterrupt, SystemExit):
             raise
         except PapayyaAPIError as e:
             click.echo(f"Error: {e}", err=True)
