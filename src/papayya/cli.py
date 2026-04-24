@@ -342,10 +342,22 @@ def init(name: str) -> None:
 @click.option("--email", prompt=True, help="Your email address")
 @click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True, help="Password (min 8 characters)")
 @click.option("--name", prompt="Account name", help="Your name or org name")
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing ~/.papayya/config.json.")
 @click.pass_context
-def signup(ctx: click.Context, email: str, password: str, name: str) -> None:
+def signup(ctx: click.Context, email: str, password: str, name: str, force: bool) -> None:
     """Create a Papayya account and get an API key."""
     base_url = ctx.obj["base_url"]
+
+    existing = _load_cli_config()
+    if existing.get("api_key") and not force:
+        current_email = existing.get("email", "<unknown email>")
+        click.echo(
+            f"Error: already signed in as {current_email} ({_CONFIG_FILE}).\n"
+            "  Run `papayya logout` to clear the current config, or pass --force to overwrite.\n"
+            "  (Creating a new account clobbers your existing API key.)",
+            err=True,
+        )
+        sys.exit(1)
 
     if len(password) < 8:
         click.echo("Error: Password must be at least 8 characters.", err=True)
@@ -459,6 +471,18 @@ def login(ctx: click.Context, email: str, password: str) -> None:
         sys.exit(1)
     finally:
         api.close()
+
+
+@main.command()
+def logout() -> None:
+    """Remove the saved CLI config (~/.papayya/config.json)."""
+    if not _CONFIG_FILE.exists():
+        click.echo("Not signed in — no config to remove.")
+        return
+    existing = _load_cli_config()
+    email = existing.get("email", "<unknown>")
+    _CONFIG_FILE.unlink()
+    click.echo(f"✓ Logged out ({email}). Removed {_CONFIG_FILE}.")
 
 
 # ---------------------------------------------------------------------------

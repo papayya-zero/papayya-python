@@ -78,6 +78,7 @@ class PapayyaClient:
         *,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        item_id: str | None = None,
         store: CheckpointStore | None = None,
     ) -> PapayyaRun:
         """Create a new durable run."""
@@ -86,6 +87,7 @@ class PapayyaClient:
                 agent=agent,
                 run_id=run_id,
                 metadata=metadata,
+                item_id=item_id,
                 store=store or self._config.store,
             )
         )
