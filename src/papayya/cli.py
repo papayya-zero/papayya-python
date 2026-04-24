@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 import click
 
+from papayya._cli_errors import SafeGroup
 from papayya._defaults import DEFAULT_BASE_URL
 from papayya.api import APIClient, APIConfig, PapayyaAPIError, resolve_config
 
@@ -164,7 +165,7 @@ def _resolve_api_key(ctx_key: str | None) -> str | None:
     return cfg.get("api_key")
 
 
-@click.group()
+@click.group(cls=SafeGroup)
 @click.version_option(package_name="papayya", prog_name="papayya")
 @click.option("--api-key", envvar="PAPAYYA_API_KEY", help="API key")
 @click.option("--base-url", envvar="PAPAYYA_BASE_URL", default=DEFAULT_BASE_URL, help="Control plane URL")
@@ -412,12 +413,8 @@ def signup(ctx: click.Context, email: str, password: str, name: str, force: bool
     except PapayyaAPIError as e:
         if e.status == 409:
             click.echo("Error: An account with that email already exists. Try `papayya login`.", err=True)
-        else:
-            click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
+            sys.exit(1)
+        raise
     finally:
         api.close()
 
@@ -468,12 +465,8 @@ def login(ctx: click.Context, email: str, password: str) -> None:
     except PapayyaAPIError as e:
         if e.status == 401:
             click.echo("Error: Invalid email or password.", err=True)
-        else:
-            click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
+            sys.exit(1)
+        raise
     finally:
         api.close()
 
@@ -594,9 +587,6 @@ def deploy(ctx: click.Context, file: str | None, agent_id: str | None, project_i
                 else:
                     click.echo(f"  Status: {state}...")
 
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
@@ -1001,9 +991,6 @@ def status(ctx: click.Context, run_id: str) -> None:
         click.echo(f"Status: {result['status']}")
         click.echo(f"Step:   {result.get('current_step', 0)}")
         click.echo(f"Cost:   {result.get('total_cost_cents', 0)} cents")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
@@ -1048,9 +1035,6 @@ def logs(ctx: click.Context, run_id: str) -> None:
                     click.echo(f"  Tool: {tc.get('name', '?')}({json.dumps(tc.get('input', {}))})")
 
             click.echo()
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
@@ -1084,9 +1068,6 @@ def secrets_set(ctx: click.Context, name: str, value: str, project_id: str | Non
     try:
         api.set_secret(project_id, name, value)
         click.echo(f"Secret '{name}' set successfully.")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
@@ -1115,9 +1096,6 @@ def secrets_list(ctx: click.Context, project_id: str | None) -> None:
             return
         for s in result:
             click.echo(f"  {s['name']}  (updated: {s.get('updated_at', '?')})")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
@@ -1143,9 +1121,6 @@ def secrets_delete(ctx: click.Context, name: str, project_id: str | None) -> Non
     try:
         api.delete_secret(project_id, name)
         click.echo(f"Secret '{name}' deleted.")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     finally:
         api.close()
 
