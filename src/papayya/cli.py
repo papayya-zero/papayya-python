@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -156,6 +158,69 @@ def _resolve_api_key(ctx_key: str | None, env: str | None = None) -> str | None:
     return _env_config(cfg, env or _current_env(cfg)).get("api_key")
 
 
+@dataclass(frozen=True)
+class _EnvScope:
+    """Resolved (env, api_key, project_id, base_url) for a server-hitting command."""
+
+    env: str
+    api_key: str | None
+    project_id: str | None
+    base_url: str
+
+
+def _env_scope(ctx_obj: dict) -> _EnvScope:
+    """Resolve env + credentials + base_url from the current CLI context.
+
+    Precedence:
+      - api_key: ctx flag / PAPAYYA_API_KEY env > envs[env].api_key
+      - project_id: PAPAYYA_PROJECT_ID env > envs[env].project_id
+      - base_url: explicit --base-url / PAPAYYA_BASE_URL > envs[env].base_url > DEFAULT_BASE_URL
+    """
+    cfg = _load_cli_config()
+    env_name = ctx_obj.get("env") or _current_env(cfg)
+    env_cfg = _env_config(cfg, env_name)
+
+    api_key = (
+        ctx_obj.get("api_key")
+        or os.environ.get("PAPAYYA_API_KEY")
+        or env_cfg.get("api_key")
+    )
+    project_id = (
+        os.environ.get("PAPAYYA_PROJECT_ID")
+        or env_cfg.get("project_id")
+    )
+
+    # Explicit --base-url (flag or PAPAYYA_BASE_URL) beats the env's stored
+    # base_url; env-stored wins over DEFAULT_BASE_URL when the flag defaults.
+    explicit = ctx_obj.get("base_url_source") in {"COMMANDLINE", "ENVIRONMENT"}
+    ctx_base = ctx_obj.get("base_url") or DEFAULT_BASE_URL
+    base_url = ctx_base if explicit else (env_cfg.get("base_url") or ctx_base)
+
+    return _EnvScope(env=env_name, api_key=api_key, project_id=project_id, base_url=base_url)
+
+
+def _require_api_key(scope: _EnvScope) -> str:
+    if not scope.api_key:
+        click.echo(
+            "Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.",
+            err=True,
+        )
+        sys.exit(1)
+    return scope.api_key
+
+
+def _require_project_id(scope: _EnvScope) -> str:
+    if not scope.project_id:
+        click.echo(
+            f"Error: No project ID for env '{scope.env}'. "
+            f"Run `papayya envs link {scope.env} --project-id ...` "
+            "or set PAPAYYA_PROJECT_ID.",
+            err=True,
+        )
+        sys.exit(1)
+    return scope.project_id
+
+
 @click.group(cls=SafeGroup)
 @click.version_option(package_name="papayya", prog_name="papayya")
 @click.option("--api-key", envvar="PAPAYYA_API_KEY", help="API key")
@@ -169,6 +234,10 @@ def main(ctx: click.Context, api_key: str | None, base_url: str, env: str | None
     ctx.obj["api_key"] = api_key
     ctx.obj["base_url"] = base_url
     ctx.obj["env"] = env
+    # Stash where `base_url` came from so `_env_scope` can tell whether the
+    # user passed an explicit override vs. landed on the default.
+    source = ctx.get_parameter_source("base_url")
+    ctx.obj["base_url_source"] = source.name if source is not None else "DEFAULT"
 
     # One-time notice when the legacy flat config gets wrapped into envs.dev.
     cfg = _load_cli_config()
@@ -1156,28 +1225,128 @@ def project_import(file: str) -> None:
     )
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_agent_id(
+    positional: str | None,
+    agent_id_flag: str | None,
+    ctx_obj: dict,
+) -> str:
+    """Turn a slug-or-uuid positional (or --agent-id flag) into an agent UUID.
+
+    --agent-id wins when both are supplied. A uuid-shaped positional passes
+    through without an API call. Otherwise the positional is treated as a
+    slug and resolved against the selected env's project via list_agents.
+    Fails loud with available slugs on a miss.
+    """
+    if agent_id_flag:
+        return agent_id_flag
+    if not positional:
+        click.echo(
+            "Error: agent required. Pass a slug or UUID:\n"
+            '  papayya run my-agent "input"',
+            err=True,
+        )
+        sys.exit(1)
+
+    if _UUID_RE.match(positional):
+        return positional
+
+    scope = _env_scope(ctx_obj)
+    resolved_key = _require_api_key(scope)
+    project_id = _require_project_id(scope)
+    api = APIClient(APIConfig(api_key=resolved_key, base_url=scope.base_url))
+    try:
+        agents = api.list_agents(project_id)
+    finally:
+        api.close()
+
+    for a in agents:
+        if a.get("slug") == positional:
+            return a["id"]
+
+    slugs = sorted(a["slug"] for a in agents if a.get("slug"))
+    available = ", ".join(slugs) if slugs else "(none deployed)"
+    click.echo(
+        f"Error: no agent '{positional}' in env '{scope.env}'. "
+        f"Available: {available}",
+        err=True,
+    )
+    sys.exit(1)
+
+
 @main.command()
-@click.option("--file", required=True, help="Path to agent definition file")
-@click.option("--input", "input_text", required=True, help="Input for the agent")
+@click.argument("agent", required=False)
+@click.argument("input_positional", required=False)
+@click.option("--file", default=None, help="Path to agent definition file (default: agent.py in cwd)")
+@click.option("--input", "input_flag", default=None, help="Input for the agent (alt to positional)")
 @click.option("--local", "use_local", is_flag=True, default=False, help="Run locally (no cloud needed)")
-@click.option("--agent-id", default=None, help="Agent ID (required for cloud runs)")
+@click.option("--agent-id", default=None, help="Agent UUID (escape hatch; wins over positional)")
 @click.option("--name", "agent_name", default=None, help="Agent name (required when file declares multiple @agent functions)")
 @click.option("--api-key", "run_api_key", default=None, help="LLM API key for local runs")
 @click.pass_context
-def run(ctx: click.Context, file: str, input_text: str, use_local: bool, agent_id: str | None, agent_name: str | None, run_api_key: str | None) -> None:
-    """Run an agent locally or in the cloud."""
+def run(
+    ctx: click.Context,
+    agent: str | None,
+    input_positional: str | None,
+    file: str | None,
+    input_flag: str | None,
+    use_local: bool,
+    agent_id: str | None,
+    agent_name: str | None,
+    run_api_key: str | None,
+) -> None:
+    """Trigger a cloud run.
+
+    \b
+    Usage:
+      papayya run my-agent "hello"              # slug + positional input
+      papayya run my-agent "hello" --file a.py  # explicit file
+      papayya run <uuid> "hello"                # UUID also works
+    """
     if use_local:
-        _run_local(None, input_text, run_api_key)
+        _run_local(None, input_flag or input_positional, run_api_key)
         return
 
-    registrations = _discover_agents(file)
+    # Resolve input: positional wins; fall back to --input flag.
+    if input_positional is not None and input_flag is not None:
+        click.echo(
+            "Error: input provided twice (positional and --input). Pick one.",
+            err=True,
+        )
+        sys.exit(1)
+    input_text = input_positional if input_positional is not None else input_flag
+    if not input_text:
+        click.echo(
+            'Error: input required.\n  papayya run <agent> "your input"',
+            err=True,
+        )
+        sys.exit(1)
+
+    # Resolve file: --file wins; else auto-discover agent.py in cwd.
+    resolved_file = file
+    if resolved_file is None:
+        if Path("agent.py").exists():
+            resolved_file = "agent.py"
+        else:
+            click.echo(
+                "Error: --file required (or place agent.py in the current directory).",
+                err=True,
+            )
+            sys.exit(1)
+
+    registrations = _discover_agents(resolved_file)
     if len(registrations) == 1:
         reg = registrations[0]
     else:
         if not agent_name:
             names = ", ".join(r.name for r in registrations)
             click.echo(
-                f"Error: {file} declares {len(registrations)} agents ({names}).\n"
+                f"Error: {resolved_file} declares {len(registrations)} agents ({names}).\n"
                 "  Pass --name <agent-name> to pick one.",
                 err=True,
             )
@@ -1186,13 +1355,14 @@ def run(ctx: click.Context, file: str, input_text: str, use_local: bool, agent_i
         if not matches:
             names = ", ".join(r.name for r in registrations)
             click.echo(
-                f"Error: no @agent named '{agent_name}' in {file}. Available: {names}",
+                f"Error: no @agent named '{agent_name}' in {resolved_file}. Available: {names}",
                 err=True,
             )
             sys.exit(1)
         reg = matches[0]
 
-    _run_cloud(ctx, reg, file, input_text, agent_id)
+    resolved_agent_id = _resolve_agent_id(agent, agent_id, ctx.obj)
+    _run_cloud(ctx, reg, resolved_file, input_text, resolved_agent_id)
 
 
 def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> None:
@@ -1220,31 +1390,18 @@ def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> Non
     sys.exit(1)
 
 
-def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str | None) -> None:
+def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str) -> None:
     """Trigger a cloud run.
 
-    ``reg`` is an ``AgentRegistration`` produced by ``_discover_agents``.
+    ``reg`` is an ``AgentRegistration`` produced by ``_discover_agents``;
+    ``agent_id`` has already been resolved (slug → uuid) by the caller.
     """
-    if not agent_id:
-        click.echo(
-            "Error: --agent-id is required for cloud runs.\n"
-            "  Deploy first: papayya deploy --file agent.py --agent-id <id>",
-            err=True,
-        )
-        sys.exit(1)
-
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo(
-            "Error: No API key found.\n"
-            "  Run `papayya signup` first, or set PAPAYYA_API_KEY.",
-            err=True,
-        )
-        sys.exit(1)
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
 
     budget_cents = int(reg.budget_usd * 100) if reg.budget_usd is not None else 500
 
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
     try:
@@ -1293,11 +1450,9 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
 @click.pass_context
 def status(ctx: click.Context, run_id: str) -> None:
     """Check the status of a run."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
     try:
@@ -1315,11 +1470,9 @@ def status(ctx: click.Context, run_id: str) -> None:
 @click.pass_context
 def logs(ctx: click.Context, run_id: str) -> None:
     """Show step-by-step logs for a run."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
     try:
@@ -1354,6 +1507,19 @@ def logs(ctx: click.Context, run_id: str) -> None:
         api.close()
 
 
+def _secrets_scope(ctx: click.Context, project_id_override: str | None) -> tuple[APIClient, str]:
+    """Resolve (APIClient, project_id) for a secrets command.
+
+    --project-id (flag) wins; otherwise fall back to the env's project_id.
+    Fixes a pre-Phase-1 bug where secrets read the legacy flat
+    `project_id` key and silently broke for migrated accounts.
+    """
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    project_id = project_id_override or _require_project_id(scope)
+    return APIClient(APIConfig(api_key=resolved_key, base_url=scope.base_url)), project_id
+
+
 @main.group()
 @click.pass_context
 def secrets(ctx: click.Context) -> None:
@@ -1364,22 +1530,11 @@ def secrets(ctx: click.Context) -> None:
 @secrets.command("set")
 @click.argument("name")
 @click.argument("value")
-@click.option("--project-id", required=False, envvar="PAPAYYA_PROJECT_ID", default=None, help="Project ID")
+@click.option("--project-id", required=False, default=None, help="Project ID (overrides env config)")
 @click.pass_context
 def secrets_set(ctx: click.Context, name: str, value: str, project_id: str | None) -> None:
     """Set a secret for a project."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    if not project_id:
-        project_id = _load_cli_config().get("project_id")
-    if not project_id:
-        click.echo("Error: --project-id required (or run `papayya signup` to save one).", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
-    api = APIClient(config)
-
+    api, project_id = _secrets_scope(ctx, project_id)
     try:
         api.set_secret(project_id, name, value)
         click.echo(f"Secret '{name}' set successfully.")
@@ -1388,22 +1543,11 @@ def secrets_set(ctx: click.Context, name: str, value: str, project_id: str | Non
 
 
 @secrets.command("list")
-@click.option("--project-id", required=False, envvar="PAPAYYA_PROJECT_ID", default=None, help="Project ID")
+@click.option("--project-id", required=False, default=None, help="Project ID (overrides env config)")
 @click.pass_context
 def secrets_list(ctx: click.Context, project_id: str | None) -> None:
     """List secrets for a project (names only)."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    if not project_id:
-        project_id = _load_cli_config().get("project_id")
-    if not project_id:
-        click.echo("Error: --project-id required (or run `papayya signup` to save one).", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
-    api = APIClient(config)
-
+    api, project_id = _secrets_scope(ctx, project_id)
     try:
         result = api.list_secrets(project_id)
         if not result:
@@ -1417,22 +1561,11 @@ def secrets_list(ctx: click.Context, project_id: str | None) -> None:
 
 @secrets.command("delete")
 @click.argument("name")
-@click.option("--project-id", required=False, envvar="PAPAYYA_PROJECT_ID", default=None, help="Project ID")
+@click.option("--project-id", required=False, default=None, help="Project ID (overrides env config)")
 @click.pass_context
 def secrets_delete(ctx: click.Context, name: str, project_id: str | None) -> None:
     """Delete a secret."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    if not project_id:
-        project_id = _load_cli_config().get("project_id")
-    if not project_id:
-        click.echo("Error: --project-id required (or run `papayya signup` to save one).", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
-    api = APIClient(config)
-
+    api, project_id = _secrets_scope(ctx, project_id)
     try:
         api.delete_secret(project_id, name)
         click.echo(f"Secret '{name}' deleted.")
@@ -1459,15 +1592,10 @@ def _cents_per_million_to_dollars(cents: int) -> float:
 
 def _require_rate_card_context(ctx: click.Context) -> tuple[APIClient, str]:
     """Resolve API key + project id, build an APIClient. Exits on missing auth."""
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    project_id = _resolve_project_id(ctx.obj)
-    if not project_id:
-        click.echo("Error: --project-id required (or run `papayya signup` to save one).", err=True)
-        sys.exit(1)
-    api = APIClient(APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"]))
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    project_id = _require_project_id(scope)
+    api = APIClient(APIConfig(api_key=resolved_key, base_url=scope.base_url))
     return api, project_id
 
 
@@ -1624,11 +1752,9 @@ def worker(ctx: click.Context, file: str, poll_interval: float) -> None:
     from papayya.worker import run_worker
 
     agent = _load_agent_from_file(file)
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo("Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.", err=True)
-        sys.exit(1)
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
     try:
@@ -1647,14 +1773,9 @@ def _make_papayya_client(ctx: click.Context) -> Any:
     ``client.close()`` in a finally block."""
     from papayya import Papayya
 
-    resolved_key = _resolve_api_key(ctx.obj["api_key"])
-    if not resolved_key:
-        click.echo(
-            "Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.",
-            err=True,
-        )
-        sys.exit(1)
-    return Papayya(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    return Papayya(api_key=resolved_key, base_url=scope.base_url)
 
 
 def _iter_jsonl_items(path: str) -> Iterator[dict[str, Any]]:
