@@ -41,13 +41,23 @@ def _resolve_base_url(explicit: str | None = None) -> str:
 
 
 def _auto_store(api_key: str | None, base_url: str | None) -> CheckpointStore:
-    """Auto-select store: CloudStore if API key available, else SQLiteStore."""
+    """Auto-select store: CloudStore if API key available, else SQLiteStore.
+
+    SQLite path resolution: ``PAPAYYA_LOCAL_DB_PATH`` env var if set, else
+    the default ``.papayya/local.db``. The env-var override is used by the
+    runtime worker (`papayya.runtime`) to point customer SQLite writes at a
+    shared file so multiple workers (and the dispatcher / dashboard) read
+    consistent state.
+    """
     resolved_key = _resolve_api_key(api_key)
     if resolved_key:
         resolved_url = _resolve_base_url(base_url)
         from .cloud_store import CloudStore, CloudStoreConfig
         return CloudStore(CloudStoreConfig(api_key=resolved_key, base_url=resolved_url))
     from .sqlite_store import SQLiteStore
+    db_path = os.environ.get("PAPAYYA_LOCAL_DB_PATH")
+    if db_path:
+        return SQLiteStore(db_path)
     return SQLiteStore()
 
 

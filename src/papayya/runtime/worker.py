@@ -1,0 +1,217 @@
+"""Worker — long-lived process that pulls items from a dispatcher.
+
+The worker process:
+
+1. Imports the customer agent module *once* on boot (this triggers
+   ``@agent`` decorator registration).
+2. Loops: long-polls the dispatcher for the next leased item, looks
+   up the registered ``@agent`` function by name, calls it with the
+   ``item_id``, reports completion (or failure).
+3. Exits cleanly on SIGTERM / SIGINT.
+
+The dispatcher protocol is intentionally minimal for Phase 1:
+
+  GET  /lease?worker_id=X     -> 200 JSON {lease_id, agent, item_id} or 204
+  POST /complete              -> 200 JSON {}, body {lease_id, status, error?}
+
+Future phases add: heartbeats, lease TTL, code-distribution version
+negotiation, hot-reload signaling. None of that exists yet — Phase 1
+prototype is the simplest thing that proves workers can serve a batch
+with one module import.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+
+log = logging.getLogger("papayya.runtime")
+
+
+@dataclass
+class Lease:
+    """One unit of work assigned to this worker by the dispatcher."""
+    lease_id: str
+    agent: str
+    item_id: str
+    payload: dict[str, Any] | None = None
+
+
+class Worker:
+    """Long-running worker. Polls a dispatcher, runs ``@agent`` functions.
+
+    Args:
+        dispatcher_url: Base URL of the dispatcher (e.g. ``http://127.0.0.1:8765``).
+        store_path: Path to the SQLite file the customer's ``papayya()``
+            client should write through. Set as ``PAPAYYA_LOCAL_DB_PATH``
+            so customer code transparently picks it up.
+        agent_module_path: Path to the customer's ``.py`` file containing
+            ``@agent``-decorated function(s). Imported once on construction.
+        worker_id: Stable id for this worker (defaults to a random short id).
+        poll_idle_seconds: Sleep between empty-lease polls. Keep small for
+            responsive iteration loop; tune in Phase 2 from real load data.
+    """
+
+    def __init__(
+        self,
+        *,
+        dispatcher_url: str,
+        store_path: str,
+        agent_module_path: str,
+        worker_id: Optional[str] = None,
+        poll_idle_seconds: float = 0.05,
+    ) -> None:
+        self.dispatcher_url = dispatcher_url.rstrip("/")
+        self.store_path = store_path
+        self.worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
+        self.poll_idle_seconds = poll_idle_seconds
+        self._running = True
+
+        # Point the customer's papayya() client at our shared SQLite. Must be
+        # set BEFORE importing the agent module — the customer code may
+        # call `papayya()` at module top-level (rare but legal).
+        os.environ["PAPAYYA_LOCAL_DB_PATH"] = store_path
+        # Ensure CloudStore isn't picked up if a stray PAPAYYA_API_KEY is in
+        # env from the parent shell.
+        os.environ.pop("PAPAYYA_API_KEY", None)
+
+        self._import_agent_module(agent_module_path)
+
+    # --- agent module loading ------------------------------------------ #
+
+    def _import_agent_module(self, path: str) -> None:
+        """Import the customer's agent file by absolute path.
+
+        This is the *one* import that should happen for the lifetime of
+        the worker. The acceptance test verifies this via an external
+        counter — see tests/integration/test_worker_acceptance.py.
+        """
+        p = Path(path).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"agent module not found: {p}")
+
+        spec = importlib.util.spec_from_file_location(f"_papayya_user_{p.stem}", p)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot build module spec for: {p}")
+
+        module = importlib.util.module_from_spec(spec)
+        # Insert into sys.modules so the @agent decorator's module-level
+        # registry write side effect persists across this loader's lifetime.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        log.info("imported agent module: %s", p)
+
+    # --- main loop ----------------------------------------------------- #
+
+    def run(self) -> None:
+        """Block, pulling items from the dispatcher, until stopped."""
+        signal.signal(signal.SIGTERM, self._on_signal)
+        signal.signal(signal.SIGINT, self._on_signal)
+
+        while self._running:
+            lease = self._poll_lease()
+            if lease is None:
+                time.sleep(self.poll_idle_seconds)
+                continue
+            self._handle_lease(lease)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _on_signal(self, signum: int, _frame: Any) -> None:
+        log.info("worker %s received signal %s; shutting down", self.worker_id, signum)
+        self._running = False
+
+    # --- dispatcher I/O ------------------------------------------------ #
+
+    def _poll_lease(self) -> Lease | None:
+        url = f"{self.dispatcher_url}/lease?worker_id={self.worker_id}"
+        try:
+            with urllib_request.urlopen(url, timeout=2.0) as resp:
+                if resp.status == 204:
+                    return None
+                if resp.status != 200:
+                    log.warning("unexpected lease status: %s", resp.status)
+                    return None
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib_error.URLError as exc:
+            # Dispatcher unreachable — back off and retry. This will turn
+            # into a real error/heartbeat state in Phase 2.
+            log.debug("lease poll failed: %s", exc)
+            return None
+
+        return Lease(
+            lease_id=body["lease_id"],
+            agent=body["agent"],
+            item_id=body["item_id"],
+            payload=body.get("payload"),
+        )
+
+    def _report_complete(
+        self,
+        lease_id: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        body = {
+            "lease_id": lease_id,
+            "status": status,
+            "worker_id": self.worker_id,
+        }
+        if error is not None:
+            body["error"] = error
+        data = json.dumps(body).encode("utf-8")
+        req = urllib_request.Request(
+            f"{self.dispatcher_url}/complete",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=2.0):
+                pass
+        except urllib_error.URLError as exc:
+            # Phase 1 prototype: best-effort. Phase 2 adds retry + DLQ.
+            log.warning("failed to report completion for %s: %s", lease_id, exc)
+
+    # --- lease handling ------------------------------------------------ #
+
+    def _handle_lease(self, lease: Lease) -> None:
+        """Run the @agent function for a single leased item."""
+        # Late import: the customer module's @agent decorations registered
+        # into this same module-level dict, so a top-level import here
+        # would create a cycle / shadow.
+        from papayya.agent import get_agent
+
+        registration = get_agent(lease.agent)
+        if registration is None:
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"unknown agent: {lease.agent}",
+            )
+            return
+
+        try:
+            registration.fn(lease.item_id)
+            self._report_complete(lease.lease_id, status="completed")
+        except Exception as exc:  # noqa: BLE001 — customer code; isolate
+            log.exception("agent %s failed on item %s", lease.agent, lease.item_id)
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
