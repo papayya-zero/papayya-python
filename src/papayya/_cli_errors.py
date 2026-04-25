@@ -21,6 +21,29 @@ def _debug_enabled() -> bool:
 
 
 class SafeGroup(click.Group):
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        # `--env` is a root-group option but users naturally type it after the
+        # subcommand (`papayya deploy --env staging`). Click rejects that
+        # because subcommand parsing happens before group parsing. Hoist any
+        # `--env <value>` or `--env=value` to the front so both positions work.
+        # No subcommand declares its own `--env`, so this is unambiguous.
+        hoisted: list[str] = []
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if tok == "--env" and i + 1 < len(args):
+                hoisted.extend(args[i:i + 2])
+                del args[i:i + 2]
+                continue
+            if tok.startswith("--env="):
+                hoisted.append(tok)
+                del args[i]
+                continue
+            i += 1
+        if hoisted:
+            args = hoisted + args
+        return super().parse_args(ctx, args)
+
     def invoke(self, ctx: click.Context):
         try:
             return super().invoke(ctx)
