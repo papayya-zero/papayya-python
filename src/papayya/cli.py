@@ -254,163 +254,31 @@ def main(ctx: click.Context, api_key: str | None, base_url: str, env: str | None
 # init
 # ---------------------------------------------------------------------------
 
-_AGENT_PY_TEMPLATE = '''\
-"""My agent — edit the instructions, tools, and LLM call to fit your use-case.
-
-Papayya is a durable execution runtime — it does NOT call LLMs on your
-behalf. You bring your own LLM SDK (openai, anthropic, bedrock, ...) and
-call it directly inside your @agent function.
-"""
-
-import json
-from openai import OpenAI
-from papayya import agent
-
-
-# --- Tools (replace with your own) ---
-
-def greet(name: str) -> str:
-    return f"Hello, {{name}}! How can I help you today?"
-
-
-def lookup_weather(location: str) -> str:
-    return f"72°F and sunny in {{location}}"
-
-
-TOOLS = [
-    {{
-        "type": "function",
-        "function": {{
-            "name": "greet",
-            "description": "Return a friendly greeting.",
-            "parameters": {{
-                "type": "object",
-                "properties": {{"name": {{"type": "string"}}}},
-                "required": ["name"],
-            }},
-        }},
-    }},
-    {{
-        "type": "function",
-        "function": {{
-            "name": "lookup_weather",
-            "description": "Look up current weather for a location.",
-            "parameters": {{
-                "type": "object",
-                "properties": {{"location": {{"type": "string"}}}},
-                "required": ["location"],
-            }},
-        }},
-    }},
-]
-
-TOOL_FNS = {{
-    "greet": lambda args: greet(args["name"]),
-    "lookup_weather": lambda args: lookup_weather(args["location"]),
-}}
-
-SYSTEM = (
-    "You are a helpful assistant. "
-    "Use the greet tool when the user says hello. "
-    "Use the lookup_weather tool when asked about weather."
-)
-
-
-@agent(name="{name}", model="gpt-4o-mini", instructions=SYSTEM, max_steps=10, budget_usd=1.00)
-def {name_underscore}(input_data):
-    """Agent loop — calls OpenAI with tools. Replace with your own logic."""
-    client = OpenAI()
-    prompt = input_data if isinstance(input_data, str) else json.dumps(input_data)
-    messages = [
-        {{"role": "system", "content": SYSTEM}},
-        {{"role": "user", "content": prompt}},
-    ]
-
-    for step in range(10):
-        response = client.chat.completions.create(
-            model="gpt-4o-mini", messages=messages, tools=TOOLS,
-        )
-        choice = response.choices[0]
-
-        if not choice.message.tool_calls:
-            return choice.message.content
-
-        messages.append(choice.message)
-        for tc in choice.message.tool_calls:
-            args = json.loads(tc.function.arguments)
-            fn = TOOL_FNS.get(tc.function.name)
-            result = fn(args) if fn else f"Unknown tool: {{tc.function.name}}"
-            messages.append({{"role": "tool", "tool_call_id": tc.id, "content": result}})
-
-    return "Max steps reached."
-
-
-# Local smoke test: `python agent.py` runs your LLM call directly.
-# This bypasses papayya — no checkpoints, no step trace, no budget enforcement.
-# Deploy (`papayya deploy`) to run with durable execution + observability.
-if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
-    print({name_underscore}("Hello! What\\'s the weather in Toronto?"))
-'''
-
-_REQUIREMENTS_TEMPLATE = """\
-papayya>=0.1.0
-openai>=1.0.0
-python-dotenv>=1.0.0
-# Install whichever LLM SDK you actually use — papayya does not depend on any.
-# anthropic>=0.40.0
-"""
-
-_ENV_EXAMPLE_TEMPLATE = """\
-# Papayya configuration
-# Copy this file to .env and fill in your keys.
-
-# LLM provider key — set whichever provider your agent code uses.
-# Papayya does not read this; your LLM SDK does.
-# ANTHROPIC_API_KEY=sk-ant-...
-# OPENAI_API_KEY=sk-...
-
-# Papayya platform key (for cloud deploys / runs)
-# Run `papayya signup` to get one automatically.
-PAPAYYA_API_KEY=
-
-# Override the default control plane URL if needed
-# PAPAYYA_BASE_URL=http://localhost:8090
-"""
-
-
 @main.command()
-@click.option("--name", default="my-agent", help="Agent name")
-def init(name: str) -> None:
-    """Scaffold a new agent project in the current directory."""
+def init() -> None:
+    """Scaffold a minimal papayya.yaml in the current directory."""
     cwd = Path.cwd()
-    click.echo(f'Initializing agent project "{name}" in {cwd}')
+    target = cwd / "papayya.yaml"
 
-    name_underscore = name.replace("-", "_").replace(" ", "_")
-    files = {
-        "agent.py": _AGENT_PY_TEMPLATE.format(name=name, name_underscore=name_underscore),
-        "requirements.txt": _REQUIREMENTS_TEMPLATE,
-        ".env.example": _ENV_EXAMPLE_TEMPLATE,
-    }
+    if target.exists():
+        click.confirm(
+            "papayya.yaml already exists. Overwrite?",
+            default=False,
+            abort=True,
+        )
 
-    created = 0
-    for filename, content in files.items():
-        target = cwd / filename
-        if target.exists():
-            click.echo(f"  ⚠ {filename} already exists — skipping")
-            continue
-        target.write_text(content)
-        click.echo(f"  ✓ Created {filename}")
-        created += 1
-
-    if created > 0:
-        click.echo("\nNext steps:")
-        click.echo("  1. pip install -r requirements.txt")
-        click.echo("  2. Set your LLM provider key (e.g. export OPENAI_API_KEY=sk-...)")
-        click.echo("  3. Test the agent file directly:  python agent.py")
-        click.echo("  4. When it works locally, deploy:  papayya deploy")
-        click.echo("  5. Then trigger a cloud run:       papayya run --file agent.py --input 'Hello'")
+    target.write_text("version: 1\n")
+    click.echo(f"✓ Created papayya.yaml in {cwd}")
+    click.echo("")
+    click.echo("Next: decorate your entrypoint with @agent from papayya, then run papayya deploy.")
+    click.echo("")
+    click.echo("    from papayya import agent")
+    click.echo("")
+    click.echo('    @agent(name="my-agent")')
+    click.echo("    def run(input):")
+    click.echo("        ...")
+    click.echo("")
+    click.echo("See https://docs.getpapayya.com for framework examples and trigger config.")
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +357,8 @@ def signup(ctx: click.Context, email: str, password: str, name: str, force: bool
         click.echo(f"  Env: dev")
         click.echo(f"  API key: {api_key[:12]}...")
         click.echo(f"  Project: {project_id}")
-        click.echo("\nNext: papayya init --name my-agent")
+        click.echo("\nNext: papayya init")
+        click.echo("Tip: pass --env <name> on any command to target a non-default env.")
 
     except PapayyaAPIError as e:
         if e.status == 409:
@@ -878,6 +747,15 @@ def deploy(
                     _print_apply_result(result, api_base_url=ctx.obj["base_url"])
                     if result.error is not None:
                         sys.exit(1)
+
+        # Per-env next-step nudge
+        if deployed:
+            current = env_name or _current_env(_load_cli_config())
+            first_slug = next(iter(deployed))
+            click.echo(f"\nEnv: {current}")
+            click.echo("\nNext:")
+            click.echo(f'  papayya run {first_slug} "your input"')
+            click.echo(f"  papayya --env {current} logs <run-id>")
 
     finally:
         api.close()

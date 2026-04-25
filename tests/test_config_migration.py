@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -238,3 +239,38 @@ def test_envs_create_duplicate_errors(tmp_config: Path) -> None:
     code, out = _invoke("envs", "create", "staging")
     assert code != 0
     assert "already exists" in out
+
+
+# ---------------------------------------------------------------------------
+# Legacy flat-key regression guard
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_FLAT_KEY_PATTERN = re.compile(
+    r"_?load_cli_config\s*\(\s*\)\s*\.\s*get\s*\(\s*['\"]"
+    r"(?:project_id|api_key|base_url|email)['\"]"
+)
+
+
+def test_no_legacy_flat_key_reads() -> None:
+    """Top-level reads of env-scoped keys must go through `_env_config()`.
+
+    A Phase 3 bug class came from code paths still reading
+    `_load_cli_config().get("project_id")` after the v1→v2 migration. The v2
+    config nests api_key/base_url/project_id/email under `envs.<name>`; the
+    only sanctioned reader is `_env_config()`.
+    """
+    src_root = Path(__file__).resolve().parent.parent / "src" / "papayya"
+    offenders: list[str] = []
+    for py_file in src_root.rglob("*.py"):
+        text = py_file.read_text()
+        for match in _LEGACY_FLAT_KEY_PATTERN.finditer(text):
+            line_no = text[: match.start()].count("\n") + 1
+            offenders.append(
+                f"{py_file.relative_to(src_root)}:{line_no}: {match.group()}"
+            )
+
+    assert not offenders, (
+        "Found legacy flat-key reads on config root. Use `_env_config()`:\n"
+        + "\n".join(offenders)
+    )
