@@ -317,6 +317,22 @@ _V7_ADD_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
+# v8: ADR-0002 #8 — lineage delivery audit. Two columns on the tasks table
+# track per-row late delivery: delivery_attempts is the total number of
+# CloudStore POST attempts (including the one that finally landed it),
+# journaled_at is the wall-clock time the SDK gave up retrying and dumped
+# the payload into the local journal sidecar.
+#
+# Local SQLiteStore writes leave both NULL — synchronous disk writes have
+# no journal path. The columns exist on the local schema for parity with
+# the hosted side; the dashboard's badge logic queries the same column
+# regardless of backend.
+_V8_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_TASKS, _schema.COL_TASK_DELIVERY_ATTEMPTS, "INTEGER"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_JOURNALED_AT, "TEXT"),
+]
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -484,14 +500,24 @@ def _apply_v6_to_v7(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "7")
 
 
+def _apply_v7_to_v8(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "7")
+    with conn:
+        for table, column, type_decl in _V8_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        _set_schema_version(conn, "8")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → v3 → v4 → v5 → v6 → v7) so long-dormant local DBs catch
-    up cleanly.
+    (e.g. v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8) so long-dormant local DBs
+    catch up cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -513,6 +539,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "6":
             _apply_v6_to_v7(conn, db_path)
             current = "7"
+        elif current == "7":
+            _apply_v7_to_v8(conn, db_path)
+            current = "8"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "

@@ -95,8 +95,22 @@ COL_RUN_AGENT_VERSION = "agent_version"
 COL_TASK_AGENT_VERSION = "agent_version"
 
 
+# v8 columns — lineage delivery audit (ADR-0002 #8). When a CloudStore POST
+# exhausts retries the SDK appends to a local journal sidecar; on the next
+# successful POST the reconciler drains the journal and reissues the original
+# request with these two fields populated. NULL means the row landed on the
+# first delivery attempt — the common case. A non-NULL journaled_at is the
+# signal the dashboard uses to render a "late delivery" badge on the step.
+#
+# Local SQLiteStore never writes these columns: synchronous disk writes have
+# no journal-backed delivery path. They exist on the local schema purely for
+# parity with the hosted side, so the same dashboard query shape works.
+COL_TASK_DELIVERY_ATTEMPTS = "delivery_attempts"
+COL_TASK_JOURNALED_AT = "journaled_at"
+
+
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 
 # Indexes — named explicitly so we can check for their presence in tests

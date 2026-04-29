@@ -1,17 +1,84 @@
-"""Checkpoint store backed by the Papayya control plane API."""
+"""Checkpoint store backed by the Papayya control plane API.
+
+POSTs are wrapped in a bounded retry with a local-journal fallback
+(ADR-0002 #8). Transient failures (5xx, 429, network errors) retry
+with exponential backoff; on exhaustion the request is appended to a
+``LineageJournal`` sidecar and the call returns successfully — the
+customer's agent function does not see the outage. The next successful
+POST drains the journal in FIFO order before issuing the new request,
+so eventually every step row lands server-side.
+
+The retry rhythm matches ``runtime/worker.py::_report_complete`` (Phase
+2 #4): 5 attempts, 0.1s → 2.0s exponential, ~3.1s wall ceiling. Same
+mental model and same ceiling, picked to stay well under any per-item
+soft timeout (#2).
+
+Terminal failures (4xx with body, decode errors) raise immediately and
+are *not* journaled — they almost always indicate an SDK-side bug, and
+journaling a bug-rich payload would just keep failing on every drain.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 import httpx
 
 from papayya._defaults import DEFAULT_BASE_URL
 from papayya._serialize import encode_user_value
 
+from .lineage_journal import JournalEntry, LineageJournal, resolve_journal_path
 from .types import CheckpointStore, RunCheckpoint, TaskEntry
+
+
+log = logging.getLogger("papayya.durable.cloud_store")
+
+
+# Retry budget — same shape as runtime/worker.py::_report_complete so
+# operators only have to learn one rhythm. Worst-case wait is roughly
+# 0.1 + 0.2 + 0.4 + 0.8 + (capped) 2.0 = 3.5s before journaling.
+_MAX_ATTEMPTS = 5
+_INITIAL_BACKOFF = 0.1
+_MAX_BACKOFF = 2.0
+
+
+# Cap on how many journaled entries a single piggyback drain attempts.
+# Keeps the per-POST overhead bounded if a long outage left thousands of
+# entries; the next POST after this one will keep draining where this
+# stopped.
+_DRAIN_BATCH = 100
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Should this exception be retried?
+
+    Yes for connection-level errors and server-side hiccups (5xx, 429).
+    No for 4xx-with-body (SDK bug — payload is wrong, retrying won't
+    help) and for any non-network exception (e.g. JSON decode errors).
+    """
+    if isinstance(exc, (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.NetworkError,
+        httpx.RemoteProtocolError,
+    )):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code >= 500 or code == 429
+    return False
 
 
 @dataclass
@@ -24,7 +91,12 @@ class CloudStoreConfig:
 
 
 class CloudStore:
-    """Checkpoint store that persists to the Papayya control plane via HTTP."""
+    """Checkpoint store that persists to the Papayya control plane via HTTP.
+
+    Wraps every write in retry + journal-on-exhaust (ADR-0002 #8). The
+    public ``CheckpointStore`` surface is unchanged — callers see no
+    difference except that transient outages no longer raise.
+    """
 
     def __init__(self, config: CloudStoreConfig) -> None:
         headers: dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -38,8 +110,14 @@ class CloudStore:
             headers=headers,
             timeout=config.timeout,
         )
+        self._journal = LineageJournal(resolve_journal_path())
+
+    # --- public store surface ----------------------------------------- #
 
     def load(self, run_id: str) -> RunCheckpoint | None:
+        # Reads have no journal path: a load that can't reach the server
+        # is a fundamentally different failure mode (the *replay-from*
+        # data isn't there yet). Surface the error to the caller.
         resp = self._client.get(f"/v1/durable/runs/{run_id}")
         if resp.status_code == 404:
             return None
@@ -69,38 +147,182 @@ class CloudStore:
         )
 
     def create(self, checkpoint: RunCheckpoint) -> None:
-        resp = self._client.post(
-            "/v1/durable/runs",
-            json={
-                "run_id": checkpoint.run_id,
-                "agent": checkpoint.agent,
-                "item_id": checkpoint.item_id,
-                "agent_version": checkpoint.agent_version,
-            },
+        payload = {
+            "run_id": checkpoint.run_id,
+            "agent": checkpoint.agent,
+            "item_id": checkpoint.item_id,
+            "agent_version": checkpoint.agent_version,
+        }
+        self._execute(
+            kind="create",
+            method="POST",
+            url="/v1/durable/runs",
+            payload=payload,
+            idempotency_key=checkpoint.run_id,
         )
-        resp.raise_for_status()
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
-        resp = self._client.post(
-            f"/v1/durable/runs/{run_id}/checkpoints",
-            json={
-                "label": entry.label,
-                "result": json.loads(encode_user_value(entry.result)),
-                "duration_ms": entry.duration_ms,
-                "item_id": entry.item_id,
-                "input_snapshot": json.loads(encode_user_value(entry.input_snapshot, strict=True)),
-                "output_snapshot": json.loads(encode_user_value(entry.output_snapshot, strict=True)),
-                "agent_version": entry.agent_version,
-            },
+        payload = {
+            "label": entry.label,
+            "result": json.loads(encode_user_value(entry.result)),
+            "duration_ms": entry.duration_ms,
+            "item_id": entry.item_id,
+            "input_snapshot": json.loads(encode_user_value(entry.input_snapshot, strict=True)),
+            "output_snapshot": json.loads(encode_user_value(entry.output_snapshot, strict=True)),
+            "agent_version": entry.agent_version,
+        }
+        self._execute(
+            kind="save_task",
+            method="POST",
+            url=f"/v1/durable/runs/{run_id}/checkpoints",
+            payload=payload,
+            idempotency_key=f"{run_id}:{entry.label}",
         )
-        resp.raise_for_status()
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
-        resp = self._client.patch(
-            f"/v1/durable/runs/{run_id}",
-            json={"status": status, "output": json.loads(encode_user_value(output))},
+        payload = {"status": status, "output": json.loads(encode_user_value(output))}
+        self._execute(
+            kind="set_status",
+            method="PATCH",
+            url=f"/v1/durable/runs/{run_id}",
+            payload=payload,
+            idempotency_key=run_id,
         )
-        resp.raise_for_status()
 
     def close(self) -> None:
         self._client.close()
+
+    # --- retry + journal core ----------------------------------------- #
+
+    def _execute(
+        self,
+        *,
+        kind: str,
+        method: str,
+        url: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> None:
+        """Drain pending journal entries, then issue ``op`` with retry.
+
+        On exhaustion the request is appended to the journal; the call
+        does NOT raise. On a terminal (non-transient) failure the
+        underlying exception bubbles up and nothing is journaled.
+        """
+        # Causal ordering — drain BEFORE this write so a queued create
+        # for run R lands before any save_task(R, ...) we're about to
+        # issue. Drain failures don't block the new write; if the server
+        # is still sick the new write will journal too, in correct order.
+        self._drain_journal()
+
+        first_attempt_at = _utcnow_iso()
+        backoff = _INITIAL_BACKOFF
+        last_exc: BaseException | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                self._dispatch(method, url, payload)
+                return
+            except BaseException as exc:  # noqa: BLE001
+                if not _is_transient(exc):
+                    raise
+                last_exc = exc
+                if attempt < _MAX_ATTEMPTS:
+                    log.debug(
+                        "lineage write attempt %d/%d failed: %s; retrying in %.2fs",
+                        attempt, _MAX_ATTEMPTS, exc, backoff,
+                    )
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, _MAX_BACKOFF)
+
+        # Exhausted. Journal and return so the customer's agent
+        # function does not see the transient outage.
+        entry = JournalEntry(
+            kind=kind,
+            method=method,
+            url=url,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            first_attempt_at=first_attempt_at,
+            attempts=_MAX_ATTEMPTS,
+            journaled_at=_utcnow_iso(),
+            last_error=f"{type(last_exc).__name__}: {last_exc}",
+        )
+        self._journal.append(entry)
+        log.warning(
+            "lineage write %s journaled after %d failed attempts: %s",
+            idempotency_key, _MAX_ATTEMPTS, last_exc,
+        )
+
+    def _drain_journal(self) -> None:
+        """FIFO drain of journaled entries, bounded by ``_DRAIN_BATCH``.
+
+        Stops at the first transient error (server still sick) so the
+        new POST gets to journal in correct order. Drops entries that
+        fail with a terminal error (rare — implies the journaled
+        payload is now invalid, e.g. tenant deleted).
+        """
+        if self._journal.is_empty():
+            return
+
+        remaining: list[JournalEntry] = []
+        drained = 0
+        halt = False
+        for entry in self._journal.iter_entries():
+            if halt or drained >= _DRAIN_BATCH:
+                remaining.append(entry)
+                continue
+
+            payload = self._payload_for_replay(entry)
+            try:
+                self._dispatch(entry.method, entry.url, payload)
+                drained += 1
+            except BaseException as exc:  # noqa: BLE001
+                if _is_transient(exc):
+                    log.debug(
+                        "drain halted on %s after transient error: %s",
+                        entry.idempotency_key, exc,
+                    )
+                    halt = True
+                    remaining.append(entry)
+                else:
+                    log.warning(
+                        "dropping journal entry %s after terminal error: %s",
+                        entry.idempotency_key, exc,
+                    )
+
+        self._journal.rewrite(remaining)
+        if drained > 0:
+            log.info("drained %d journaled lineage write(s)", drained)
+
+    def _payload_for_replay(self, entry: JournalEntry) -> dict[str, Any]:
+        """Build the wire payload for a journaled entry being reissued.
+
+        For ``save_task`` the persisted row carries the late-delivery
+        audit columns, so inject ``delivery_attempts`` (total attempts
+        including this drain attempt) and ``journaled_at``. For other
+        kinds the audit lives only on per-step rows; replay payloads
+        are unchanged.
+        """
+        if entry.kind != "save_task":
+            return entry.payload
+        payload = dict(entry.payload)
+        payload["delivery_attempts"] = entry.attempts + 1
+        payload["journaled_at"] = entry.journaled_at
+        return payload
+
+    def _dispatch(self, method: str, url: str, payload: dict[str, Any]) -> httpx.Response:
+        """Issue the actual HTTP request and raise for non-2xx.
+
+        Raising on 4xx/5xx is what makes ``_is_transient`` work for
+        ``HTTPStatusError``. ``httpx.Client.request`` does not
+        ``raise_for_status`` automatically, so we do.
+        """
+        resp = self._client.request(method, url, json=payload)
+        resp.raise_for_status()
+        return resp
+
+
+# Type-checkers want CheckpointStore conformance at the module surface,
+# so a no-op assertion helps catch protocol drift at import time without
+# costing anything at runtime.
+_check: Callable[[CloudStore], CheckpointStore] = lambda store: store  # noqa: E731
