@@ -319,12 +319,32 @@ class Worker:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib_request.urlopen(req, timeout=2.0):
-                pass
-        except urllib_error.URLError as exc:
-            # Phase 1 prototype: best-effort. Phase 2 adds retry + DLQ.
-            log.warning("failed to report completion for %s: %s", lease_id, exc)
+
+        # Bounded retry. The dispatcher's /complete handler is idempotent
+        # on lease_id (a duplicate POST emits stale_complete and is a
+        # no-op), so retrying a transient failure is always safe. ADR-0002
+        # #4. On exhaustion the dispatcher's lease TTL is the safety net:
+        # the lease eventually re-dispatches and at-least-once semantics
+        # are preserved.
+        attempts = 5
+        wait = 0.1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib_request.urlopen(req, timeout=2.0):
+                    return
+            except urllib_error.URLError as exc:
+                if attempt == attempts:
+                    log.error(
+                        "failed to report completion for %s after %d attempts: %s",
+                        lease_id, attempts, exc,
+                    )
+                    return
+                log.debug(
+                    "complete report attempt %d/%d failed: %s; retrying in %.2fs",
+                    attempt, attempts, exc, wait,
+                )
+                time.sleep(wait)
+                wait = min(wait * 2.0, 2.0)
 
     # --- lease handling ------------------------------------------------ #
 
