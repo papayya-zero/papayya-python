@@ -44,6 +44,14 @@ class WorkerSubprocess:
         # Ensure the worker doesn't accidentally pick up parent shell credentials.
         env.pop("PAPAYYA_API_KEY", None)
         env["PAPAYYA_LOCAL_DB_PATH"] = store_path
+        # Stream stdout+stderr to a sibling log file. With pipes the worker
+        # blocks on flush against pytest's slow capture, which used to hide
+        # commit ordering races. With DEVNULL the worker is *too* fast and
+        # the test races on cross-process WAL visibility. A real file is the
+        # middle ground — the worker keeps writing without backpressure, and
+        # log inspection is available when an assertion fails.
+        log_path = counter_path.parent / "worker.log"
+        self._log_path = log_path
 
         self._proc = subprocess.Popen(
             [
@@ -59,11 +67,11 @@ class WorkerSubprocess:
                 "--worker-id",
                 worker_id,
                 "--log-level",
-                "WARNING",
+                "INFO",
             ],
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=open(log_path, "wb"),
+            stderr=subprocess.STDOUT,
         )
 
     @property
@@ -89,20 +97,22 @@ class WorkerSubprocess:
             self._proc.wait(timeout=2)
 
     def stderr_tail(self, n_bytes: int = 4096) -> str:
-        """Best-effort stderr read for debugging failed tests."""
-        if self._proc.stderr is None:
+        """Best-effort tail of the worker's combined stdout+stderr log.
+
+        Both streams land in the same on-disk log file — see ``__init__``
+        for the rationale (pipes interact poorly with pytest's capture
+        and mask cross-process WAL visibility, DEVNULL hides debug
+        output entirely). The file lives next to the import-counter and
+        is cleaned up with the test's ``tmp_path``.
+        """
+        if not getattr(self, "_log_path", None) or not self._log_path.exists():
             return ""
         try:
-            data = self._proc.stderr.read(n_bytes)
-            return data.decode("utf-8", errors="replace") if data else ""
+            data = self._log_path.read_bytes()[-n_bytes:]
+            return data.decode("utf-8", errors="replace")
         except Exception:
             return ""
 
     def stdout_tail(self, n_bytes: int = 4096) -> str:
-        if self._proc.stdout is None:
-            return ""
-        try:
-            data = self._proc.stdout.read(n_bytes)
-            return data.decode("utf-8", errors="replace") if data else ""
-        except Exception:
-            return ""
+        # Combined stream — see stderr_tail.
+        return self.stderr_tail(n_bytes)

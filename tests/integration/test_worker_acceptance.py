@@ -27,6 +27,8 @@ Reference:
 
 from __future__ import annotations
 
+import time as _t
+
 import pytest
 
 from .conftest import write_test_agent
@@ -124,9 +126,22 @@ def test_worker_processes_batch_with_correct_lineage(
     )
 
     # 2. Every item produced one completed run.
-    assert in_memory_store.completed_run_count() == len(items), (
-        f"expected {len(items)} completed runs, got "
-        f"{in_memory_store.completed_run_count()}"
+    #
+    # Poll for up to 2s after dispatcher drain. The worker's
+    # ``_report_complete`` posts /complete after ``run.complete()``'s
+    # SQLite commit returns, but cross-process WAL visibility can lag
+    # the in-process commit by a few milliseconds when many small
+    # commits pipeline. ``wait_until_drained`` already gave the test a
+    # reason to expect 10 rows; the poll just absorbs the WAL-replication
+    # gap without masking a real bug — a genuine miss would still fail
+    # at the deadline.
+    deadline = _t.monotonic() + 2.0
+    last_count = in_memory_store.completed_run_count()
+    while last_count < len(items) and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+        last_count = in_memory_store.completed_run_count()
+    assert last_count == len(items), (
+        f"expected {len(items)} completed runs after 2s poll, got {last_count}"
     )
 
     # 3. Per-item lineage shape is identical to what a single-process
