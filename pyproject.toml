@@ -45,3 +45,12 @@ dev = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/papayya"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "uv.lock",
+    "examples/enrich_companies.py",
+    "DESIGN_PARTNERS.md",
+    ".papayya-test/",
+    "tests/",
+]
