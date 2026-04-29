@@ -28,6 +28,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -38,6 +39,12 @@ from urllib import request as urllib_request
 
 
 log = logging.getLogger("papayya.runtime")
+
+
+# Default heartbeat cadence. Must be well below the dispatcher's lease
+# TTL (default 30s) so a single missed heartbeat doesn't expire the
+# lease. 5s gives roughly 6× headroom.
+_DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 
 @dataclass
@@ -74,15 +81,26 @@ class Worker:
         agent_module_path: str,
         worker_id: Optional[str] = None,
         poll_idle_seconds: float = 0.05,
+        heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
         self.worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
         self.poll_idle_seconds = poll_idle_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self._running = True
         now = time.monotonic()
         self._last_activity_at = now
         self._last_idle_log_at = now
+
+        # In-flight lease tracking for heartbeats. Set to the current
+        # Lease just before the agent fn runs and cleared in the finally
+        # block. Heartbeat thread reads it under _hb_lock and POSTs
+        # to /heartbeat while it's set.
+        self._in_flight_lease: Optional[Lease] = None
+        self._hb_lock = threading.Lock()
+        self._hb_stop = threading.Event()
+        # Started at the end of __init__ via _start_heartbeat() below.
 
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
@@ -93,6 +111,15 @@ class Worker:
         os.environ.pop("PAPAYYA_API_KEY", None)
 
         self._import_agent_module(agent_module_path)
+
+        # Heartbeat thread starts after module import so any import
+        # error fails fast without leaving a daemon thread behind.
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name=f"papayya-worker-hb-{self.worker_id}",
+        )
+        self._hb_thread.start()
 
     # --- agent module loading ------------------------------------------ #
 
@@ -222,6 +249,10 @@ class Worker:
         )
         started_at = time.monotonic()
         self._last_activity_at = started_at
+        # Publish the lease so the heartbeat thread starts pinging
+        # /heartbeat for it. Cleared in the finally block.
+        with self._hb_lock:
+            self._in_flight_lease = lease
         try:
             registration = get_agent(lease.agent)
             if registration is None:
@@ -256,4 +287,58 @@ class Worker:
                 error=f"{type(exc).__name__}: {exc}",
             )
         finally:
+            with self._hb_lock:
+                self._in_flight_lease = None
             self._last_activity_at = time.monotonic()
+
+    # --- heartbeat ----------------------------------------------------- #
+
+    def _heartbeat_loop(self) -> None:
+        """Background loop: ping /heartbeat for the in-flight lease.
+
+        Runs for the worker's lifetime. A missing in-flight lease is
+        legal (worker is between items) and just skips the iteration.
+        Network failures are soft — the dispatcher's reaper handles
+        actual death; heartbeat-loop errors are surface-only.
+        """
+        while not self._hb_stop.is_set():
+            if self._hb_stop.wait(timeout=self.heartbeat_interval_seconds):
+                return
+            with self._hb_lock:
+                lease = self._in_flight_lease
+            if lease is None:
+                continue
+            try:
+                self._send_heartbeat(lease.lease_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("heartbeat for %s failed: %s", lease.lease_id[:8], exc)
+
+    def _send_heartbeat(self, lease_id: str) -> None:
+        body = json.dumps({
+            "lease_id": lease_id,
+            "worker_id": self.worker_id,
+        }).encode("utf-8")
+        req = urllib_request.Request(
+            f"{self.dispatcher_url}/heartbeat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=2.0):
+                pass
+        except urllib_error.HTTPError as exc:
+            # 410 Gone: dispatcher released this lease (TTL expired or
+            # never existed). Drop our local tracking so a late /complete
+            # for this stolen item doesn't get reported.
+            # 409 Conflict: another worker holds it (zombie scenario).
+            if exc.code in (409, 410):
+                with self._hb_lock:
+                    if self._in_flight_lease is not None and self._in_flight_lease.lease_id == lease_id:
+                        log.warning(
+                            "lease %s rejected by dispatcher (HTTP %d); worker dropping in-flight tracking",
+                            lease_id[:8], exc.code,
+                        )
+                        self._in_flight_lease = None
+                return
+            raise

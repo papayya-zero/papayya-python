@@ -12,7 +12,7 @@ import argparse
 import logging
 import sys
 
-from .worker import Worker
+from .worker import _DEFAULT_HEARTBEAT_INTERVAL, Worker
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -45,6 +45,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Python logging level (default: INFO).",
     )
+    p.add_argument(
+        "--heartbeat-interval-seconds",
+        type=float,
+        default=_DEFAULT_HEARTBEAT_INTERVAL,
+        help=(
+            "Seconds between /heartbeat POSTs to the dispatcher while a "
+            f"lease is in flight (default: {_DEFAULT_HEARTBEAT_INTERVAL})."
+        ),
+    )
     return p
 
 
@@ -59,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         store_path=args.store,
         agent_module_path=args.agent_module,
         worker_id=args.worker_id,
+        heartbeat_interval_seconds=args.heartbeat_interval_seconds,
     )
     worker.run()
     return 0

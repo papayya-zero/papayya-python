@@ -52,12 +52,46 @@ class _PendingItem:
     payload: dict | None
 
 
+@dataclass
+class _LeasedRecord:
+    """A leased item plus the bookkeeping needed for TTL-based recovery.
+
+    ``leased_at`` is the lease grant time. ``last_heartbeat`` advances
+    on POST /heartbeat from the lease's owning worker; the reaper
+    releases the lease when ``now - last_heartbeat`` exceeds the TTL.
+    """
+    item: _PendingItem
+    worker_id: str
+    leased_at: float       # time.monotonic()
+    last_heartbeat: float  # time.monotonic()
+
+
+# Default lease TTL: long enough to absorb a slow step + a few missed
+# heartbeats; short enough that worker death recovers in under a minute.
+# Phase 2 ADR-0002 #1 calls for "30–60 seconds"; defaulting to 30 here so
+# the reaper releases dead leases within roughly the polling window the
+# operator already observes in the dispatcher event log.
+_DEFAULT_LEASE_TTL_SECONDS = 30.0
+
+
 class LocalDispatcher:
     """In-memory HTTP dispatcher for local development.
 
     Thread-safe: all state mutations go through ``self._lock``. The HTTP
     handler runs in dispatcher-server threads; in-process callers
     (tests, the CLI) acquire the same lock.
+
+    Lease TTL + heartbeats (Phase 2 ADR-0002 #1):
+      • Workers heartbeat to ``POST /heartbeat`` every few seconds while a
+        lease is in flight. Dispatcher updates the lease's
+        ``last_heartbeat`` timestamp.
+      • A reaper thread scans leased items every ``heartbeat_check_interval``
+        seconds and releases any lease whose heartbeat is older than
+        ``lease_ttl_seconds``.
+      • Released items are re-queued at the *front* of pending with a
+        *fresh* lease_id. The fresh ID means a zombie worker's late
+        ``/complete`` becomes an unknown lease and gets dropped — it
+        cannot collide with the lease the next worker takes.
     """
 
     def __init__(
@@ -65,18 +99,37 @@ class LocalDispatcher:
         host: str = "127.0.0.1",
         port: int = 0,
         on_event: Callable[[str, dict], None] | None = None,
+        lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
+        heartbeat_check_interval: float | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._pending: deque[_PendingItem] = deque()
-        self._leased: dict[str, _PendingItem] = {}
+        self._leased: dict[str, _LeasedRecord] = {}
         self._completed: dict[str, dict[str, Any]] = {}
         self._enqueued_total = 0
         self._on_event = on_event or (lambda _kind, _data: None)
+
+        self._lease_ttl = lease_ttl_seconds
+        self._heartbeat_check_interval = (
+            heartbeat_check_interval
+            if heartbeat_check_interval is not None
+            else max(0.1, lease_ttl_seconds / 4)
+        )
 
         self._server = ThreadingHTTPServer((host, port), self._handler_factory())
         self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+
+        # Reaper thread runs after the server is listening so its events
+        # never refer to an HTTP path that doesn't exist yet.
+        self._reaper_stop = threading.Event()
+        self._reaper_thread = threading.Thread(
+            target=self._reaper_loop,
+            daemon=True,
+            name="papayya-dispatcher-reaper",
+        )
+        self._reaper_thread.start()
 
     # --- lifecycle ----------------------------------------------------- #
 
@@ -94,6 +147,8 @@ class LocalDispatcher:
         return self._server.server_address[1]
 
     def shutdown(self) -> None:
+        self._reaper_stop.set()
+        self._reaper_thread.join(timeout=2)
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=2)
@@ -246,6 +301,28 @@ class LocalDispatcher:
                     self._send_json(200, None)
                     return
 
+                if parsed.path == "/heartbeat":
+                    body = self._read_json()
+                    if body is None or "lease_id" not in body or "worker_id" not in body:
+                        self._send_json(400, {"error": "lease_id and worker_id required"})
+                        return
+                    outcome = dispatcher._record_heartbeat(
+                        lease_id=body["lease_id"],
+                        worker_id=body["worker_id"],
+                    )
+                    if outcome == "ok":
+                        self._send_json(200, None)
+                    elif outcome == "wrong_worker":
+                        # 409: another worker holds this lease (zombie
+                        # double-claim). The heartbeating worker should
+                        # drop its in-flight tracking.
+                        self._send_json(409, {"error": "lease held by another worker"})
+                    else:  # "unknown"
+                        # 410: lease released (reaper) or never existed.
+                        # The worker should clear its in-flight state.
+                        self._send_json(410, {"error": "lease no longer recognized"})
+                    return
+
                 self._send_json(404, {"error": "not found"})
 
         return _Handler
@@ -257,7 +334,13 @@ class LocalDispatcher:
             if not self._pending:
                 return None
             item = self._pending.popleft()
-            self._leased[item.lease_id] = item
+            now = time.monotonic()
+            self._leased[item.lease_id] = _LeasedRecord(
+                item=item,
+                worker_id=worker_id,
+                leased_at=now,
+                last_heartbeat=now,
+            )
         self._on_event("leased", {
             "lease_id": item.lease_id,
             "agent": item.agent,
@@ -273,9 +356,23 @@ class LocalDispatcher:
         status: str,
         error: str | None,
         worker_id: str | None,
-    ) -> None:
+    ) -> bool:
+        """Record completion. Returns True if the lease was recognized.
+
+        A False return means the lease was already released (typically by
+        the reaper after a heartbeat timeout); the caller's /complete is
+        a stale write from a zombie worker and gets dropped. The
+        ``stale_complete`` event surfaces it so operators see the drop.
+        """
         with self._lock:
-            self._leased.pop(lease_id, None)
+            record = self._leased.pop(lease_id, None)
+            if record is None:
+                self._on_event("stale_complete", {
+                    "lease_id": lease_id,
+                    "status": status,
+                    "worker_id": worker_id,
+                })
+                return False
             self._completed[lease_id] = {"status": status, "error": error}
         self._on_event("completed", {
             "lease_id": lease_id,
@@ -283,6 +380,72 @@ class LocalDispatcher:
             "error": error,
             "worker_id": worker_id,
         })
+        return True
+
+    def _record_heartbeat(self, *, lease_id: str, worker_id: str) -> str:
+        """Update last_heartbeat for a lease.
+
+        Returns a status string the HTTP layer maps to a code:
+          "ok"            → 200, lease recognized and refreshed
+          "unknown"       → 410 Gone, lease already released or never existed
+          "wrong_worker"  → 409 Conflict, lease held by a different worker
+        """
+        with self._lock:
+            record = self._leased.get(lease_id)
+            if record is None:
+                return "unknown"
+            if record.worker_id != worker_id:
+                return "wrong_worker"
+            record.last_heartbeat = time.monotonic()
+            return "ok"
+
+    def _reaper_loop(self) -> None:
+        """Background loop: release leases past TTL, re-issue with fresh ID."""
+        while not self._reaper_stop.is_set():
+            if self._reaper_stop.wait(timeout=self._heartbeat_check_interval):
+                return
+            try:
+                self._reap_expired()
+            except Exception as exc:  # noqa: BLE001
+                # Reaper must never die — that would silently disable
+                # the recovery mechanism. Log and continue.
+                log.warning("reaper iteration failed: %s", exc)
+
+    def _reap_expired(self) -> None:
+        now = time.monotonic()
+        # Collect-then-emit pattern: release under the lock, fire events
+        # outside it. ``on_event`` is user-supplied and may block.
+        expired: list[tuple[str, str, _LeasedRecord, float]] = []
+        with self._lock:
+            for old_lease_id in list(self._leased.keys()):
+                record = self._leased[old_lease_id]
+                age = now - record.last_heartbeat
+                if age <= self._lease_ttl:
+                    continue
+                self._leased.pop(old_lease_id)
+                # Fresh lease_id so a zombie worker's late /complete
+                # cannot collide with the lease the next worker takes.
+                new_lease_id = uuid.uuid4().hex
+                new_item = _PendingItem(
+                    lease_id=new_lease_id,
+                    agent=record.item.agent,
+                    item_id=record.item.item_id,
+                    payload=record.item.payload,
+                )
+                # Front of the deque — re-process ASAP. The item already
+                # waited for the reaper; don't make it wait behind newer
+                # arrivals too.
+                self._pending.appendleft(new_item)
+                expired.append((old_lease_id, new_lease_id, record, age))
+        for old_lease_id, new_lease_id, record, age in expired:
+            self._on_event("lease_expired", {
+                "old_lease_id": old_lease_id,
+                "new_lease_id": new_lease_id,
+                "worker_id": record.worker_id,
+                "agent": record.item.agent,
+                "item_id": record.item.item_id,
+                "age_s": age,
+            })
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +468,15 @@ def _build_parser():
         help="Initial batch to enqueue at startup. Repeatable. Example: --enqueue enrich:co_42,co_43",
     )
     p.add_argument("--log-level", default="INFO")
+    p.add_argument(
+        "--lease-ttl-seconds",
+        type=float,
+        default=_DEFAULT_LEASE_TTL_SECONDS,
+        help=(
+            "Maximum seconds without a worker heartbeat before the dispatcher "
+            f"releases a lease and re-queues the item (default: {_DEFAULT_LEASE_TTL_SECONDS})."
+        ),
+    )
     return p
 
 
@@ -324,6 +496,17 @@ def _format_event(kind: str, data: dict) -> str:
             f"[{ts}] {marker} completed {data['lease_id'][:8]}  "
             f"status={data['status']}  worker={data.get('worker_id')}{suffix}"
         )
+    if kind == "lease_expired":
+        return (
+            f"[{ts}] ⏰ expired   {data['old_lease_id'][:8]}  agent={data['agent']}  "
+            f"item={data['item_id']}  worker={data['worker_id']}  "
+            f"age={data['age_s']:.1f}s  re-leased={data['new_lease_id'][:8]}"
+        )
+    if kind == "stale_complete":
+        return (
+            f"[{ts}] ⚠️  stale     {data['lease_id'][:8]}  status={data['status']}  "
+            f"worker={data.get('worker_id')}  (lease already released; drop)"
+        )
     return f"[{ts}] {kind} {data}"
 
 
@@ -334,7 +517,12 @@ def main(argv: list[str] | None = None) -> int:
     def emit(kind: str, data: dict) -> None:
         print(_format_event(kind, data), flush=True)
 
-    d = LocalDispatcher(host=args.host, port=args.port, on_event=emit)
+    d = LocalDispatcher(
+        host=args.host,
+        port=args.port,
+        on_event=emit,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+    )
 
     print(f"Papayya local dispatcher listening on {d.url}", flush=True)
     print(f"  worker:  python -m papayya.runtime --agent-module FILE --dispatcher {d.url} --store /tmp/papayya.db", flush=True)
