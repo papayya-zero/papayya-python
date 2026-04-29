@@ -817,7 +817,18 @@ def serve(host: str = "127.0.0.1", port: int = 8585, db_path: str = ".papayya/lo
     ensure_migrated(db.resolve())
 
     DevHandler.db_path = str(db.resolve())
-    server = ThreadingHTTPServer((host, port), DevHandler)
+    try:
+        server = ThreadingHTTPServer((host, port), DevHandler)
+    except OSError as exc:
+        import errno
+        if exc.errno == errno.EADDRINUSE:
+            sys.stderr.write(
+                f"Port {port} on {host} is already in use.\n"
+                f"Another `papayya dev` instance or another process is bound there.\n"
+                f"Try `papayya dev --port <N>` with a different port.\n"
+            )
+            sys.exit(1)
+        raise
     sys.stderr.write(f"Papayya Dev Dashboard: http://{host}:{port}\n")
     sys.stderr.write(f"Reading from: {db.resolve()}\n")
     sys.stderr.write("Press Ctrl+C to stop.\n\n")

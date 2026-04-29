@@ -469,3 +469,34 @@ class TestStaticFallback:
         except urllib.error.HTTPError as e:
             assert e.code == 404
             assert e.headers.get("Content-Type", "").startswith("application/json")
+
+
+class TestServePortConflict:
+    """Phase 1.5 finding: a stale `papayya dev` on the default port produced
+    a bare `OSError: [Errno 48] Address already in use` with no port number
+    in the message. ``serve()`` should exit 1 with a clear message instead."""
+
+    def test_exits_with_clear_message_when_port_in_use(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from papayya.dev.server import serve
+
+        db_path = tmp_path / "local.db"
+        SQLiteStore(str(db_path)).close()
+
+        squatter = socket.socket()
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        port = squatter.getsockname()[1]
+
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                serve(host="127.0.0.1", port=port, db_path=str(db_path))
+        finally:
+            squatter.close()
+
+        assert excinfo.value.code == 1
+        captured = capsys.readouterr()
+        assert str(port) in captured.err
+        assert "already in use" in captured.err
+        assert "--port" in captured.err
