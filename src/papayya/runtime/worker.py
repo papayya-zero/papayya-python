@@ -56,6 +56,51 @@ class Lease:
     payload: dict[str, Any] | None = None
 
 
+class _PollOutcome:
+    """String constants for the three states `_poll_lease` can return.
+
+    A small string-based discriminant rather than an Enum keeps the
+    main loop's branching trivially readable in tracebacks.
+    """
+    LEASED = "leased"
+    IDLE = "idle"
+    UNREACHABLE = "unreachable"
+
+
+class _ReconnectBackoff:
+    """Exponential backoff for dispatcher unreachability.
+
+    Stateful by design — the worker holds one instance across the life
+    of the run loop. Each ``on_failure`` advances the wait (doubles up
+    to ``max_seconds``), each ``on_success`` snaps back to zero so the
+    *next* poll after recovery has zero added latency. ADR-0002 #15.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_seconds: float = 0.1,
+        max_seconds: float = 2.0,
+    ) -> None:
+        self._initial = initial_seconds
+        self._max = max_seconds
+        self._current = 0.0
+
+    def on_failure(self) -> float:
+        if self._current == 0.0:
+            self._current = self._initial
+        else:
+            self._current = min(self._current * 2.0, self._max)
+        return self._current
+
+    def on_success(self) -> None:
+        self._current = 0.0
+
+    @property
+    def current(self) -> float:
+        return self._current
+
+
 class Worker:
     """Long-running worker. Polls a dispatcher, runs ``@agent`` functions.
 
@@ -101,6 +146,11 @@ class Worker:
         self._hb_lock = threading.Lock()
         self._hb_stop = threading.Event()
         # Started at the end of __init__ via _start_heartbeat() below.
+
+        # Backoff state for dispatcher unreachability. Without this the
+        # poll loop hammers a dead/recovering dispatcher at the
+        # poll_idle_seconds rate (~20 retries/sec by default).
+        self._reconnect_backoff = _ReconnectBackoff()
 
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
@@ -154,12 +204,33 @@ class Worker:
         signal.signal(signal.SIGINT, self._on_signal)
 
         while self._running:
-            lease = self._poll_lease()
-            if lease is None:
+            outcome, lease = self._poll_lease()
+            if outcome == _PollOutcome.LEASED:
+                if self._reconnect_backoff.current > 0.0:
+                    log.info("dispatcher reachable again; resuming normal poll cadence")
+                self._reconnect_backoff.on_success()
+                assert lease is not None
+                self._handle_lease(lease)
+                continue
+            if outcome == _PollOutcome.IDLE:
+                if self._reconnect_backoff.current > 0.0:
+                    log.info("dispatcher reachable again; resuming normal poll cadence")
+                self._reconnect_backoff.on_success()
                 self._maybe_log_idle()
                 time.sleep(self.poll_idle_seconds)
                 continue
-            self._handle_lease(lease)
+            # UNREACHABLE — connection refused or timeout.
+            was_healthy = self._reconnect_backoff.current == 0.0
+            wait = self._reconnect_backoff.on_failure()
+            if was_healthy:
+                # Surface the first failure at INFO so operators see it
+                # without DEBUG. Sustained outages stay quiet (the
+                # individual urlopen exception still logs at DEBUG).
+                log.warning(
+                    "dispatcher unreachable; backing off (next poll in %.1fs)",
+                    wait,
+                )
+            time.sleep(wait)
 
     def _maybe_log_idle(self) -> None:
         now = time.monotonic()
@@ -183,28 +254,33 @@ class Worker:
 
     # --- dispatcher I/O ------------------------------------------------ #
 
-    def _poll_lease(self) -> Lease | None:
+    def _poll_lease(self) -> tuple[str, Lease | None]:
+        """Poll the dispatcher for one lease.
+
+        Returns a (outcome, lease) tuple. The outcome distinguishes
+        "no work right now" (IDLE) from "couldn't reach the dispatcher"
+        (UNREACHABLE) so the caller can apply different sleep policies —
+        the latter triggers exponential backoff.
+        """
         url = f"{self.dispatcher_url}/lease?worker_id={self.worker_id}"
         try:
             with urllib_request.urlopen(url, timeout=2.0) as resp:
                 if resp.status == 204:
-                    return None
+                    return (_PollOutcome.IDLE, None)
                 if resp.status != 200:
                     log.warning("unexpected lease status: %s", resp.status)
-                    return None
+                    return (_PollOutcome.IDLE, None)
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib_error.URLError as exc:
-            # Dispatcher unreachable — back off and retry. This will turn
-            # into a real error/heartbeat state in Phase 2.
             log.debug("lease poll failed: %s", exc)
-            return None
+            return (_PollOutcome.UNREACHABLE, None)
 
-        return Lease(
+        return (_PollOutcome.LEASED, Lease(
             lease_id=body["lease_id"],
             agent=body["agent"],
             item_id=body["item_id"],
             payload=body.get("payload"),
-        )
+        ))
 
     def _report_complete(
         self,
