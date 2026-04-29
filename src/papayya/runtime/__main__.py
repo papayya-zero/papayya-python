@@ -12,7 +12,11 @@ import argparse
 import logging
 import sys
 
-from .worker import _DEFAULT_HEARTBEAT_INTERVAL, Worker
+from .worker import (
+    _DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    _DEFAULT_HEARTBEAT_INTERVAL,
+    Worker,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,6 +58,17 @@ def _build_parser() -> argparse.ArgumentParser:
             f"lease is in flight (default: {_DEFAULT_HEARTBEAT_INTERVAL})."
         ),
     )
+    p.add_argument(
+        "--drain-timeout-seconds",
+        type=float,
+        default=_DEFAULT_DRAIN_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to let an in-flight item finish after SIGTERM "
+            "before the worker force-exits (lease TTL recovers the "
+            "orphaned item). 0 or negative disables the watchdog "
+            f"(default: {_DEFAULT_DRAIN_TIMEOUT_SECONDS})."
+        ),
+    )
     return p
 
 
@@ -69,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_module_path=args.agent_module,
         worker_id=args.worker_id,
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+        drain_timeout_seconds=args.drain_timeout_seconds,
     )
     worker.run()
     return 0

@@ -47,6 +47,12 @@ log = logging.getLogger("papayya.runtime")
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 
+# Default SIGTERM drain budget. Aligns with Kubernetes' default
+# `terminationGracePeriodSeconds` (30s) so a worker pod gets to finish
+# the in-flight item before kubelet escalates to SIGKILL. ADR-0002 #12.
+_DEFAULT_DRAIN_TIMEOUT_SECONDS = 30.0
+
+
 @dataclass
 class Lease:
     """One unit of work assigned to this worker by the dispatcher."""
@@ -141,12 +147,14 @@ class Worker:
         worker_id: Optional[str] = None,
         poll_idle_seconds: float = 0.05,
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
         self.worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
         self.poll_idle_seconds = poll_idle_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.drain_timeout_seconds = drain_timeout_seconds
         self._running = True
         now = time.monotonic()
         self._last_activity_at = now
@@ -165,6 +173,16 @@ class Worker:
         # poll loop hammers a dead/recovering dispatcher at the
         # poll_idle_seconds rate (~20 retries/sec by default).
         self._reconnect_backoff = _ReconnectBackoff()
+
+        # Drain coordination (ADR-0002 #12). Watchdog thread is started
+        # lazily on first SIGTERM. Pre-spawning + Event.wait() would be
+        # the cleaner pattern, but a long-blocked daemon thread inside
+        # the worker subprocess interferes with cross-process SQLite WAL
+        # visibility under load (commits land but other processes read
+        # stale state). Lazy-start sidesteps that completely.
+        self._drain_started: bool = False
+        self._drain_lock = threading.Lock()
+        self._drain_thread: Optional[threading.Thread] = None
 
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
@@ -217,34 +235,43 @@ class Worker:
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
 
-        while self._running:
-            outcome, lease = self._poll_lease()
-            if outcome == _PollOutcome.LEASED:
-                if self._reconnect_backoff.current > 0.0:
-                    log.info("dispatcher reachable again; resuming normal poll cadence")
-                self._reconnect_backoff.on_success()
-                assert lease is not None
-                self._handle_lease(lease)
-                continue
-            if outcome == _PollOutcome.IDLE:
-                if self._reconnect_backoff.current > 0.0:
-                    log.info("dispatcher reachable again; resuming normal poll cadence")
-                self._reconnect_backoff.on_success()
-                self._maybe_log_idle()
-                time.sleep(self.poll_idle_seconds)
-                continue
-            # UNREACHABLE — connection refused or timeout.
-            was_healthy = self._reconnect_backoff.current == 0.0
-            wait = self._reconnect_backoff.on_failure()
-            if was_healthy:
-                # Surface the first failure at INFO so operators see it
-                # without DEBUG. Sustained outages stay quiet (the
-                # individual urlopen exception still logs at DEBUG).
-                log.warning(
-                    "dispatcher unreachable; backing off (next poll in %.1fs)",
-                    wait,
-                )
-            time.sleep(wait)
+        try:
+            while self._running:
+                outcome, lease = self._poll_lease()
+                if outcome == _PollOutcome.LEASED:
+                    if self._reconnect_backoff.current > 0.0:
+                        log.info("dispatcher reachable again; resuming normal poll cadence")
+                    self._reconnect_backoff.on_success()
+                    assert lease is not None
+                    self._handle_lease(lease)
+                    continue
+                if outcome == _PollOutcome.IDLE:
+                    if self._reconnect_backoff.current > 0.0:
+                        log.info("dispatcher reachable again; resuming normal poll cadence")
+                    self._reconnect_backoff.on_success()
+                    self._maybe_log_idle()
+                    time.sleep(self.poll_idle_seconds)
+                    continue
+                # UNREACHABLE — connection refused or timeout.
+                was_healthy = self._reconnect_backoff.current == 0.0
+                wait = self._reconnect_backoff.on_failure()
+                if was_healthy:
+                    # Surface the first failure at INFO so operators see it
+                    # without DEBUG. Sustained outages stay quiet (the
+                    # individual urlopen exception still logs at DEBUG).
+                    log.warning(
+                        "dispatcher unreachable; backing off (next poll in %.1fs)",
+                        wait,
+                    )
+                time.sleep(wait)
+        finally:
+            # Stop the heartbeat thread cleanly so in-process callers
+            # don't leak it across runs. The drain watchdog (if it was
+            # spawned) checks _hb_stop and exits silently when the main
+            # thread reaches this point — clean shutdown short-circuits
+            # the deadline.
+            self._hb_stop.set()
+            self._hb_thread.join(timeout=2)
 
     def _maybe_log_idle(self) -> None:
         now = time.monotonic()
@@ -263,8 +290,35 @@ class Worker:
         self._running = False
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
-        log.info("worker %s received signal %s; shutting down", self.worker_id, signum)
-        self._running = False
+        # Idempotent: a second SIGTERM during drain is a no-op so the
+        # operator's only escape is SIGKILL.
+        with self._drain_lock:
+            if self._drain_started:
+                return
+            self._drain_started = True
+            self._running = False
+            if self.drain_timeout_seconds > 0:
+                # Lazy-spawn the watchdog. Pre-spawning + Event.wait()
+                # would be cleaner, but a long-blocked daemon thread in
+                # the worker subprocess interferes with cross-process
+                # SQLite WAL visibility under load. Spawning from a
+                # signal handler is safe here: the only other thread
+                # that calls Thread.start() is __init__ (already done)
+                # and the heartbeat thread (never spawns).
+                self._drain_thread = threading.Thread(
+                    target=self._drain_watchdog,
+                    args=(time.monotonic(),),
+                    daemon=True,
+                    name=f"papayya-worker-drain-{self.worker_id}",
+                )
+                self._drain_thread.start()
+        # Log outside the lock — signal handler interrupting another
+        # log call could deadlock the logging lock if it ran inside it.
+        log.info(
+            "worker %s received signal %s; draining (deadline %.0fs, "
+            "SIGKILL to force-exit)",
+            self.worker_id, signum, self.drain_timeout_seconds,
+        )
 
     # --- dispatcher I/O ------------------------------------------------ #
 
@@ -473,6 +527,46 @@ class Worker:
             short, lease.item_id, duration_ms,
         )
         self._report_complete(lease.lease_id, status="completed")
+
+    # --- drain watchdog ----------------------------------------------- #
+
+    def _drain_watchdog(self, started_at: float) -> None:
+        """Bound the SIGTERM drain phase; force-exit on deadline.
+
+        Spawned lazily from ``_on_signal`` so an idle worker doesn't
+        hold a blocked daemon thread (which interferes with
+        cross-process SQLite WAL visibility on macOS). Gives the
+        in-flight item ``drain_timeout_seconds`` to finish naturally;
+        if the main thread reaches ``run()``'s finally before that
+        deadline, ``_hb_stop`` is set and the watchdog exits silently.
+
+        On deadline expiry the watchdog flushes log handlers and calls
+        ``os._exit(1)``. The recovery path is the dispatcher's lease
+        TTL: the orphaned lease is released and the item re-dispatched,
+        with the idempotent ``/complete`` (#4) preventing
+        double-accounting if a late completion lands.
+        """
+        deadline = started_at + self.drain_timeout_seconds
+        while time.monotonic() < deadline:
+            if self._hb_stop.is_set():
+                return  # run() returned cleanly; nothing to escalate
+            time.sleep(0.2)
+        with self._hb_lock:
+            in_flight = self._in_flight_lease
+        lease_short = in_flight.lease_id[:8] if in_flight else "?"
+        log.error(
+            "worker %s drain deadline exceeded (%.0fs); forcing exit. "
+            "Lease %s will be released by dispatcher TTL.",
+            self.worker_id, self.drain_timeout_seconds, lease_short,
+        )
+        # Flush handlers so the error line above reaches the operator
+        # before os._exit skips Python finalization.
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(1)
 
     # --- heartbeat ----------------------------------------------------- #
 
