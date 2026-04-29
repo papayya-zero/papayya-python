@@ -24,10 +24,38 @@ file and deploys each one.
 from __future__ import annotations
 
 import functools
+import inspect
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from papayya import _serialize
 from papayya.tools import ToolDefinition
+
+
+# ---------------------------------------------------------------------------
+# Per-call agent input snapshot.
+#
+# The @agent wrapper captures the function's call args here so that
+# DurableRun.init() can populate runs.input_snapshot — the column
+# `runs.replay()` / dlq replay / `papayya replay` all read.
+#
+# Without this bridge, every run is created with input_snapshot=NULL and
+# replay surfaces error out with "no input_snapshot — cannot replay."
+# ---------------------------------------------------------------------------
+
+_AGENT_INPUT: ContextVar[Any] = ContextVar("papayya_agent_input", default=None)
+
+
+def consume_agent_input_snapshot() -> Any:
+    """Return the current agent's captured input args, or None.
+
+    Called by DurableRun.init() when seeding a fresh RunCheckpoint. The
+    contextvar stays set across the fn body so multiple runs created
+    inside one @agent call all inherit the same input — that matches
+    intent: the snapshot describes the *agent invocation*, not a run.
+    """
+    return _AGENT_INPUT.get()
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +90,41 @@ def get_agent(name: str) -> AgentRegistration | None:
 
 
 # ---------------------------------------------------------------------------
+# Input snapshot capture
+# ---------------------------------------------------------------------------
+
+def _build_input_snapshot(
+    sig: inspect.Signature | None,
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """Build the snapshot dict for an @agent function call, or None.
+
+    Returns None — never raises — if any of the following fail:
+      - The signature couldn't be introspected at decoration time.
+      - bind() rejects the call (TypeError will surface from fn() anyway).
+      - The bound args aren't JSON-encodable (e.g. a custom class instance
+        with no __dict__). The run still executes; replay just isn't
+        available for that invocation.
+    """
+    if sig is None:
+        return None
+    try:
+        bound = sig.bind(*args, **kwargs)
+    except TypeError:
+        return None
+    # Pull defaults onto the snapshot so replay stays deterministic if
+    # the source code's default values change after a run was captured.
+    bound.apply_defaults()
+    snap = dict(bound.arguments)
+    try:
+        _serialize.encode_user_value(snap, strict=True)
+    except (TypeError, ValueError):
+        return None
+    return snap
+
+
+# ---------------------------------------------------------------------------
 # @agent decorator
 # ---------------------------------------------------------------------------
 
@@ -90,21 +153,38 @@ def agent(
         budget_usd: Per-run budget cap.
     """
     def decorator(fn: Callable) -> Callable:
+        try:
+            sig: inspect.Signature | None = inspect.signature(fn)
+        except (TypeError, ValueError):
+            # Builtins / C-level callables — no introspectable signature.
+            # Snapshot capture skipped for these; runs still execute.
+            sig = None
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            snapshot = _build_input_snapshot(sig, args, kwargs)
+            token = _AGENT_INPUT.set(snapshot)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _AGENT_INPUT.reset(token)
+
+        # Register the *wrapper*, not the raw fn — the runtime worker
+        # calls registration.fn(item_id) directly, and the wrapper is
+        # what sets the input-snapshot contextvar that DurableRun.init()
+        # reads when seeding runs.input_snapshot. Storing the raw fn
+        # would silently bypass that bridge for every worker-driven run.
         registration = AgentRegistration(
             name=name,
             model=model,
             instructions=instructions,
-            fn=fn,
+            fn=wrapper,
             tools=tools or [],
             max_steps=max_steps,
             budget_usd=budget_usd,
             durable=durable,
         )
         _registry[name] = registration
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            return fn(*args, **kwargs)
 
         # Attach metadata so callers can inspect without the registry
         wrapper._papayya_agent = registration

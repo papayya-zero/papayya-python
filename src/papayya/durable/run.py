@@ -80,6 +80,11 @@ class PapayyaRun:
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
         else:
+            # Read the @agent wrapper's captured call args. None when the
+            # caller bypassed the decorator (scripts, tests). Stays as-is
+            # — we never inject a synthetic snapshot here.
+            from papayya.agent import consume_agent_input_snapshot
+
             now = datetime.now(timezone.utc).isoformat()
             checkpoint = RunCheckpoint(
                 run_id=self.run_id,
@@ -89,6 +94,7 @@ class PapayyaRun:
                 created_at=now,
                 updated_at=now,
                 item_id=self._run_item_id,
+                input_snapshot=consume_agent_input_snapshot(),
             )
             self._store.create(checkpoint)
 

@@ -150,6 +150,15 @@ def test_worker_processes_batch_with_correct_lineage(
         last = run.tasks[-1]
         assert last.result == {"id": item_id, "data": f"snippet-for-{item_id}", "score": 0.42}
 
+        # input_snapshot must be populated from the @agent call args so
+        # `runs.replay()` and dlq replay can re-issue this run. Captured
+        # by the @agent wrapper via inspect.signature.bind().
+        assert run.input_snapshot == {"item_id": item_id}, (
+            f"item {item_id}: expected input_snapshot={{'item_id': {item_id!r}}}, "
+            f"got {run.input_snapshot!r}. Replay paths read this column; "
+            "if it's None, replay surfaces silently break."
+        )
+
     # 4. Worker exits cleanly when stopped.
     worker.stop(timeout=5.0)
     assert worker.exit_code == 0, (
