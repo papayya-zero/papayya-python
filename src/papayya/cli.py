@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -107,6 +108,29 @@ def _discover_agents(path: str) -> list:
         sys.exit(1)
 
     return agents
+
+
+def _replay_invoke(fn: Any, snapshot: Any) -> Any:
+    """Re-invoke an @agent function with a captured input_snapshot.
+
+    Two shapes are accepted:
+
+      • dict whose keys bind to the agent's parameters — unpacked as
+        kwargs. This is the format the @agent wrapper captures via
+        ``inspect.signature.bind().arguments``.
+      • anything else (including a dict whose keys do *not* bind) —
+        passed as a single positional argument. Back-compat path for
+        snapshots that predate the @agent capture bridge or were
+        hand-populated via ``RunCheckpoint(input_snapshot=...)``.
+    """
+    if isinstance(snapshot, dict):
+        try:
+            inspect.signature(fn).bind(**snapshot)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return fn(**snapshot)
+    return fn(snapshot)
 
 
 def _resolve_project_id(ctx_obj: dict) -> str | None:
@@ -883,9 +907,11 @@ def dlq_replay(run_id: str, file: str | None, db: str) -> None:
       papayya dlq replay --run <run_id> --file my_agents.py
 
     Reads the run's input_snapshot from the local DB, finds the matching
-    @agent-decorated function in the agent file, and invokes it with the
-    snapshot as its single positional argument. The agent is expected to
-    take one argument — the same payload it received the first time.
+    @agent-decorated function in the agent file, and re-invokes it. When
+    the snapshot is a dict whose keys bind to the agent's parameters
+    (the format the @agent decorator captures), the dict is unpacked as
+    kwargs. Otherwise the snapshot is passed as a single positional
+    argument — back-compat for runs whose snapshot was hand-populated.
 
     On any outcome (success or a new failure), the original run is marked
     with disposition='replayed'. If the replay also fails it shows up as a
@@ -974,7 +1000,7 @@ def dlq_replay(run_id: str, file: str | None, db: str) -> None:
     click.echo(f"Replaying run {run_id} through agent {agent_name}...")
     replay_error: Exception | None = None
     try:
-        result = matching.fn(input_snapshot)
+        result = _replay_invoke(matching.fn, input_snapshot)
         click.echo(f"Replay returned: {result!r}")
     except Exception as exc:  # noqa: BLE001
         replay_error = exc

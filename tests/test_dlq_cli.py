@@ -167,6 +167,47 @@ def test_replay_rejects_run_without_snapshot(tmp_path: Path) -> None:
     assert "no input_snapshot" in result.output or "no input_snapshot" in (result.stderr_bytes or b"").decode()
 
 
+def test_replay_unpacks_dict_snapshot_as_kwargs(tmp_path: Path) -> None:
+    """When the snapshot is a dict whose keys match the agent's
+    signature, replay calls fn(**snapshot). This is the format the
+    @agent wrapper captures (via inspect.signature.bind), so the runs
+    written by the worker model replay correctly without each customer
+    having to remember to pass a single positional arg.
+    """
+    db_path = tmp_path / "local.db"
+    # Snapshot keyed by parameter name — matches the agent's signature.
+    _make_failed_run(
+        db_path,
+        run_id="kw-run",
+        agent="kw_enricher",
+        input_snapshot={"item_id": "co_42", "retries": 0},
+    )
+
+    body = textwrap.dedent("""\
+        from papayya import agent
+
+        @agent(name="kw_enricher")
+        def kw_enricher(item_id, retries=0):
+            return {"item_id": item_id, "retries": retries}
+    """)
+    agent_file = tmp_path / "agent.py"
+    agent_file.write_text(body)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.main,
+        ["dlq", "replay", "--run", "kw-run",
+         "--db", str(db_path), "--file", str(agent_file)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    # The fn returned the kwargs back — confirms unpack happened, not
+    # a positional pass (which would have stuffed the whole dict into
+    # `item_id` and tripped Python's binding before our test could see).
+    assert "'item_id': 'co_42'" in result.output
+    assert "'retries': 0" in result.output
+
+
 def test_replay_rejects_unknown_agent(tmp_path: Path) -> None:
     db_path = tmp_path / "local.db"
     _make_failed_run(db_path, run_id="wrong-agent", agent="does-not-exist")
@@ -219,3 +260,32 @@ def test_replay_rejects_unknown_run(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "not found" in (result.output + (result.stderr_bytes or b"").decode()).lower()
+
+
+# --- _replay_invoke unit tests ----------------------------------------- #
+
+def test_replay_invoke_unpacks_dict_when_keys_bind() -> None:
+    def fn(item_id, retries=0):
+        return (item_id, retries)
+
+    assert cli_module._replay_invoke(fn, {"item_id": "x"}) == ("x", 0)
+    assert cli_module._replay_invoke(fn, {"item_id": "x", "retries": 3}) == ("x", 3)
+
+
+def test_replay_invoke_falls_back_to_positional_when_keys_dont_bind() -> None:
+    """A dict whose keys don't match the fn's params is passed as one
+    positional argument — the agent receives the whole dict as before.
+    """
+    def fn(payload):
+        return payload
+
+    snap = {"unrelated_key": "x"}
+    assert cli_module._replay_invoke(fn, snap) == snap
+
+
+def test_replay_invoke_passes_non_dict_positionally() -> None:
+    def fn(payload):
+        return payload
+
+    assert cli_module._replay_invoke(fn, "raw-string") == "raw-string"
+    assert cli_module._replay_invoke(fn, [1, 2, 3]) == [1, 2, 3]
