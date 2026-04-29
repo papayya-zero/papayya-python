@@ -56,6 +56,20 @@ class Lease:
     payload: dict[str, Any] | None = None
 
 
+class _AgentTimeout(BaseException):
+    """Raised by the SIGALRM handler when an agent fn exceeds its
+    ``max_duration_seconds`` budget.
+
+    Subclasses BaseException (not Exception) so customer ``except
+    Exception`` blocks inside the agent fn don't accidentally swallow
+    the timeout. The worker handles it explicitly.
+    """
+
+
+def _on_agent_alarm(_signum: int, _frame: Any) -> None:
+    raise _AgentTimeout()
+
+
 class _PollOutcome:
     """String constants for the three states `_poll_lease` can return.
 
@@ -287,6 +301,7 @@ class Worker:
         lease_id: str,
         status: str,
         error: str | None = None,
+        error_category: str | None = None,
     ) -> None:
         body = {
             "lease_id": lease_id,
@@ -295,6 +310,8 @@ class Worker:
         }
         if error is not None:
             body["error"] = error
+        if error_category is not None:
+            body["error_category"] = error_category
         data = json.dumps(body).encode("utf-8")
         req = urllib_request.Request(
             f"{self.dispatcher_url}/complete",
@@ -344,13 +361,69 @@ class Worker:
                 )
                 return
 
-            registration.fn(lease.item_id)
-            duration_ms = int((time.monotonic() - started_at) * 1000)
-            log.info(
-                "finished %s item=%s duration=%dms",
-                short, lease.item_id, duration_ms,
+            # Resolve the timeout for this invocation. Per-call payload
+            # override (ADR-0002 #2 user choice) wins over the per-agent
+            # default. None at both levels disables the watchdog.
+            max_duration = None
+            if isinstance(lease.payload, dict):
+                payload_override = lease.payload.get("max_duration_seconds")
+                if payload_override is not None:
+                    max_duration = payload_override
+            if max_duration is None:
+                max_duration = registration.max_duration_seconds
+
+            self._invoke_with_timeout(
+                fn=registration.fn,
+                lease=lease,
+                started_at=started_at,
+                max_duration=max_duration,
+                short=short,
             )
-            self._report_complete(lease.lease_id, status="completed")
+        finally:
+            with self._hb_lock:
+                self._in_flight_lease = None
+            self._last_activity_at = time.monotonic()
+
+    def _invoke_with_timeout(
+        self,
+        *,
+        fn: Any,
+        lease: Lease,
+        started_at: float,
+        max_duration: float | None,
+        short: str,
+    ) -> None:
+        """Run ``fn(lease.item_id)``; arm SIGALRM if max_duration is set.
+
+        Three terminal paths:
+          - Success: report completed.
+          - _AgentTimeout: report failed with error_category=timeout.
+          - Any other exception: report failed with stringified error.
+
+        The signal arming is local to this call. ``setitimer(0)`` and
+        the handler restore in the finally block guarantee no SIGALRM
+        leaks across leases.
+        """
+        prior_handler = None
+        watchdog_armed = max_duration is not None and max_duration > 0
+        if watchdog_armed:
+            prior_handler = signal.signal(signal.SIGALRM, _on_agent_alarm)
+            signal.setitimer(signal.ITIMER_REAL, max_duration)
+        try:
+            fn(lease.item_id)
+        except _AgentTimeout:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.warning(
+                "failed   %s item=%s duration=%dms category=timeout limit=%.2fs",
+                short, lease.item_id, duration_ms, max_duration,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"timeout: agent ran for >{max_duration}s",
+                error_category="timeout",
+            )
+            return
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.exception(
@@ -362,10 +435,24 @@ class Worker:
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+            return
         finally:
-            with self._hb_lock:
-                self._in_flight_lease = None
-            self._last_activity_at = time.monotonic()
+            if watchdog_armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                # Restore whatever was on SIGALRM before us — could be
+                # the default handler (None on the C side) or a customer
+                # handler installed before we hooked. signal.signal
+                # returns the prior callable / SIG_DFL marker.
+                if prior_handler is not None:
+                    signal.signal(signal.SIGALRM, prior_handler)
+
+        # Success path (no exception, no early return).
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "finished %s item=%s duration=%dms",
+            short, lease.item_id, duration_ms,
+        )
+        self._report_complete(lease.lease_id, status="completed")
 
     # --- heartbeat ----------------------------------------------------- #
 

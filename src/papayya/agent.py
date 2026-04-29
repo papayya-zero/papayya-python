@@ -73,6 +73,10 @@ class AgentRegistration:
     max_steps: int
     budget_usd: float | None
     durable: bool = False
+    # Per-agent default for the worker's wall-clock watchdog. None
+    # disables the watchdog entirely. Per-call overrides via the
+    # dispatcher payload take priority. ADR-0002 #2.
+    max_duration_seconds: float | None = None
 
 
 # Global registry, keyed by agent name (slug)
@@ -136,6 +140,7 @@ def agent(
     max_steps: int = 50,
     budget_usd: float | None = None,
     durable: bool = False,
+    max_duration_seconds: float | None = None,
 ) -> Callable:
     """Decorator that registers a function as a deployable agent.
 
@@ -151,7 +156,24 @@ def agent(
         tools: Optional list of ToolDefinition objects.
         max_steps: Max LLM calls per run (enforced by the runtime shim).
         budget_usd: Per-run budget cap.
+        max_duration_seconds: Wall-clock soft timeout for one invocation
+            of the agent fn, enforced by the runtime worker (ADR-0002 #2).
+            ``None`` (the default) disables enforcement — existing agents
+            keep their pre-timeout behavior. The dispatcher payload's
+            ``max_duration_seconds`` field overrides this on a per-call
+            basis.
+
+            Caveats: signal-based watchdog (Unix only). Cannot interrupt
+            blocking C calls (SSL handshakes, default ``requests.get``);
+            pair this with explicit socket timeouts in your HTTP client
+            for full coverage. Customer code that installs its own
+            ``SIGALRM`` handler conflicts.
     """
+    if max_duration_seconds is not None and max_duration_seconds <= 0:
+        raise ValueError(
+            f"max_duration_seconds must be > 0 or None, got {max_duration_seconds!r}"
+        )
+
     def decorator(fn: Callable) -> Callable:
         try:
             sig: inspect.Signature | None = inspect.signature(fn)
@@ -183,6 +205,7 @@ def agent(
             max_steps=max_steps,
             budget_usd=budget_usd,
             durable=durable,
+            max_duration_seconds=max_duration_seconds,
         )
         _registry[name] = registration
 

@@ -297,6 +297,7 @@ class LocalDispatcher:
                         status=body.get("status", "completed"),
                         error=body.get("error"),
                         worker_id=body.get("worker_id"),
+                        error_category=body.get("error_category"),
                     )
                     self._send_json(200, None)
                     return
@@ -356,6 +357,7 @@ class LocalDispatcher:
         status: str,
         error: str | None,
         worker_id: str | None,
+        error_category: str | None = None,
     ) -> bool:
         """Record completion. Returns True if the lease was recognized.
 
@@ -373,7 +375,11 @@ class LocalDispatcher:
                     "worker_id": worker_id,
                 })
                 return False
-            self._completed[lease_id] = {"status": status, "error": error}
+            self._completed[lease_id] = {
+                "status": status,
+                "error": error,
+                "error_category": error_category,
+            }
             # Computed dispatcher-side from leased_at to keep the
             # measurement single-clock — worker clock skew can't
             # mislead operators reading the event log.
@@ -382,6 +388,7 @@ class LocalDispatcher:
             "lease_id": lease_id,
             "status": status,
             "error": error,
+            "error_category": error_category,
             "worker_id": worker_id,
             "duration_ms": duration_ms,
         })
@@ -499,10 +506,12 @@ def _format_event(kind: str, data: dict) -> str:
         suffix = f" error={data['error']}" if data.get("error") else ""
         duration = data.get("duration_ms")
         duration_field = f"  duration={duration}ms" if duration is not None else ""
+        category = data.get("error_category")
+        category_field = f"  category={category}" if category else ""
         return (
             f"[{ts}] {marker} completed {data['lease_id'][:8]}  "
             f"status={data['status']}  worker={data.get('worker_id')}"
-            f"{duration_field}{suffix}"
+            f"{category_field}{duration_field}{suffix}"
         )
     if kind == "lease_expired":
         return (
