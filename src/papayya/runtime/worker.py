@@ -64,6 +64,8 @@ class Worker:
             responsive iteration loop; tune in Phase 2 from real load data.
     """
 
+    _idle_log_interval = 30.0
+
     def __init__(
         self,
         *,
@@ -78,6 +80,9 @@ class Worker:
         self.worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
         self.poll_idle_seconds = poll_idle_seconds
         self._running = True
+        now = time.monotonic()
+        self._last_activity_at = now
+        self._last_idle_log_at = now
 
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
@@ -124,9 +129,23 @@ class Worker:
         while self._running:
             lease = self._poll_lease()
             if lease is None:
+                self._maybe_log_idle()
                 time.sleep(self.poll_idle_seconds)
                 continue
             self._handle_lease(lease)
+
+    def _maybe_log_idle(self) -> None:
+        now = time.monotonic()
+        if (
+            now - self._last_activity_at >= self._idle_log_interval
+            and now - self._last_idle_log_at >= self._idle_log_interval
+        ):
+            log.info(
+                "worker %s idle, no work for %ds",
+                self.worker_id,
+                int(now - self._last_activity_at),
+            )
+            self._last_idle_log_at = now
 
     def stop(self) -> None:
         self._running = False
@@ -196,22 +215,45 @@ class Worker:
         # would create a cycle / shadow.
         from papayya.agent import get_agent
 
-        registration = get_agent(lease.agent)
-        if registration is None:
-            self._report_complete(
-                lease.lease_id,
-                status="failed",
-                error=f"unknown agent: {lease.agent}",
-            )
-            return
-
+        short = lease.lease_id[:8]
+        log.info(
+            "started  %s agent=%s item=%s",
+            short, lease.agent, lease.item_id,
+        )
+        started_at = time.monotonic()
+        self._last_activity_at = started_at
         try:
+            registration = get_agent(lease.agent)
+            if registration is None:
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                log.warning(
+                    "failed   %s item=%s duration=%dms unknown-agent=%s",
+                    short, lease.item_id, duration_ms, lease.agent,
+                )
+                self._report_complete(
+                    lease.lease_id,
+                    status="failed",
+                    error=f"unknown agent: {lease.agent}",
+                )
+                return
+
             registration.fn(lease.item_id)
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.info(
+                "finished %s item=%s duration=%dms",
+                short, lease.item_id, duration_ms,
+            )
             self._report_complete(lease.lease_id, status="completed")
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
-            log.exception("agent %s failed on item %s", lease.agent, lease.item_id)
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.exception(
+                "failed   %s item=%s duration=%dms",
+                short, lease.item_id, duration_ms,
+            )
             self._report_complete(
                 lease.lease_id,
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+        finally:
+            self._last_activity_at = time.monotonic()
