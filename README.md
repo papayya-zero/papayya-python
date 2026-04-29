@@ -12,8 +12,9 @@ pip install papayya
 
 ```bash
 papayya init                                    # writes papayya.yaml
-python examples/local_demo_agent.py             # one keyless durable run
-papayya dev --db .papayya/local.db              # open the local dashboard
+papayya example                                 # scaffolds local_demo_agent.py
+python local_demo_agent.py                      # one keyless durable run
+papayya dev                                     # open the local dashboard
 ```
 
 The demo agent runs a two-step durable workflow against canned data — no provider key, no network. Open `papayya dev` to see the run, the per-step input/output, and the lineage. That's the iteration loop.

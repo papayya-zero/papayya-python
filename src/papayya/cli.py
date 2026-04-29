@@ -294,15 +294,55 @@ def init() -> None:
     target.write_text("version: 1\n")
     click.echo(f"✓ Created papayya.yaml in {cwd}")
     click.echo("")
-    click.echo("Next: decorate your entrypoint with @agent from papayya, then run papayya deploy.")
+    click.echo("Next: scaffold a runnable demo to feel the loop:")
     click.echo("")
-    click.echo("    from papayya import agent")
+    click.echo("    papayya example     # writes local_demo_agent.py")
+    click.echo("    python local_demo_agent.py")
+    click.echo("    papayya dev         # open the dashboard")
     click.echo("")
-    click.echo('    @agent(name="my-agent")')
-    click.echo("    def run(input):")
-    click.echo("        ...")
+    click.echo("Or write your own agent — see https://docs.getpapayya.com")
+
+
+# ---------------------------------------------------------------------------
+# example
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option(
+    "--print",
+    "print_only",
+    is_flag=True,
+    default=False,
+    help="Print the demo to stdout instead of writing a file.",
+)
+def example(print_only: bool) -> None:
+    """Scaffold local_demo_agent.py — a keyless durable run you can execute immediately."""
+    from papayya._demo import LOCAL_DEMO_AGENT_SOURCE
+
+    if print_only:
+        click.echo(LOCAL_DEMO_AGENT_SOURCE, nl=False)
+        return
+
+    cwd = Path.cwd()
+    target = cwd / "local_demo_agent.py"
+
+    if target.exists():
+        click.confirm(
+            "local_demo_agent.py already exists. Overwrite?",
+            default=False,
+            abort=True,
+        )
+
+    target.write_text(LOCAL_DEMO_AGENT_SOURCE)
+    click.echo(f"✓ Wrote local_demo_agent.py to {cwd}")
     click.echo("")
-    click.echo("See https://docs.getpapayya.com for framework examples and trigger config.")
+    click.echo("Run it:")
+    click.echo("")
+    click.echo("    python local_demo_agent.py")
+    click.echo("")
+    click.echo("Then open the dashboard:")
+    click.echo("")
+    click.echo("    papayya dev")
 
 
 # ---------------------------------------------------------------------------
