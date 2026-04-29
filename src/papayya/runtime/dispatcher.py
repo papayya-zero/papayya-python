@@ -374,11 +374,16 @@ class LocalDispatcher:
                 })
                 return False
             self._completed[lease_id] = {"status": status, "error": error}
+            # Computed dispatcher-side from leased_at to keep the
+            # measurement single-clock — worker clock skew can't
+            # mislead operators reading the event log.
+            duration_ms = int((time.monotonic() - record.leased_at) * 1000)
         self._on_event("completed", {
             "lease_id": lease_id,
             "status": status,
             "error": error,
             "worker_id": worker_id,
+            "duration_ms": duration_ms,
         })
         return True
 
@@ -492,9 +497,12 @@ def _format_event(kind: str, data: dict) -> str:
     if kind == "completed":
         marker = "✓" if data["status"] == "completed" else "✗"
         suffix = f" error={data['error']}" if data.get("error") else ""
+        duration = data.get("duration_ms")
+        duration_field = f"  duration={duration}ms" if duration is not None else ""
         return (
             f"[{ts}] {marker} completed {data['lease_id'][:8]}  "
-            f"status={data['status']}  worker={data.get('worker_id')}{suffix}"
+            f"status={data['status']}  worker={data.get('worker_id')}"
+            f"{duration_field}{suffix}"
         )
     if kind == "lease_expired":
         return (
