@@ -8,7 +8,17 @@ Durable background jobs for AI agents. Bring your own LLM — Papayya handles ex
 pip install papayya
 ```
 
-## Quick Start
+## Try it in 30 seconds (no LLM key needed)
+
+```bash
+papayya init                                    # writes papayya.yaml
+python examples/local_demo_agent.py             # one keyless durable run
+papayya dev --db .papayya/local.db              # open the local dashboard
+```
+
+The demo agent runs a two-step durable workflow against canned data — no provider key, no network. Open `papayya dev` to see the run, the per-step input/output, and the lineage. That's the iteration loop.
+
+## Quick Start with your own LLM
 
 ### Define an agent
 
@@ -19,13 +29,12 @@ from papayya import agent, tool
 def search_web(query: str) -> str:
     """Search the web for information."""
     # Your implementation here
-    return results
+    return "..."
 
 @agent(name="research-bot", model="gpt-4o-mini", budget_usd=1.0)
 def research_bot(input_data):
     from openai import OpenAI
     client = OpenAI()
-    # Your agent logic — call your LLM directly
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": input_data}],
@@ -37,21 +46,25 @@ def research_bot(input_data):
 
 ### Durable execution
 
-Wrap long-running work in checkpoint-able tasks. If a run crashes, it resumes from the last checkpoint instead of re-executing completed steps.
+Wrap long-running work in checkpoint-able steps. If a run crashes, it resumes from the last checkpoint instead of re-executing completed steps.
 
 ```python
 from papayya import papayya
 
-run = papayya(agent="my-agent")
+run = papayya().run("my-agent")
 
-search = run.task("search", search_web)
-summarize = run.task("summarize", summarize_results)
+fetch    = run.step("fetch",     fetch_data)
+analyse  = run.step("analyse",   analyse_results)
 
-results = search(query)        # cached on replay
-summary = summarize(results)   # cached on replay
+data    = fetch(query)        # cached on replay
+summary = analyse(data)       # cached on replay
 
 run.complete(summary)
 ```
+
+`step()` and `task()` are aliases. Use whichever reads better in context.
+
+When `PAPAYYA_API_KEY` is set, checkpoints round-trip through the cloud control plane. Without a key, the SDK writes to a local SQLite at `.papayya/local.db` — the same database `papayya dev` reads from.
 
 ### Budget enforcement (cloud only)
 
@@ -69,7 +82,8 @@ papayya deploy
 - **BYOF (Bring Your Own Function)** — Papayya doesn't wrap your LLM calls. You use any SDK (OpenAI, Anthropic, Bedrock, etc.) directly inside your agent function.
 - **`@agent` decorator** — Registers your function for deployment. The function stays callable locally.
 - **`@tool` decorator** — Defines tools your agent can call, with automatic JSON Schema generation from type hints.
-- **Durable runs** — Checkpoint-and-replay execution. Tasks are cached so replayed runs skip completed work.
+- **Durable runs** — Checkpoint-and-replay execution. Steps are cached so replayed runs skip completed work.
+- **Local dashboard** — `papayya dev` reads from the same SQLite the SDK writes to. No control plane required.
 - **Budgets** — Cloud-only. The runtime shim reserves cost before each LLM call and pauses the run when the cap is hit.
 
 ## Requirements

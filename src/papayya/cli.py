@@ -880,7 +880,8 @@ def _print_apply_result(result, *, api_base_url: str) -> None:
 @main.command()
 @click.option("--port", default=8585, help="Port for the dev dashboard")
 @click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--db", default=".papayya/local.db", help="Path to SQLite database")
+@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
+              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
 def dev(port: int, host: str, db: str) -> None:
     """Launch the local development dashboard."""
     click.echo(f"Starting Papayya Dev Dashboard...")
@@ -897,7 +898,8 @@ def dlq() -> None:
 @click.option("--run", "run_id", required=True, help="Run ID to replay")
 @click.option("--file", "file", default=None,
               help="Agent file (default: auto-discover agent.py in cwd)")
-@click.option("--db", default=".papayya/local.db", help="Path to SQLite database")
+@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
+              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
 @click.option(
     "--latest",
     "latest",
@@ -1066,7 +1068,8 @@ def project() -> None:
 
 @project.command("export")
 @click.option("--out", required=True, help="Output JSONL file path")
-@click.option("--db",  default=".papayya/local.db", help="Path to SQLite database")
+@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
+              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
 @click.option(
     "--include-response-text",
     is_flag=True,
