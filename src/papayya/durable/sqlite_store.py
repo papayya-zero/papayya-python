@@ -307,6 +307,16 @@ _V6_INDEXES = [
 ]
 
 
+# v7: ADR-0002 #7 — version-tagged lineage. agent_version on runs is the
+# source of truth (set at create() time) and denormalized onto each task
+# row written under the run, so the dashboard can render it on a step
+# without joining. No index — display column, not a filter target.
+_V7_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_RUNS, _schema.COL_RUN_AGENT_VERSION, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_AGENT_VERSION, "TEXT"),
+]
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -464,14 +474,24 @@ def _apply_v5_to_v6(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "6")
 
 
+def _apply_v6_to_v7(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "6")
+    with conn:
+        for table, column, type_decl in _V7_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        _set_schema_version(conn, "7")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → v3 → v4 → v5 → v6) so long-dormant local DBs catch up
-    cleanly.
+    (e.g. v1 → v2 → v3 → v4 → v5 → v6 → v7) so long-dormant local DBs catch
+    up cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -490,6 +510,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "5":
             _apply_v5_to_v6(conn, db_path)
             current = "6"
+        elif current == "6":
+            _apply_v6_to_v7(conn, db_path)
+            current = "7"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -540,6 +563,7 @@ class SQLiteStore:
                 llm_stop_reason=t[_schema.COL_TASK_LLM_STOP_REASON],
                 llm_provider_shape=t[_schema.COL_TASK_LLM_PROVIDER_SHAPE],
                 error_category=t[_schema.COL_TASK_ERROR_CATEGORY],
+                agent_version=t[_schema.COL_TASK_AGENT_VERSION],
             )
             for t in task_rows
         ]
@@ -553,6 +577,7 @@ class SQLiteStore:
             updated_at=row["updated_at"],
             item_id=row[_schema.COL_RUN_ITEM_ID],
             input_snapshot=_decode_snapshot(row[_schema.COL_RUN_INPUT_SNAPSHOT]),
+            agent_version=row[_schema.COL_RUN_AGENT_VERSION],
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -572,8 +597,9 @@ class SQLiteStore:
                    {_schema.COL_TASK_LLM_MODEL},
                    {_schema.COL_TASK_LLM_STOP_REASON},
                    {_schema.COL_TASK_LLM_PROVIDER_SHAPE},
-                   {_schema.COL_TASK_ERROR_CATEGORY})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_TASK_ERROR_CATEGORY},
+                   {_schema.COL_TASK_AGENT_VERSION})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -591,6 +617,7 @@ class SQLiteStore:
                     entry.llm_stop_reason,
                     entry.llm_provider_shape,
                     entry.error_category,
+                    entry.agent_version,
                 ),
             )
             self._conn.execute(
@@ -690,8 +717,9 @@ class SQLiteStore:
 
         self._conn.execute(
             f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
-               batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT},
+               {_schema.COL_RUN_AGENT_VERSION})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
                 checkpoint.agent,
@@ -701,6 +729,7 @@ class SQLiteStore:
                 batch_id,
                 checkpoint.item_id,
                 _encode_snapshot(checkpoint.input_snapshot),
+                checkpoint.agent_version,
             ),
         )
         self._conn.commit()

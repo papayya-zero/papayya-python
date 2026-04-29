@@ -43,8 +43,27 @@ class Runs:
     def cancel(self, run_id: str) -> dict[str, Any]:
         return self._api._request("POST", f"/v1/runs/{run_id}/cancel")
 
-    def replay(self, run_id: str, *, from_step: int) -> dict[str, Any]:
-        return self._api._request("POST", f"/v1/runs/{run_id}/replay", json={"from_step": from_step})
+    def replay(
+        self,
+        run_id: str,
+        *,
+        from_step: int,
+        latest: bool = False,
+    ) -> dict[str, Any]:
+        """Replay a durable run from a step.
+
+        ``latest=False`` (the default) is the safe option: when the hosted
+        version-mismatch gate (ADR-0002 #7) lands, the server will reject a
+        replay whose registration's ``agent_version`` differs from the
+        captured one. Pass ``latest=True`` to opt into running the current
+        code anyway. Until the hosted gate is live the server ignores the
+        flag — we ship the wire contract now so the SDK is forward-compatible.
+        """
+        return self._api._request(
+            "POST",
+            f"/v1/runs/{run_id}/replay",
+            json={"from_step": from_step, "allow_version_mismatch": latest},
+        )
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         return self._api._request("GET", f"/v1/runs/{run_id}/steps")

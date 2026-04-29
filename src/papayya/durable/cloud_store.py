@@ -58,12 +58,14 @@ class CloudStore:
                     item_id=cp.get("item_id"),
                     input_snapshot=cp.get("input_snapshot"),
                     output_snapshot=cp.get("output_snapshot"),
+                    agent_version=cp.get("agent_version"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
             item_id=body.get("item_id"),
             created_at=body["created_at"],
             updated_at=body["updated_at"],
+            agent_version=body.get("agent_version"),
         )
 
     def create(self, checkpoint: RunCheckpoint) -> None:
@@ -73,6 +75,7 @@ class CloudStore:
                 "run_id": checkpoint.run_id,
                 "agent": checkpoint.agent,
                 "item_id": checkpoint.item_id,
+                "agent_version": checkpoint.agent_version,
             },
         )
         resp.raise_for_status()
@@ -87,6 +90,7 @@ class CloudStore:
                 "item_id": entry.item_id,
                 "input_snapshot": json.loads(encode_user_value(entry.input_snapshot, strict=True)),
                 "output_snapshot": json.loads(encode_user_value(entry.output_snapshot, strict=True)),
+                "agent_version": entry.agent_version,
             },
         )
         resp.raise_for_status()

@@ -28,6 +28,7 @@ from papayya.durable.sqlite_store import (
     _apply_v2_to_v3,
     _apply_v3_to_v4,
     _apply_v4_to_v5,
+    _apply_v5_to_v6,
 )
 
 
@@ -192,6 +193,15 @@ class TestFreshInstall:
         assert _schema.COL_RUN_DLQ_DISPOSITION in run_cols
         assert _schema.COL_RUN_DLQ_RESOLVED_AT in run_cols
         assert _schema.COL_RUN_REPLAYED_FROM in run_cols
+
+    def test_fresh_db_has_agent_version_columns(self, tmp_db: Path) -> None:
+        """v7 adds agent_version on runs (source) + tasks (denormalized)."""
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert _schema.COL_RUN_AGENT_VERSION in run_cols
+        assert _schema.COL_TASK_AGENT_VERSION in task_cols
 
     def test_fresh_db_drops_budget_and_cost_columns(self, tmp_db: Path) -> None:
         """v4 removes budget/cost/token columns. Fresh DBs end up v4 after the
@@ -368,7 +378,9 @@ class TestV5ToV6Migration:
         version = conn.execute(
             "SELECT value FROM _meta WHERE key='schema_version'"
         ).fetchone()[0]
-        assert version == "6"
+        # Migrations chain: v5 → head. Test name reflects the v5→v6 step
+        # this class exercises; the assertion tracks the current head.
+        assert version == _schema.SCHEMA_VERSION
 
     def test_v5_db_adds_dlq_columns_as_null(self, tmp_db: Path) -> None:
         self._build_v5_db(tmp_db)
@@ -398,6 +410,50 @@ class TestV5ToV6Migration:
         self._build_v5_db(tmp_db)
         SQLiteStore(str(tmp_db))
         backup = tmp_db.with_suffix(tmp_db.suffix + ".backup-v5")
+        assert backup.exists()
+
+
+class TestV6ToV7Migration:
+    """Exercise the v6→v7 step: agent_version on runs + tasks (ADR-0002 #7)."""
+
+    def _build_v6_db(self, tmp_db: Path) -> None:
+        _build_v1_db(tmp_db)
+        conn = sqlite3.connect(tmp_db)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _apply_v1_to_v2(conn, tmp_db)
+            _apply_v2_to_v3(conn, tmp_db)
+            _apply_v3_to_v4(conn, tmp_db)
+            _apply_v4_to_v5(conn, tmp_db)
+            _apply_v5_to_v6(conn, tmp_db)
+        finally:
+            conn.close()
+
+    def test_v6_db_bumps_to_head(self, tmp_db: Path) -> None:
+        self._build_v6_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        version = conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert version == _schema.SCHEMA_VERSION
+
+    def test_v6_db_adds_agent_version_columns_as_null(self, tmp_db: Path) -> None:
+        self._build_v6_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='run-1'").fetchone()
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE run_id='run-1'"
+        ).fetchone()
+        assert run[_schema.COL_RUN_AGENT_VERSION] is None
+        assert task[_schema.COL_TASK_AGENT_VERSION] is None
+
+    def test_v6_to_v7_creates_backup(self, tmp_db: Path) -> None:
+        self._build_v6_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        backup = tmp_db.with_suffix(tmp_db.suffix + ".backup-v6")
         assert backup.exists()
 
 

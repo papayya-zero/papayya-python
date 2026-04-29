@@ -86,8 +86,17 @@ DLQ_SKIPPED = "skipped"
 DLQ_ACKNOWLEDGED = "acknowledged"
 
 
+# v7 columns — version-tagged lineage (ADR-0002 #7). Every run records the
+# agent_version it ran on; the same value denormalizes onto each task row so
+# the dashboard can display it on a step without an extra join. Replay reads
+# the run's agent_version and refuses to use a registration with a different
+# value unless the operator passes --latest.
+COL_RUN_AGENT_VERSION = "agent_version"
+COL_TASK_AGENT_VERSION = "agent_version"
+
+
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 
 # Indexes — named explicitly so we can check for their presence in tests

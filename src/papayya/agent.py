@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
+import shutil
+import subprocess
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -77,6 +80,98 @@ class AgentRegistration:
     # disables the watchdog entirely. Per-call overrides via the
     # dispatcher payload take priority. ADR-0002 #2.
     max_duration_seconds: float | None = None
+    # Version tag that gets stamped on every run + step the worker
+    # produces under this registration. Resolved at decoration time via
+    # ``_resolve_agent_version``: explicit decorator arg → env var →
+    # git short SHA → "unknown". Replay refuses to use a registration
+    # whose version doesn't match the original run unless --latest.
+    # ADR-0002 #7.
+    agent_version: str = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Agent version resolution (ADR-0002 #7)
+#
+# Resolved once per process at decoration time. Order:
+#   1. Explicit decorator arg (`@agent(..., agent_version="2.3.1")`)
+#   2. Env var PAPAYYA_AGENT_VERSION (CI/CD injects the build tag)
+#   3. `git rev-parse --short HEAD` from cwd
+#   4. "unknown" sentinel
+# Layers 2 + 3 memoize at module level so a project with N agents only
+# does one git subprocess at boot, not N. Memoization is a process-level
+# cache: tests can clear it with ``_clear_agent_version_cache()``.
+# ---------------------------------------------------------------------------
+
+_AGENT_VERSION_FALLBACK = "unknown"
+_VERSION_RESOLVE_CACHE: dict[str, str | None] = {}
+
+
+def _clear_agent_version_cache() -> None:
+    """Reset the env+git memoization. Test-only helper."""
+    _VERSION_RESOLVE_CACHE.clear()
+
+
+def _resolve_env_version() -> str | None:
+    if "env" in _VERSION_RESOLVE_CACHE:
+        return _VERSION_RESOLVE_CACHE["env"]
+    raw = os.environ.get("PAPAYYA_AGENT_VERSION", "")
+    value = raw.strip() or None
+    _VERSION_RESOLVE_CACHE["env"] = value
+    return value
+
+
+def _resolve_git_version() -> str | None:
+    """Run `git rev-parse --short HEAD` once; memoize the answer.
+
+    Silent on every failure mode (no git binary, not a repo, subprocess
+    timeout, decoding error). The fallback chain handles the None case.
+    """
+    if "git" in _VERSION_RESOLVE_CACHE:
+        return _VERSION_RESOLVE_CACHE["git"]
+    git = shutil.which("git")
+    if git is None:
+        _VERSION_RESOLVE_CACHE["git"] = None
+        return None
+    try:
+        out = subprocess.run(
+            [git, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        _VERSION_RESOLVE_CACHE["git"] = None
+        return None
+    if out.returncode != 0:
+        _VERSION_RESOLVE_CACHE["git"] = None
+        return None
+    sha = out.stdout.strip()
+    value = sha or None
+    _VERSION_RESOLVE_CACHE["git"] = value
+    return value
+
+
+def _resolve_agent_version(explicit: str | None) -> str:
+    """Pick the agent version from the four-layer chain. Always returns a string.
+
+    The "unknown" sentinel is returned when none of the layers resolve.
+    Replay treats "unknown" strictly — if either side of the comparison
+    is "unknown", the gate fires unless --latest is passed. That's the
+    point of the sentinel: an un-tagged process should be visible, not
+    silently equal to other un-tagged processes.
+    """
+    if explicit is not None:
+        cleaned = explicit.strip()
+        if cleaned:
+            return cleaned
+    env = _resolve_env_version()
+    if env is not None:
+        return env
+    git = _resolve_git_version()
+    if git is not None:
+        return git
+    return _AGENT_VERSION_FALLBACK
 
 
 # Global registry, keyed by agent name (slug)
@@ -141,6 +236,7 @@ def agent(
     budget_usd: float | None = None,
     durable: bool = False,
     max_duration_seconds: float | None = None,
+    agent_version: str | None = None,
 ) -> Callable:
     """Decorator that registers a function as a deployable agent.
 
@@ -168,11 +264,19 @@ def agent(
             pair this with explicit socket timeouts in your HTTP client
             for full coverage. Customer code that installs its own
             ``SIGALRM`` handler conflicts.
+        agent_version: Opaque string stamped on every run + step this
+            agent produces, used as the replay-mismatch gate (ADR-0002
+            #7). Resolution chain when omitted: env
+            ``PAPAYYA_AGENT_VERSION`` → ``git rev-parse --short HEAD``
+            → ``"unknown"``. CI/CD injecting the env var is the
+            recommended path.
     """
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise ValueError(
             f"max_duration_seconds must be > 0 or None, got {max_duration_seconds!r}"
         )
+
+    resolved_version = _resolve_agent_version(agent_version)
 
     def decorator(fn: Callable) -> Callable:
         try:
@@ -206,6 +310,7 @@ def agent(
             budget_usd=budget_usd,
             durable=durable,
             max_duration_seconds=max_duration_seconds,
+            agent_version=resolved_version,
         )
         _registry[name] = registration
 

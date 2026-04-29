@@ -898,13 +898,26 @@ def dlq() -> None:
 @click.option("--file", "file", default=None,
               help="Agent file (default: auto-discover agent.py in cwd)")
 @click.option("--db", default=".papayya/local.db", help="Path to SQLite database")
-def dlq_replay(run_id: str, file: str | None, db: str) -> None:
+@click.option(
+    "--latest",
+    "latest",
+    is_flag=True,
+    default=False,
+    help=(
+        "Replay on the agent's current code even if its agent_version "
+        "differs from the one captured on the original run. Without this "
+        "flag, a version mismatch aborts the replay (ADR-0002 #7). Pre-#7 "
+        "runs whose agent_version is NULL replay freely."
+    ),
+)
+def dlq_replay(run_id: str, file: str | None, db: str, latest: bool) -> None:
     """Re-drive a failed run using its captured input snapshot.
 
     \b
     Usage:
       papayya dlq replay --run <run_id>
       papayya dlq replay --run <run_id> --file my_agents.py
+      papayya dlq replay --run <run_id> --latest
 
     Reads the run's input_snapshot from the local DB, finds the matching
     @agent-decorated function in the agent file, and re-invokes it. When
@@ -912,6 +925,11 @@ def dlq_replay(run_id: str, file: str | None, db: str) -> None:
     (the format the @agent decorator captures), the dict is unpacked as
     kwargs. Otherwise the snapshot is passed as a single positional
     argument — back-compat for runs whose snapshot was hand-populated.
+
+    Version gate (ADR-0002 #7): the run's captured agent_version is
+    compared to the registration's current value. A mismatch aborts the
+    replay unless --latest is passed; pre-#7 runs (NULL agent_version)
+    replay without the gate.
 
     On any outcome (success or a new failure), the original run is marked
     with disposition='replayed'. If the replay also fails it shows up as a
@@ -935,7 +953,8 @@ def dlq_replay(run_id: str, file: str | None, db: str) -> None:
         row = conn.execute(
             f"""SELECT run_id, agent, status,
                        {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
-                       {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot
+                       {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot,
+                       {_schema.COL_RUN_AGENT_VERSION} AS agent_version
                 FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
             (run_id,),
         ).fetchone()
@@ -993,6 +1012,26 @@ def dlq_replay(run_id: str, file: str | None, db: str) -> None:
         click.echo(
             f"Error: No @agent with name {agent_name!r} found in {file}.\n"
             f"Registered agents: {names}", err=True,
+        )
+        sys.exit(1)
+
+    # Version-mismatch gate (ADR-0002 #7).
+    #
+    # Permissive on legacy runs: if the captured agent_version is NULL the
+    # run predates this feature and replays without the gate. Otherwise the
+    # captured value must equal the registration's current agent_version,
+    # or the operator must pass --latest. Either side being "unknown" while
+    # the other has a concrete value still trips the gate — that's the
+    # whole point of the unknown sentinel.
+    captured_version = row["agent_version"]
+    current_version = matching.agent_version
+    if not latest and captured_version is not None and captured_version != current_version:
+        click.echo(
+            f"Error: Run {run_id!r} captured agent_version="
+            f"{captured_version!r}; current registration is at "
+            f"{current_version!r}. Replay would run different code than "
+            "the original. Pass --latest to replay on the current version.",
+            err=True,
         )
         sys.exit(1)
 

@@ -67,6 +67,11 @@ class PapayyaRun:
         # unless they pass an explicit override (which applies to that step
         # only — the run-level id does not change mid-run).
         self._run_item_id: str | None = config.item_id
+        # ADR-0002 #7: agent version pinned at run creation. On replay this
+        # is read from the loaded checkpoint, NOT recomputed — otherwise
+        # replay would silently rewrite the version onto rows that were
+        # produced under a different code version.
+        self._agent_version: str | None = None
 
     def init(self) -> None:
         """Load any existing checkpoint from the store."""
@@ -76,6 +81,7 @@ class PapayyaRun:
 
         existing = self._store.load(self.run_id)
         if existing is not None:
+            self._agent_version = existing.agent_version
             for entry in existing.tasks:
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
@@ -83,7 +89,12 @@ class PapayyaRun:
             # Read the @agent wrapper's captured call args. None when the
             # caller bypassed the decorator (scripts, tests). Stays as-is
             # — we never inject a synthetic snapshot here.
-            from papayya.agent import consume_agent_input_snapshot
+            from papayya.agent import consume_agent_input_snapshot, get_agent
+
+            registration = get_agent(self.agent)
+            self._agent_version = (
+                registration.agent_version if registration is not None else None
+            )
 
             now = datetime.now(timezone.utc).isoformat()
             checkpoint = RunCheckpoint(
@@ -95,6 +106,7 @@ class PapayyaRun:
                 updated_at=now,
                 item_id=self._run_item_id,
                 input_snapshot=consume_agent_input_snapshot(),
+                agent_version=self._agent_version,
             )
             self._store.create(checkpoint)
 
@@ -305,6 +317,7 @@ class PapayyaRun:
                 llm_model=llm_model,
                 llm_stop_reason=llm_stop_reason,
                 llm_provider_shape=llm_provider_shape,
+                agent_version=self._agent_version,
             )
 
             self._cache[label] = entry

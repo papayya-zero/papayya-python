@@ -31,6 +31,11 @@ class TaskEntry:
     llm_stop_reason: str | None = None
     llm_provider_shape: str | None = None
     error_category: str | None = None
+    # ADR-0002 #7: agent version that produced this task row. Denormalized
+    # from the parent run so the dashboard can display it on a step without
+    # joining. Stays None for runs created before the v7 migration and for
+    # in-process MemoryStore use where no registration is in scope.
+    agent_version: str | None = None
 
 
 @dataclass
@@ -49,6 +54,10 @@ class RunCheckpoint:
     # invokes replay which creates a new run using this payload as input.
     # Opaque JSON-encodable value; papayya does not inspect the shape.
     input_snapshot: Any = None
+    # ADR-0002 #7: agent version this run executed under. Source of truth for
+    # the replay-mismatch gate; the same value denormalizes onto every task
+    # row written for this run.
+    agent_version: str | None = None
 
 
 @dataclass
