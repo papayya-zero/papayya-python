@@ -9,8 +9,8 @@ from papayya.errors import CreditExhausted, BudgetExceeded
 from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 
 __all__ = [
-    "Agent", "agent", "get_registry", "get_agent",
-    "Papayya", "Client", "RunResult", "tool",
+    "agent", "get_registry", "get_agent",
+    "Papayya", "Client", "RunResult",
     "papayya", "PapayyaRun",
     "CreditExhausted", "BudgetExceeded",
     "is_credit_exhaustion_error", "classify_provider_error",
