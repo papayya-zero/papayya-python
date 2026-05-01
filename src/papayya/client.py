@@ -1,5 +1,11 @@
 """High-level client for backend integration.
 
+.. deprecated::
+    ``papayya.Client`` is deprecated. Use ``papayya.Papayya`` instead —
+    its ``runs`` namespace exposes ``runs.create``, ``runs.get_status``,
+    and ``runs.get_steps`` covering the same surface. Scheduled for
+    removal in the next minor release.
+
 Usage:
     from papayya import Client
 
@@ -17,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Any
 
 from papayya.api import APIClient, PapayyaAPIError, resolve_config
@@ -41,13 +48,28 @@ class RunResult(str):
 
 
 class Client:
-    """Developer-facing client for triggering and monitoring runs."""
+    """Developer-facing client for triggering and monitoring runs.
+
+    .. deprecated::
+        Use ``papayya.Papayya`` instead. ``Papayya.runs.create``,
+        ``Papayya.runs.get_status``, and ``Papayya.runs.get_steps``
+        cover the same surface. ``Client`` is scheduled for removal
+        in the next minor release.
+    """
 
     def __init__(
         self,
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
+        warnings.warn(
+            "papayya.Client is deprecated; use papayya.Papayya which "
+            "exposes runs.create / runs.get_status / runs.get_steps via "
+            "the resource namespace. Client will be removed in the next "
+            "minor release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         config = resolve_config(api_key=api_key, base_url=base_url)
         self._api = APIClient(config)
 
