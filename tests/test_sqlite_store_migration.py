@@ -30,6 +30,7 @@ from papayya.durable.sqlite_store import (
     _apply_v4_to_v5,
     _apply_v5_to_v6,
     _apply_v6_to_v7,
+    _apply_v7_to_v8,
 )
 
 
@@ -211,6 +212,30 @@ class TestFreshInstall:
         task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
         assert _schema.COL_TASK_DELIVERY_ATTEMPTS in task_cols
         assert _schema.COL_TASK_JOURNALED_AT in task_cols
+
+    def test_fresh_db_has_metadata_tenant_columns(self, tmp_db: Path) -> None:
+        """v9 adds metadata + tenant_key on runs and tasks."""
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert _schema.COL_RUN_METADATA in run_cols
+        assert _schema.COL_RUN_TENANT_KEY in run_cols
+        assert _schema.COL_TASK_METADATA in task_cols
+        assert _schema.COL_TASK_TENANT_KEY in task_cols
+
+    def test_fresh_db_has_tenant_indexes(self, tmp_db: Path) -> None:
+        """v9 adds tenant_key indexes on runs + tasks for filtered queries."""
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert _schema.IDX_RUNS_TENANT in indexes
+        assert _schema.IDX_TASKS_TENANT in indexes
 
     def test_fresh_db_drops_budget_and_cost_columns(self, tmp_db: Path) -> None:
         """v4 removes budget/cost/token columns. Fresh DBs end up v4 after the
@@ -508,6 +533,78 @@ class TestV7ToV8Migration:
         SQLiteStore(str(tmp_db))
         backup = tmp_db.with_suffix(tmp_db.suffix + ".backup-v7")
         assert backup.exists()
+
+
+class TestV8ToV9Migration:
+    """Exercise the v8→v9 step: metadata + tenant_key on runs and tasks."""
+
+    def _build_v8_db(self, tmp_db: Path) -> None:
+        _build_v1_db(tmp_db)
+        conn = sqlite3.connect(tmp_db)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _apply_v1_to_v2(conn, tmp_db)
+            _apply_v2_to_v3(conn, tmp_db)
+            _apply_v3_to_v4(conn, tmp_db)
+            _apply_v4_to_v5(conn, tmp_db)
+            _apply_v5_to_v6(conn, tmp_db)
+            _apply_v6_to_v7(conn, tmp_db)
+            _apply_v7_to_v8(conn, tmp_db)
+        finally:
+            conn.close()
+
+    def test_v8_db_bumps_to_head(self, tmp_db: Path) -> None:
+        self._build_v8_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        version = conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert version == _schema.SCHEMA_VERSION
+
+    def test_v8_db_adds_metadata_tenant_columns_as_null(self, tmp_db: Path) -> None:
+        self._build_v8_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='run-1'").fetchone()
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE run_id='run-1'"
+        ).fetchone()
+        assert run[_schema.COL_RUN_METADATA] is None
+        assert run[_schema.COL_RUN_TENANT_KEY] is None
+        assert task[_schema.COL_TASK_METADATA] is None
+        assert task[_schema.COL_TASK_TENANT_KEY] is None
+
+    def test_v8_to_v9_creates_tenant_indexes(self, tmp_db: Path) -> None:
+        self._build_v8_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert _schema.IDX_RUNS_TENANT in indexes
+        assert _schema.IDX_TASKS_TENANT in indexes
+
+    def test_v8_to_v9_creates_backup(self, tmp_db: Path) -> None:
+        self._build_v8_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        backup = tmp_db.with_suffix(tmp_db.suffix + ".backup-v8")
+        assert backup.exists()
+
+    def test_v8_to_v9_preserves_existing_rows(self, tmp_db: Path) -> None:
+        self._build_v8_db(tmp_db)
+        SQLiteStore(str(tmp_db))
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        run = conn.execute("SELECT * FROM runs WHERE run_id='run-1'").fetchone()
+        task = conn.execute("SELECT * FROM tasks WHERE run_id='run-1'").fetchone()
+        assert run["agent"] == "test-agent"
+        assert task["label"] == "search"
+        assert task["result"] == '"hit"'
 
 
 class TestIdempotence:

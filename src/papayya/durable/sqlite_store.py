@@ -333,6 +333,24 @@ _V8_ADD_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
+# v9: multi-tenancy metadata convention. metadata is the JSON blob captured
+# at run() time; tenant_key is the extracted indexed value. Denormalized
+# onto tasks so dashboard filters by tenant don't need to join through runs.
+_V9_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_RUNS, _schema.COL_RUN_METADATA, "TEXT"),
+    (_schema.TBL_RUNS, _schema.COL_RUN_TENANT_KEY, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_METADATA, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_TENANT_KEY, "TEXT"),
+]
+
+_V9_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_TENANT} "
+    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_TENANT_KEY});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_TASKS_TENANT} "
+    f"ON {_schema.TBL_TASKS}({_schema.COL_TASK_TENANT_KEY});",
+]
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -510,14 +528,25 @@ def _apply_v7_to_v8(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "8")
 
 
+def _apply_v8_to_v9(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "8")
+    with conn:
+        for table, column, type_decl in _V9_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        for index_sql in _V9_INDEXES:
+            conn.execute(index_sql)
+        _set_schema_version(conn, "9")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8) so long-dormant local DBs
-    catch up cleanly.
+    (e.g. v1 → v2 → … → v8 → v9) so long-dormant local DBs catch up cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -542,6 +571,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "7":
             _apply_v7_to_v8(conn, db_path)
             current = "8"
+        elif current == "8":
+            _apply_v8_to_v9(conn, db_path)
+            current = "9"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
