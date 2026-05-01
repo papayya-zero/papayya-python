@@ -194,41 +194,6 @@ def get_agent(name: str) -> AgentRegistration | None:
 
 
 # ---------------------------------------------------------------------------
-# Input snapshot capture
-# ---------------------------------------------------------------------------
-
-def _build_input_snapshot(
-    sig: inspect.Signature | None,
-    args: tuple,
-    kwargs: dict,
-) -> Any:
-    """Build the snapshot dict for an @agent function call, or None.
-
-    Returns None — never raises — if any of the following fail:
-      - The signature couldn't be introspected at decoration time.
-      - bind() rejects the call (TypeError will surface from fn() anyway).
-      - The bound args aren't JSON-encodable (e.g. a custom class instance
-        with no __dict__). The run still executes; replay just isn't
-        available for that invocation.
-    """
-    if sig is None:
-        return None
-    try:
-        bound = sig.bind(*args, **kwargs)
-    except TypeError:
-        return None
-    # Pull defaults onto the snapshot so replay stays deterministic if
-    # the source code's default values change after a run was captured.
-    bound.apply_defaults()
-    snap = dict(bound.arguments)
-    try:
-        _serialize.encode_user_value(snap, strict=True)
-    except (TypeError, ValueError):
-        return None
-    return snap
-
-
-# ---------------------------------------------------------------------------
 # @agent decorator
 # ---------------------------------------------------------------------------
 
@@ -305,7 +270,7 @@ def agent(
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            snapshot = _build_input_snapshot(sig, args, kwargs)
+            snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
             token = _AGENT_INPUT.set(snapshot)
             try:
                 return fn(*args, **kwargs)

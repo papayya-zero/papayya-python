@@ -16,16 +16,16 @@ from __future__ import annotations
 import pytest
 
 from papayya import agent
+from papayya._serialize import build_input_snapshot
 from papayya.agent import (
     _AGENT_INPUT,
-    _build_input_snapshot,
     consume_agent_input_snapshot,
 )
 from papayya.durable import papayya
 from papayya.durable.sqlite_store import SQLiteStore
 
 
-# --- _build_input_snapshot — pure helper -------------------------------- #
+# --- build_input_snapshot — pure helper -------------------------------- #
 
 def test_build_snapshot_captures_kwargs():
     def fn(item_id: str, retries: int = 0) -> None:
@@ -33,7 +33,7 @@ def test_build_snapshot_captures_kwargs():
 
     import inspect
     sig = inspect.signature(fn)
-    snap = _build_input_snapshot(sig, ("co_42",), {})
+    snap = build_input_snapshot(sig, ("co_42",), {})
     assert snap == {"item_id": "co_42", "retries": 0}
 
 
@@ -43,8 +43,8 @@ def test_build_snapshot_normalizes_positional_and_keyword():
 
     import inspect
     sig = inspect.signature(fn)
-    assert _build_input_snapshot(sig, (1, 2), {}) == {"a": 1, "b": 2, "c": 3}
-    assert _build_input_snapshot(sig, (1,), {"b": 2}) == {"a": 1, "b": 2, "c": 3}
+    assert build_input_snapshot(sig, (1, 2), {}) == {"a": 1, "b": 2, "c": 3}
+    assert build_input_snapshot(sig, (1,), {"b": 2}) == {"a": 1, "b": 2, "c": 3}
 
 
 def test_build_snapshot_returns_none_for_non_json_args():
@@ -57,12 +57,12 @@ def test_build_snapshot_returns_none_for_non_json_args():
 
     import inspect
     sig = inspect.signature(fn)
-    assert _build_input_snapshot(sig, (Custom(),), {}) is None
+    assert build_input_snapshot(sig, (Custom(),), {}) is None
 
 
 def test_build_snapshot_returns_none_when_signature_missing():
     """Builtins / C callables — no introspectable signature."""
-    assert _build_input_snapshot(None, ("anything",), {}) is None
+    assert build_input_snapshot(None, ("anything",), {}) is None
 
 
 # --- @agent wrapper — contextvar lifecycle ------------------------------ #

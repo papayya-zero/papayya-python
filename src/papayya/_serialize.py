@@ -33,6 +33,7 @@ pointing the user at serializable alternatives.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 from typing import Any
 
@@ -101,3 +102,30 @@ def encode_user_value(value: Any, *, strict: bool = False) -> str:
         # here. Last-resort: stringify the top-level value so the step
         # record still lands as valid JSON.
         return json.dumps(repr(value))
+
+
+def build_input_snapshot(
+    sig: inspect.Signature | None,
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """Bind args/kwargs against ``sig``, apply defaults, return a JSON-encodable dict.
+
+    Returns ``None`` — never raises — if the signature is unavailable, ``bind()``
+    rejects the call, or the bound args aren't JSON-encodable. Used by the
+    ``@agent`` decorator and ``run.step`` auto-capture to record the input
+    state of a callable invocation as lineage data.
+    """
+    if sig is None:
+        return None
+    try:
+        bound = sig.bind(*args, **kwargs)
+    except TypeError:
+        return None
+    bound.apply_defaults()
+    snap = dict(bound.arguments)
+    try:
+        encode_user_value(snap, strict=True)
+    except (TypeError, ValueError):
+        return None
+    return snap

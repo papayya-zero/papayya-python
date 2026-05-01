@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import time as _time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, overload
 
+from papayya._serialize import build_input_snapshot
 from papayya.classify import classify_provider_error
 from papayya.errors import CreditExhausted
 from papayya.llm_extract import extract_llm_usage
@@ -23,6 +25,10 @@ from .types import (
 )
 
 T = TypeVar("T")
+
+# Sentinel: distinguishes "snapshot kwarg not provided" (auto-capture)
+# from "snapshot=None" (explicit None) and "snapshot=False" (opt-out).
+_AUTO = object()
 
 
 class PapayyaRun:
@@ -129,7 +135,7 @@ class PapayyaRun:
         fn=None,
         *,
         item_id: str | None = None,
-        snapshot: Any = None,
+        snapshot: Any = _AUTO,
         kind: str | None = None,
     ):
         """Wrap a function as a durable step. (Alias: ``run.step``.)
@@ -145,9 +151,14 @@ class PapayyaRun:
         * ``item_id`` — identifier of the record this step acts on. If set,
           the step row gets tagged with it; the first step to pass one also
           seeds the run-level item_id for later steps to inherit.
-        * ``snapshot`` — arbitrary JSON-encodable payload captured as the
-          step's *input* state. The function's return value is captured as
-          the step's *output* state whenever an item_id is in effect.
+        * ``snapshot`` — controls input-state capture for the step row.
+          Defaults to auto-capture: when an item_id is in effect, the
+          wrapped fn's call args are bound against its signature and
+          encoded as the input snapshot (same path ``@agent`` uses). Pass
+          ``snapshot=False`` to opt out, or pass any other value to
+          override the captured payload (escape hatch for args that
+          aren't JSON-encodable). The fn's return value is captured as
+          the output snapshot whenever an item_id is in effect.
         * ``kind`` — optional step-kind hint. Pass ``"llm"`` to wrap an LLM
           call; the wrapper runs shape-based usage extraction on the
           returned response (tokens, model, stop_reason) and classifies
@@ -197,9 +208,16 @@ class PapayyaRun:
         fn: Callable[..., T],
         *,
         item_id: str | None = None,
-        snapshot: Any = None,
+        snapshot: Any = _AUTO,
         kind: str | None = None,
     ) -> Callable[..., T]:
+        try:
+            sig: inspect.Signature | None = inspect.signature(fn)
+        except (TypeError, ValueError):
+            # Builtins / C-level callables — no introspectable signature.
+            # Auto-capture skipped for these; the step still runs.
+            sig = None
+
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             self.init()
@@ -295,8 +313,19 @@ class PapayyaRun:
             # Snapshots only populate when an item_id is in effect — the
             # lineage view has no home for snapshots that aren't attached
             # to an item, and we'd rather not bloat the DB with noise.
+            #
+            # Resolution for input_snapshot when an item_id is in effect:
+            #   - snapshot=False  → opt-out (None)
+            #   - snapshot=_AUTO  → introspect args (matches @agent path)
+            #   - any other value → explicit override (escape hatch for
+            #     args that aren't JSON-encodable)
             if effective_item_id is not None:
-                input_snapshot = snapshot
+                if snapshot is False:
+                    input_snapshot = None
+                elif snapshot is _AUTO:
+                    input_snapshot = build_input_snapshot(sig, args, kwargs)
+                else:
+                    input_snapshot = snapshot
                 output_snapshot = result
             else:
                 input_snapshot = None
