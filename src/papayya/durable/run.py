@@ -211,23 +211,25 @@ class PapayyaRun:
             self._warn_kind_llm_deprecated(
                 _label_for_warning(label_or_fn, fn)
             )
-        # Case 1: run.task("label", fn)
+        # Case 1: run.task("label", fn) — canonical, silent.
         if isinstance(label_or_fn, str) and fn is not None:
             return self._wrap(label_or_fn, fn, item_id=item_id, snapshot=snapshot, kind=kind)
 
-        # Case 2: run.task(fn)
+        # Case 2: run.task(fn) — DEPRECATED, label derived from fn.__name__.
         if callable(label_or_fn):
             label = label_or_fn.__name__
             if not label or label == "<lambda>":
                 raise ValueError(
                     "Anonymous/lambda functions require an explicit label: "
-                    "run.task('myLabel', lambda: ...)"
+                    "run.step('myLabel', lambda: ...)"
                 )
+            self._warn_legacy_step_form("fn-only", label)
             return self._wrap(label, label_or_fn, item_id=item_id, snapshot=snapshot, kind=kind)
 
-        # Case 3: @run.task("label") — return decorator
+        # Case 3: @run.task("label") — DEPRECATED decorator form.
         if isinstance(label_or_fn, str):
             label = label_or_fn
+            self._warn_legacy_step_form("decorator", label)
             _item_id = item_id
             _snapshot = snapshot
             _kind = kind

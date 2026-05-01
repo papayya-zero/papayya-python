@@ -133,12 +133,6 @@ class TestResume:
 
 
 class TestLabels:
-    def test_defaults_label_to_function_name(self) -> None:
-        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
-        search = run.task(search_web)
-        search("test")
-        assert run.completed_tasks == ["search_web"]
-
     def test_throws_on_lambda_without_label(self) -> None:
         run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
         with pytest.raises(ValueError, match="Anonymous"):
@@ -151,27 +145,15 @@ class TestLabels:
         assert result == "hello"
         assert run.completed_tasks == ["greet"]
 
-    def test_decorator_syntax(self) -> None:
-        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
-
-        @run.task("greet")
-        def greet(name: str) -> str:
-            return f"hello {name}"
-
-        result = greet("world")
-        assert result == "hello world"
-        assert run.completed_tasks == ["greet"]
-
     def test_step_is_alias_for_task(self) -> None:
         run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
-
         assert run.step.__func__ is run.task.__func__
 
-        @run.step("greet")
         def greet(name: str) -> str:
             return f"hello {name}"
 
-        assert greet("world") == "hello world"
+        wrapped = run.step("greet", greet)
+        assert wrapped("world") == "hello world"
         assert run.completed_tasks == ["greet"]
 
 

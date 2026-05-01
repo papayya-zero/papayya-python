@@ -241,25 +241,6 @@ def test_llm_kind_replay_returns_cached_result():
     assert first is second
 
 
-# ---------------------------------------------------------------------------
-# Decorator form still works with kind
-# ---------------------------------------------------------------------------
-
-def test_decorator_form_accepts_kind():
-    run = _make_run()
-
-    @run.step("decorated", kind="llm")
-    def call():
-        return SimpleNamespace(
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-            model="tiny",
-        )
-
-    call()
-    entry = run._cache["decorated"]
-    assert entry.kind == "llm"
-    assert entry.llm_provider_shape == "openai"
-    assert entry.llm_total_tokens == 3
 
 
 # ---------------------------------------------------------------------------

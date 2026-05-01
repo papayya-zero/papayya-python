@@ -53,14 +53,13 @@ class TestAutoCapture:
         assert entry.input_snapshot == {"payload": {"name": "acme"}}
         assert entry.output_snapshot == {"name": "acme", "tier": "gold"}
 
-    def test_captures_via_decorator_form(self, tmp_db: Path) -> None:
+    def test_captures_via_canonical_form(self, tmp_db: Path) -> None:
         run = _make_run(tmp_db, item_id="co_42")
 
-        @run.step("enrich")
         def enrich(payload: dict) -> dict:
             return {**payload, "tier": "gold"}
 
-        enrich({"name": "acme"})
+        run.step("enrich", enrich)({"name": "acme"})
 
         assert run._cache["enrich"].input_snapshot == {"payload": {"name": "acme"}}
 
