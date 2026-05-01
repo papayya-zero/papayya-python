@@ -185,6 +185,94 @@ class TestNonJsonNativePayloads:
             store.save_task("r1", entry)
 
 
+class TestCreateSendsMetadataAndTenantKey:
+    """v9 multi-tenancy convention. metadata is the user-supplied JSON
+    blob; tenant_key is the extracted indexed value. Both ride the same
+    POST /v1/durable/runs as the rest of the run header."""
+
+    def test_create_posts_metadata_and_tenant_key(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(201, json={})
+
+        store = _make_store(handler)
+        checkpoint = RunCheckpoint(
+            run_id="r1",
+            agent="enrich",
+            tasks=[],
+            status="running",
+            metadata={"organization_id": "org_42", "user_id": "u_7"},
+            tenant_key="org_42",
+            created_at="",
+            updated_at="",
+        )
+        store.create(checkpoint)
+
+        body = captured["body"]
+        assert body["metadata"] == {"organization_id": "org_42", "user_id": "u_7"}
+        assert body["tenant_key"] == "org_42"
+
+    def test_save_task_posts_metadata_and_tenant_key(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(201, json={})
+
+        store = _make_store(handler)
+        entry = TaskEntry(
+            label="enrich",
+            result={"out": 1},
+            duration_ms=50,
+            completed_at="2026-05-01T00:00:00+00:00",
+            metadata={"organization_id": "org_42"},
+            tenant_key="org_42",
+        )
+        store.save_task("r1", entry)
+
+        body = captured["body"]
+        assert body["metadata"] == {"organization_id": "org_42"}
+        assert body["tenant_key"] == "org_42"
+
+
+class TestLoadRestoresMetadataAndTenantKey:
+    def test_load_reads_metadata_from_response(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "r1",
+                    "agent": "enrich",
+                    "status": "running",
+                    "metadata": {"organization_id": "org_42"},
+                    "tenant_key": "org_42",
+                    "checkpoints": [
+                        {
+                            "label": "enrich",
+                            "result": {"out": 1},
+                            "duration_ms": 50,
+                            "completed_at": "2026-05-01T00:00:00+00:00",
+                            "metadata": {"organization_id": "org_42"},
+                            "tenant_key": "org_42",
+                        }
+                    ],
+                    "created_at": "2026-05-01T00:00:00+00:00",
+                    "updated_at": "2026-05-01T00:00:00+00:00",
+                },
+            )
+
+        store = _make_store(handler)
+        checkpoint = store.load("r1")
+        assert checkpoint is not None
+        assert checkpoint.metadata == {"organization_id": "org_42"}
+        assert checkpoint.tenant_key == "org_42"
+        (entry,) = checkpoint.tasks
+        assert entry.metadata == {"organization_id": "org_42"}
+        assert entry.tenant_key == "org_42"
+
+
 class TestBackwardCompat:
     def test_load_tolerates_missing_slice6_fields(self) -> None:
         """Pre-Slice-6 control-plane responses don't include these keys."""

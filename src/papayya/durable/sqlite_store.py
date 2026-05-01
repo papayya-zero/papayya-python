@@ -125,6 +125,28 @@ def _decode_snapshot(raw: str | None) -> Any:
     except (TypeError, ValueError):
         return raw
 
+
+def _encode_metadata(value: dict[str, Any] | None) -> str | None:
+    """JSON-encode the metadata dict for storage. None passes through.
+
+    Uses the canonical user-value serializer so non-JSON-native values
+    (datetimes, UUIDs, etc.) get the same treatment as snapshots.
+    """
+    if value is None:
+        return None
+    return _serialize.encode_user_value(value, strict=True)
+
+
+def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
+    """Inverse of _encode_metadata. Returns None for null rows."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
 # v1 base schema. Kept verbatim with the original (pre-v4) columns so the
 # migration chain still applies cleanly for long-dormant DBs upgrading from
 # v1/v2/v3. The v3→v4 migration drops the budget/cost/token columns below;
@@ -625,6 +647,8 @@ class SQLiteStore:
                 llm_provider_shape=t[_schema.COL_TASK_LLM_PROVIDER_SHAPE],
                 error_category=t[_schema.COL_TASK_ERROR_CATEGORY],
                 agent_version=t[_schema.COL_TASK_AGENT_VERSION],
+                metadata=_decode_metadata(t[_schema.COL_TASK_METADATA]),
+                tenant_key=t[_schema.COL_TASK_TENANT_KEY],
             )
             for t in task_rows
         ]
@@ -639,6 +663,8 @@ class SQLiteStore:
             item_id=row[_schema.COL_RUN_ITEM_ID],
             input_snapshot=_decode_snapshot(row[_schema.COL_RUN_INPUT_SNAPSHOT]),
             agent_version=row[_schema.COL_RUN_AGENT_VERSION],
+            metadata=_decode_metadata(row[_schema.COL_RUN_METADATA]),
+            tenant_key=row[_schema.COL_RUN_TENANT_KEY],
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -659,8 +685,10 @@ class SQLiteStore:
                    {_schema.COL_TASK_LLM_STOP_REASON},
                    {_schema.COL_TASK_LLM_PROVIDER_SHAPE},
                    {_schema.COL_TASK_ERROR_CATEGORY},
-                   {_schema.COL_TASK_AGENT_VERSION})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_TASK_AGENT_VERSION},
+                   {_schema.COL_TASK_METADATA},
+                   {_schema.COL_TASK_TENANT_KEY})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -679,6 +707,8 @@ class SQLiteStore:
                     entry.llm_provider_shape,
                     entry.error_category,
                     entry.agent_version,
+                    _encode_metadata(entry.metadata),
+                    entry.tenant_key,
                 ),
             )
             self._conn.execute(
@@ -779,8 +809,9 @@ class SQLiteStore:
         self._conn.execute(
             f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
                batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT},
-               {_schema.COL_RUN_AGENT_VERSION})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               {_schema.COL_RUN_AGENT_VERSION},
+               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_TENANT_KEY})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
                 checkpoint.agent,
@@ -791,6 +822,8 @@ class SQLiteStore:
                 checkpoint.item_id,
                 _encode_snapshot(checkpoint.input_snapshot),
                 checkpoint.agent_version,
+                _encode_metadata(checkpoint.metadata),
+                checkpoint.tenant_key,
             ),
         )
         self._conn.commit()
