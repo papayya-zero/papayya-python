@@ -6,6 +6,7 @@ import functools
 import inspect
 import time as _time
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, overload
 
@@ -29,6 +30,21 @@ T = TypeVar("T")
 # Sentinel: distinguishes "snapshot kwarg not provided" (auto-capture)
 # from "snapshot=None" (explicit None) and "snapshot=False" (opt-out).
 _AUTO = object()
+
+
+def _label_for_warning(label_or_fn: Any, fn: Any) -> str:
+    """Best-effort label string for deprecation messages.
+
+    The deprecation tracker keys per-(run, label) to dedupe noise. When
+    the caller used a legacy form, we may not yet have resolved the
+    final label — this helper picks the most informative string we can
+    surface in the warning message.
+    """
+    if isinstance(label_or_fn, str):
+        return label_or_fn
+    if callable(label_or_fn):
+        return getattr(label_or_fn, "__name__", "<anonymous>")
+    return "<unknown>"
 
 
 class PapayyaRun:
@@ -82,6 +98,9 @@ class PapayyaRun:
         # value. Both denormalize onto every TaskEntry written by this run.
         self._metadata: dict[str, Any] | None = config.metadata
         self._tenant_key: str | None = config.tenant_key
+        # Track which (label, deprecation-kind) pairs already emitted a
+        # warning this run, so repeated calls don't spam the log.
+        self._deprecation_seen: set[str] = set()
 
     def init(self) -> None:
         """Load any existing checkpoint from the store."""
@@ -153,11 +172,20 @@ class PapayyaRun:
     ):
         """Wrap a function as a durable step. (Alias: ``run.step``.)
 
-        Three calling conventions:
+        Preferred call shape::
 
-        1. ``run.step("label", some_fn)``  — higher-order, explicit label
-        2. ``run.step(some_fn)``           — higher-order, label = fn.__name__
-        3. ``@run.step("label")``          — decorator with explicit label
+            run.step("label", some_fn)
+
+        For LLM calls, use the explicit ``run.llm_step("label", fn)``
+        method — it's equivalent to passing ``kind="llm"`` here but
+        makes the intent visible in the type signature.
+
+        Two legacy call shapes are still accepted for one release and
+        emit ``DeprecationWarning`` — migrate to the canonical form
+        before they're removed:
+
+        * ``run.step(some_fn)`` — derives the label from ``fn.__name__``.
+        * ``@run.step("label")`` — decorator form.
 
         Optional kwargs:
 
@@ -172,16 +200,17 @@ class PapayyaRun:
           override the captured payload (escape hatch for args that
           aren't JSON-encodable). The fn's return value is captured as
           the output snapshot whenever an item_id is in effect.
-        * ``kind`` — optional step-kind hint. Pass ``"llm"`` to wrap an LLM
-          call; the wrapper runs shape-based usage extraction on the
-          returned response (tokens, model, stop_reason) and classifies
-          any raised provider exception via ``classify_provider_error`` —
-          credit-shaped exceptions are re-raised as ``CreditExhausted``
-          so the runtime pauses instead of failing. Unrecognized shapes
-          still record that the step ran; they just lose token granularity.
+        * ``kind`` — DEPRECATED. Pass ``kind="llm"`` triggers the LLM
+          observability path (tokens, model, stop_reason, credit-error
+          classification). Use ``run.llm_step(label, fn)`` instead;
+          ``kind=`` will be removed in the next minor release.
 
         All kwargs are additive and optional.
         """
+        if kind == "llm":
+            self._warn_kind_llm_deprecated(
+                _label_for_warning(label_or_fn, fn)
+            )
         # Case 1: run.task("label", fn)
         if isinstance(label_or_fn, str) and fn is not None:
             return self._wrap(label_or_fn, fn, item_id=item_id, snapshot=snapshot, kind=kind)
@@ -214,6 +243,68 @@ class PapayyaRun:
     # execution frameworks (Temporal, Inngest, DBOS); `task` is retained
     # as an alias so existing user code keeps working unchanged.
     step = task
+
+    def llm_step(
+        self,
+        label: str,
+        fn: Callable[..., T],
+        *,
+        item_id: str | None = None,
+        snapshot: Any = _AUTO,
+    ) -> Callable[..., T]:
+        """Wrap an LLM-call function as a durable step.
+
+        Equivalent to ``run.step(label, fn, kind="llm")`` but makes the
+        intent explicit. The wrapper runs shape-based usage extraction
+        on the returned response (tokens, model, stop_reason) and
+        classifies any raised provider exception via
+        ``classify_provider_error`` — credit-shaped exceptions are
+        re-raised as ``CreditExhausted`` so the runtime pauses instead
+        of failing.
+
+        Canonical signature only — no ``__name__``-derived label or
+        decorator form. ``run.step(..., kind="llm")`` keeps working for
+        one release with a deprecation warning.
+        """
+        return self._wrap(
+            label, fn, item_id=item_id, snapshot=snapshot, kind="llm"
+        )
+
+    def _warn_kind_llm_deprecated(self, label: str) -> None:
+        """Fire ``DeprecationWarning`` once per (run, label) for kind='llm'."""
+        token = f"kind=llm:{label}"
+        if token in self._deprecation_seen:
+            return
+        self._deprecation_seen.add(token)
+        warnings.warn(
+            "run.step(kind='llm') is deprecated; use run.llm_step(label, fn) "
+            "instead. The kind= kwarg will be removed in the next minor release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+    def _warn_legacy_step_form(self, form: str, label: str) -> None:
+        """Fire ``DeprecationWarning`` once per (run, label, form)."""
+        token = f"{form}:{label}"
+        if token in self._deprecation_seen:
+            return
+        self._deprecation_seen.add(token)
+        if form == "fn-only":
+            warnings.warn(
+                "run.step(fn) (label derived from fn.__name__) is deprecated; "
+                "pass an explicit label: run.step('label', fn). The fn-only "
+                "form will be removed in the next minor release.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        elif form == "decorator":
+            warnings.warn(
+                "@run.step('label') decorator form is deprecated; rewrite as "
+                "fn = run.step('label', fn). The decorator form will be removed "
+                "in the next minor release.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
 
     def _wrap(
         self,
