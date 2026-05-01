@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +52,26 @@ class EnvSpec(_Strict):
 class PapayyaYaml(_Strict):
     version: Literal[1]
     envs: dict[str, EnvSpec] = Field(default_factory=dict)
+    # v9 multi-tenancy convention: name the metadata key that carries the
+    # tenant identifier. When set, every run() call must include this key
+    # in its metadata; the SDK extracts it into the indexed tenant_key
+    # column so dashboards and downstream layers (per-tenant budgets,
+    # rate-limit pools, fairness) can filter and aggregate by tenant.
+    # Leave unset for single-tenant projects.
+    tenant_key: str | None = Field(
+        default=None,
+        description="Metadata key whose value identifies the tenant for this project.",
+    )
+
+    @field_validator("tenant_key")
+    @classmethod
+    def _tenant_key_nonempty(cls, value: str | None) -> str | None:
+        # An empty-string tenant_key is almost certainly a mistake — pydantic
+        # would otherwise accept it and the SDK would extract empty values
+        # without complaint. Fail loud at parse time instead.
+        if value is not None and value.strip() == "":
+            raise ValueError("tenant_key must be a non-empty string when set")
+        return value
 
 
 class PapayyaYamlError(Exception):

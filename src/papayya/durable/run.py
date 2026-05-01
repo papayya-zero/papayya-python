@@ -78,6 +78,10 @@ class PapayyaRun:
         # replay would silently rewrite the version onto rows that were
         # produced under a different code version.
         self._agent_version: str | None = None
+        # v9 multi-tenancy: metadata blob and the extracted tenant_key
+        # value. Both denormalize onto every TaskEntry written by this run.
+        self._metadata: dict[str, Any] | None = config.metadata
+        self._tenant_key: str | None = config.tenant_key
 
     def init(self) -> None:
         """Load any existing checkpoint from the store."""
@@ -88,6 +92,13 @@ class PapayyaRun:
         existing = self._store.load(self.run_id)
         if existing is not None:
             self._agent_version = existing.agent_version
+            # v9: tenant_key/metadata pin at create time. On replay, trust
+            # the stored values rather than rederiving — same posture as
+            # agent_version (#7).
+            if existing.metadata is not None:
+                self._metadata = existing.metadata
+            if existing.tenant_key is not None:
+                self._tenant_key = existing.tenant_key
             for entry in existing.tasks:
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
@@ -113,6 +124,8 @@ class PapayyaRun:
                 item_id=self._run_item_id,
                 input_snapshot=consume_agent_input_snapshot(),
                 agent_version=self._agent_version,
+                metadata=self._metadata,
+                tenant_key=self._tenant_key,
             )
             self._store.create(checkpoint)
 
@@ -347,6 +360,8 @@ class PapayyaRun:
                 llm_stop_reason=llm_stop_reason,
                 llm_provider_shape=llm_provider_shape,
                 agent_version=self._agent_version,
+                metadata=self._metadata,
+                tenant_key=self._tenant_key,
             )
 
             self._cache[label] = entry

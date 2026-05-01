@@ -1,17 +1,18 @@
-"""v9 multi-tenancy metadata convention — SQLiteStore round-trip.
+"""v9 multi-tenancy metadata convention.
 
-End-to-end strict-when-declared enforcement and papayya.yaml integration
-land alongside the PapayyaClient changes in a later commit. This file
-covers persistence: the store reads back what it wrote, and the JSON
-encoder used for snapshots round-trips dict metadata cleanly.
+Covers store round-trip + PapayyaClient strict-when-declared enforcement
+against papayya.yaml. The yaml's tenant_key declaration is the contract:
+when set, every run() call must include the named key in metadata.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from papayya.durable.client import PapayyaClient, PapayyaClientConfig
 from papayya.durable.sqlite_store import SQLiteStore, _decode_metadata, _encode_metadata
 from papayya.durable.types import RunCheckpoint, TaskEntry
 
@@ -119,3 +120,109 @@ class TestSQLiteStoreRoundTrip:
         (task,) = loaded.tasks
         assert task.metadata is None
         assert task.tenant_key is None
+
+
+@pytest.fixture
+def papayya_yaml_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Run tests inside a temp cwd so PapayyaClient picks up our yaml."""
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _write_yaml(dir: Path, body: str) -> None:
+    (dir / "papayya.yaml").write_text(body)
+
+
+class TestPapayyaClientStrictWhenDeclared:
+    """PapayyaClient.run() reads papayya.yaml at first call and enforces
+    that every run includes the declared tenant_key in its metadata."""
+
+    def test_no_yaml_means_tenant_key_optional(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        # No papayya.yaml exists — runs without metadata are accepted.
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        run = client.run(agent="enrich")
+        assert run is not None
+
+    def test_yaml_without_tenant_key_means_optional(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(papayya_yaml_dir, "version: 1\n")
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        run = client.run(agent="enrich", metadata={"any": "thing"})
+        assert run is not None
+
+    def test_declared_key_present_extracts_value(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(
+            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+        )
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        run = client.run(
+            agent="enrich",
+            run_id="r1",
+            metadata={"organization_id": "org_42", "user_id": "u_7"},
+        )
+        run.step("enrich", lambda: {"out": 1})()
+        # Round-trip via the store.
+        loaded = store.load("r1")
+        assert loaded is not None
+        assert loaded.tenant_key == "org_42"
+        assert loaded.metadata == {"organization_id": "org_42", "user_id": "u_7"}
+        (task,) = loaded.tasks
+        assert task.tenant_key == "org_42"
+
+    def test_declared_key_missing_metadata_raises(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(
+            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+        )
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        with pytest.raises(ValueError, match="organization_id"):
+            client.run(agent="enrich")
+
+    def test_declared_key_metadata_missing_key_raises(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(
+            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+        )
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        with pytest.raises(ValueError, match="organization_id"):
+            client.run(agent="enrich", metadata={"unrelated": "value"})
+
+    def test_declared_key_empty_value_raises(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(
+            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+        )
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        with pytest.raises(ValueError, match="non-empty"):
+            client.run(
+                agent="enrich",
+                metadata={"organization_id": ""},
+            )
+
+    def test_declared_key_non_string_raises(
+        self, tmp_path: Path, papayya_yaml_dir: Path
+    ) -> None:
+        _write_yaml(
+            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+        )
+        store = SQLiteStore(str(tmp_path / "local.db"))
+        client = PapayyaClient(PapayyaClientConfig(store=store))
+        with pytest.raises(ValueError, match="non-empty"):
+            client.run(
+                agent="enrich",
+                metadata={"organization_id": 42},
+            )

@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from papayya._config import env_config, load_cli_config
+from papayya._config import (
+    PapayyaYaml,
+    PapayyaYamlError,
+    env_config,
+    load_cli_config,
+    load_yaml,
+)
 from papayya._defaults import DEFAULT_BASE_URL
 
 from .run import PapayyaRun
@@ -61,6 +68,22 @@ def _auto_store(api_key: str | None, base_url: str | None) -> CheckpointStore:
     return SQLiteStore()
 
 
+_TENANT_KEY_SENTINEL = object()
+
+
+def _resolve_yaml_tenant_key_field(yaml_path: Path) -> str | None:
+    """Return the metadata-key name declared in papayya.yaml, or None.
+
+    Missing yaml is silent (treated as a single-tenant project). Malformed
+    yaml or version mismatches raise — caller-visible config errors surface
+    here rather than at first run().
+    """
+    if not yaml_path.exists():
+        return None
+    spec: PapayyaYaml = load_yaml(yaml_path)
+    return spec.tenant_key
+
+
 class PapayyaClient:
     """Client for creating durable runs.
 
@@ -75,6 +98,19 @@ class PapayyaClient:
 
     def __init__(self, config: PapayyaClientConfig | None = None) -> None:
         self._config = config or PapayyaClientConfig()
+        # Lazy-resolved on first run() so construction stays cheap and
+        # tests that monkeypatch cwd are unaffected by import order.
+        self._tenant_key_field: Any = _TENANT_KEY_SENTINEL
+
+    def _project_tenant_key_field(self) -> str | None:
+        if self._tenant_key_field is _TENANT_KEY_SENTINEL:
+            try:
+                self._tenant_key_field = _resolve_yaml_tenant_key_field(
+                    Path("papayya.yaml")
+                )
+            except PapayyaYamlError:
+                raise
+        return self._tenant_key_field  # type: ignore[return-value]
 
     def run(
         self,
@@ -85,7 +121,18 @@ class PapayyaClient:
         item_id: str | None = None,
         store: CheckpointStore | None = None,
     ) -> PapayyaRun:
-        """Create a new durable run."""
+        """Create a new durable run.
+
+        When ``papayya.yaml`` declares a ``tenant_key:``, the supplied
+        ``metadata`` MUST include that key — strict-when-declared. The
+        extracted value is persisted in the indexed ``tenant_key`` column
+        on every row written under this run.
+        """
+        tenant_key_field = self._project_tenant_key_field()
+        tenant_key_value: str | None = None
+        if tenant_key_field is not None:
+            tenant_key_value = _extract_tenant_key(metadata, tenant_key_field)
+
         return PapayyaRun(
             DurableRunConfig(
                 agent=agent,
@@ -93,8 +140,41 @@ class PapayyaClient:
                 metadata=metadata,
                 item_id=item_id,
                 store=store or self._config.store,
+                tenant_key=tenant_key_value,
             )
         )
+
+
+def _extract_tenant_key(
+    metadata: dict[str, Any] | None,
+    tenant_key_field: str,
+) -> str:
+    """Pull the tenant key value from run metadata. Strict by design.
+
+    Raises ValueError when papayya.yaml declares a tenant_key but the
+    caller didn't include it in metadata, or included an empty/non-string
+    value. The error names the missing key so the caller knows what
+    contract they're violating.
+    """
+    if not metadata:
+        raise ValueError(
+            f"papayya.yaml declares tenant_key={tenant_key_field!r} but "
+            f"run() was called with no metadata. Pass "
+            f"metadata={{{tenant_key_field!r}: ...}} to identify the tenant."
+        )
+    if tenant_key_field not in metadata:
+        raise ValueError(
+            f"papayya.yaml declares tenant_key={tenant_key_field!r} but "
+            f"run() metadata is missing this key. "
+            f"metadata.keys()={sorted(metadata.keys())}"
+        )
+    value = metadata[tenant_key_field]
+    if not isinstance(value, str) or value == "":
+        raise ValueError(
+            f"metadata[{tenant_key_field!r}] must be a non-empty string; "
+            f"got {value!r}"
+        )
+    return value
 
 
 def papayya(

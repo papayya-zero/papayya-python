@@ -154,3 +154,27 @@ def test_schedule_missing_cron_rejected(tmp_path: Path) -> None:
 def test_returns_pydantic_model(tmp_path: Path) -> None:
     cfg = load_yaml(_write(tmp_path, "version: 1\n"))
     assert isinstance(cfg, PapayyaYaml)
+
+
+def test_tenant_key_absent_defaults_none(tmp_path: Path) -> None:
+    cfg = load_yaml(_write(tmp_path, "version: 1\n"))
+    assert cfg.tenant_key is None
+
+
+def test_tenant_key_string_accepted(tmp_path: Path) -> None:
+    cfg = load_yaml(
+        _write(tmp_path, "version: 1\ntenant_key: organization_id\n")
+    )
+    assert cfg.tenant_key == "organization_id"
+
+
+def test_tenant_key_empty_string_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path, 'version: 1\ntenant_key: ""\n')
+    with pytest.raises(PapayyaYamlError, match="non-empty"):
+        load_yaml(path)
+
+
+def test_tenant_key_non_string_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path, "version: 1\ntenant_key: 42\n")
+    with pytest.raises(PapayyaYamlError):
+        load_yaml(path)
