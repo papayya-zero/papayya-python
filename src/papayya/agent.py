@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import os
 import shutil
 import subprocess
@@ -34,6 +35,8 @@ from typing import Any, Callable
 
 from papayya import _serialize
 from papayya.tools import ToolDefinition
+
+log = logging.getLogger("papayya.agent")
 
 
 # ---------------------------------------------------------------------------
@@ -152,26 +155,28 @@ def _resolve_git_version() -> str | None:
     return value
 
 
-def _resolve_agent_version(explicit: str | None) -> str:
-    """Pick the agent version from the four-layer chain. Always returns a string.
+def _resolve_agent_version(explicit: str | None) -> tuple[str, str]:
+    """Pick the agent version from the four-layer chain.
 
-    The "unknown" sentinel is returned when none of the layers resolve.
-    Replay treats "unknown" strictly — if either side of the comparison
-    is "unknown", the gate fires unless --latest is passed. That's the
-    point of the sentinel: an un-tagged process should be visible, not
-    silently equal to other un-tagged processes.
+    Returns ``(version, source)`` where ``source`` is one of
+    ``"decorator" | "env" | "git" | "unknown"``. The ``"unknown"``
+    sentinel is returned when none of the layers resolve. Replay treats
+    "unknown" strictly — if either side of the comparison is "unknown",
+    the gate fires unless --latest is passed. That's the point of the
+    sentinel: an un-tagged process should be visible, not silently
+    equal to other un-tagged processes.
     """
     if explicit is not None:
         cleaned = explicit.strip()
         if cleaned:
-            return cleaned
+            return cleaned, "decorator"
     env = _resolve_env_version()
     if env is not None:
-        return env
+        return env, "env"
     git = _resolve_git_version()
     if git is not None:
-        return git
-    return _AGENT_VERSION_FALLBACK
+        return git, "git"
+    return _AGENT_VERSION_FALLBACK, "unknown"
 
 
 # Global registry, keyed by agent name (slug)
@@ -276,7 +281,19 @@ def agent(
             f"max_duration_seconds must be > 0 or None, got {max_duration_seconds!r}"
         )
 
-    resolved_version = _resolve_agent_version(agent_version)
+    resolved_version, version_source = _resolve_agent_version(agent_version)
+    if version_source == "unknown":
+        log.warning(
+            "registered '%s' v=unknown (no agent_version arg, no PAPAYYA_AGENT_VERSION, no git SHA available)",
+            name,
+        )
+    else:
+        log.info(
+            "registered '%s' v=%s (source=%s)",
+            name,
+            resolved_version,
+            version_source,
+        )
 
     def decorator(fn: Callable) -> Callable:
         try:
