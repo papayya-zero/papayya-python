@@ -7,13 +7,14 @@ import inspect
 import time as _time
 import uuid
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, overload
 
 from papayya._serialize import build_input_snapshot
 from papayya.classify import classify_provider_error
 from papayya.errors import CreditExhausted
-from papayya.llm_extract import extract_llm_usage
+from papayya.llm_extract import LlmUsage, extract_llm_usage
 from papayya.runtime_context import get_current_reporter
 
 from .store import MemoryStore
@@ -30,6 +31,30 @@ T = TypeVar("T")
 # Sentinel: distinguishes "snapshot kwarg not provided" (auto-capture)
 # from "snapshot=None" (explicit None) and "snapshot=False" (opt-out).
 _AUTO = object()
+
+# Sentinel returned from ``_pre_call`` when the cache MISSED — the
+# wrapper proceeds to invoke ``fn``. A cache hit returns the cached
+# value instead and the wrapper short-circuits.
+_MISS = object()
+
+
+@dataclass
+class _CallCtx:
+    """Per-call state shared between ``_pre_call`` and ``_post_call_*``.
+
+    Lives on the stack of one wrapper invocation. Carries the dedupe
+    handle for the runtime reporter so the post-call helpers can ask
+    "did the interceptor handle this call?" via the per-call token
+    (new path) or the legacy pre/post counter (back-compat with old
+    shims that don't expose ``begin_call``).
+    """
+
+    effective_item_id: str | None
+    runtime_reporter: Any | None
+    call_token: object | None
+    legacy_pre_count: int | None
+    start: float
+    cleanup_done: bool = False
 
 
 def _label_for_warning(label_or_fn: Any, fn: Any) -> str:
@@ -94,10 +119,10 @@ class PapayyaRun:
         # replay would silently rewrite the version onto rows that were
         # produced under a different code version.
         self._agent_version: str | None = None
-        # v9 multi-tenancy: metadata blob and the extracted tenant_key
+        # v9 partition-key: metadata blob and the extracted partition_key
         # value. Both denormalize onto every TaskEntry written by this run.
         self._metadata: dict[str, Any] | None = config.metadata
-        self._tenant_key: str | None = config.tenant_key
+        self._partition_key: str | None = config.partition_key
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
@@ -111,13 +136,13 @@ class PapayyaRun:
         existing = self._store.load(self.run_id)
         if existing is not None:
             self._agent_version = existing.agent_version
-            # v9: tenant_key/metadata pin at create time. On replay, trust
-            # the stored values rather than rederiving — same posture as
-            # agent_version (#7).
+            # v9: partition_key/metadata pin at create time. On replay,
+            # trust the stored values rather than rederiving — same
+            # posture as agent_version (#7).
             if existing.metadata is not None:
                 self._metadata = existing.metadata
-            if existing.tenant_key is not None:
-                self._tenant_key = existing.tenant_key
+            if existing.partition_key is not None:
+                self._partition_key = existing.partition_key
             for entry in existing.tasks:
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
@@ -144,7 +169,7 @@ class PapayyaRun:
                 input_snapshot=consume_agent_input_snapshot(),
                 agent_version=self._agent_version,
                 metadata=self._metadata,
-                tenant_key=self._tenant_key,
+                partition_key=self._partition_key,
             )
             self._store.create(checkpoint)
 
@@ -316,7 +341,18 @@ class PapayyaRun:
         item_id: str | None = None,
         snapshot: Any = _AUTO,
         kind: str | None = None,
-    ) -> Callable[..., T]:
+    ) -> Callable[..., Any]:
+        """Build the durable wrapper around ``fn``.
+
+        Returns an ``async def`` wrapper iff ``fn`` is a coroutine
+        function (per :func:`inspect.iscoroutinefunction`, which
+        unwraps ``functools.wraps``); otherwise returns a sync
+        wrapper. The async path mirrors the sync path through
+        ``await fn(...)`` — same pre/post helpers, same dedupe
+        semantics. Async generators fall through to the sync branch
+        (their wrapper returns the async-generator object — same as
+        today's behavior).
+        """
         try:
             sig: inspect.Signature | None = inspect.signature(fn)
         except (TypeError, ValueError):
@@ -324,15 +360,20 @@ class PapayyaRun:
             # Auto-capture skipped for these; the step still runs.
             sig = None
 
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
+        is_async = inspect.iscoroutinefunction(fn)
+
+        def _pre_call() -> tuple[Any, _CallCtx | None]:
+            """Common pre-call work. Returns ``(cache_hit, None)`` on
+            replay or ``(_MISS, ctx)`` when the wrapper should invoke
+            ``fn``. Splitting this out keeps the sync and async wrappers
+            byte-identical above the actual call boundary.
+            """
             self.init()
             self._throw_if_finished()
 
-            # Check cache for replay
             cached = self._cache.get(label)
             if cached is not None:
-                return cached.result  # type: ignore[return-value]
+                return cached.result, None
 
             # Resolve effective item_id: explicit per-step kwarg wins; else
             # inherit the run-level id. First step to supply an explicit id
@@ -341,47 +382,82 @@ class PapayyaRun:
             if item_id is not None and self._run_item_id is None:
                 self._run_item_id = item_id
 
-            # Snapshot the runtime reporter's intercepted-call count before
-            # running the fn. If it goes up during the call, the interceptor
-            # already reported this LLM call and the wrapper must NOT emit a
-            # second step row (double-counting cost + tokens).
             runtime_reporter = get_current_reporter() if kind == "llm" else None
-            pre_intercepted = (
-                runtime_reporter.intercepted_call_count()
-                if runtime_reporter is not None
-                else 0
+            call_token: object | None = None
+            legacy_pre_count: int | None = None
+            if runtime_reporter is not None:
+                # New shims expose begin_call → use the per-call token
+                # path (correct under asyncio.gather). Old shims only
+                # expose intercepted_call_count → fall back to the
+                # legacy pre/post snapshot. Both branches stay alive
+                # one release.
+                if hasattr(runtime_reporter, "begin_call"):
+                    try:
+                        call_token = runtime_reporter.begin_call(label)
+                    except Exception:
+                        # Telemetry must never crash a step. Falling
+                        # back to "no dedupe" means a duplicate emission
+                        # at worst, never a missed step.
+                        call_token = None
+                if call_token is None:
+                    try:
+                        legacy_pre_count = runtime_reporter.intercepted_call_count()
+                    except Exception:
+                        legacy_pre_count = 0
+
+            return _MISS, _CallCtx(
+                effective_item_id=effective_item_id,
+                runtime_reporter=runtime_reporter,
+                call_token=call_token,
+                legacy_pre_count=legacy_pre_count,
+                start=_time.monotonic(),
             )
 
-            start = _time.monotonic()
+        def _interceptor_already_emitted(ctx: _CallCtx) -> bool:
+            """Ask the reporter whether the interceptor handled this call.
+
+            Closes the per-token dedupe scope on the new path (so the
+            shim can release its bookkeeping); falls back to the
+            legacy pre/post counter compare on old shims.
+            """
+            reporter = ctx.runtime_reporter
+            if reporter is None:
+                return False
+            ctx.cleanup_done = True
+            if ctx.call_token is not None:
+                try:
+                    return reporter.was_emitted_for(ctx.call_token)
+                except Exception:
+                    return False
             try:
-                result = fn(*args, **kwargs)
-            except Exception as exc:
-                # For LLM-kind steps, classify the provider exception shape
-                # and promote credit-exhaustion errors so the runtime pauses
-                # the run (same behavior the interceptor produces for
-                # patched providers). Non-LLM steps propagate unchanged.
-                if kind == "llm":
-                    category = classify_provider_error(exc)
-                    if runtime_reporter is not None:
-                        post = runtime_reporter.intercepted_call_count()
-                        if post == pre_intercepted:
-                            # Interceptor didn't see the failure; emit it
-                            # so the dashboard has a step row for the
-                            # unpatched provider's error.
-                            duration_ms_exc = int((_time.monotonic() - start) * 1000)
-                            from papayya.llm_extract import LlmUsage as _Usage
-                            runtime_reporter.report_llm_call(
-                                label=label,
-                                usage=_Usage(None, None, None, None, None, "unknown"),
-                                duration_ms=duration_ms_exc,
-                                error_category=category,
-                            )
-                    if category == "credit" and not isinstance(exc, CreditExhausted):
-                        raise CreditExhausted(
-                            f"{label}: provider credits exhausted ({exc})"
-                        ) from exc
-                raise
-            duration_ms = int((_time.monotonic() - start) * 1000)
+                return reporter.intercepted_call_count() != ctx.legacy_pre_count
+            except Exception:
+                return False
+
+        def _ensure_cleanup(ctx: _CallCtx) -> None:
+            """Final-chance reset for the per-call token.
+
+            Runs in the wrapper's ``finally`` so cancellation
+            (``asyncio.CancelledError`` extends ``BaseException``,
+            bypassing our ``except Exception``) doesn't leak the
+            contextvar entry on the shim side.
+            """
+            if ctx.cleanup_done or ctx.call_token is None:
+                return
+            reporter = ctx.runtime_reporter
+            if reporter is None:
+                return
+            try:
+                reporter.was_emitted_for(ctx.call_token)
+            except Exception:
+                pass
+            ctx.cleanup_done = True
+
+        def _post_call_success(result: Any, ctx: _CallCtx, args: tuple, kwargs: dict) -> Any:
+            """Common post-success work: usage extraction, dedupe,
+            snapshot resolution, ``TaskEntry`` build, ``save_task``.
+            """
+            duration_ms = int((_time.monotonic() - ctx.start) * 1000)
 
             # LLM usage extraction runs on the returned response when this
             # step was wrapped with kind="llm". Extraction never raises —
@@ -398,11 +474,10 @@ class PapayyaRun:
                 # Emit through the runtime reporter only when the
                 # interceptor did not already emit for this call. This
                 # avoids double-counting when the user wraps a patched
-                # provider (openai / anthropic) in run.step(kind="llm").
-                if runtime_reporter is not None:
-                    post_intercepted = runtime_reporter.intercepted_call_count()
-                    if post_intercepted == pre_intercepted:
-                        runtime_reporter.report_llm_call(
+                # provider (openai / anthropic) in run.llm_step(...).
+                if ctx.runtime_reporter is not None:
+                    if not _interceptor_already_emitted(ctx):
+                        ctx.runtime_reporter.report_llm_call(
                             label=label,
                             usage=usage,
                             duration_ms=duration_ms,
@@ -425,7 +500,7 @@ class PapayyaRun:
             #   - snapshot=_AUTO  → introspect args (matches @agent path)
             #   - any other value → explicit override (escape hatch for
             #     args that aren't JSON-encodable)
-            if effective_item_id is not None:
+            if ctx.effective_item_id is not None:
                 if snapshot is False:
                     input_snapshot = None
                 elif snapshot is _AUTO:
@@ -442,7 +517,7 @@ class PapayyaRun:
                 result=result,
                 duration_ms=duration_ms,
                 completed_at=datetime.now(timezone.utc).isoformat(),
-                item_id=effective_item_id,
+                item_id=ctx.effective_item_id,
                 input_snapshot=input_snapshot,
                 output_snapshot=output_snapshot,
                 kind=kind,
@@ -454,16 +529,86 @@ class PapayyaRun:
                 llm_provider_shape=llm_provider_shape,
                 agent_version=self._agent_version,
                 metadata=self._metadata,
-                tenant_key=self._tenant_key,
+                partition_key=self._partition_key,
             )
 
             self._cache[label] = entry
             self._task_call_order.append(label)
             self._store.save_task(self.run_id, entry)
 
-            return result  # type: ignore[return-value]
+            return result
 
-        return wrapper  # type: ignore[return-value]
+        def _post_call_exception(exc: BaseException, ctx: _CallCtx) -> None:
+            """Common exception-path work for LLM steps.
+
+            Mirrors the success path's dedupe choice: emit a failed
+            step row only if the interceptor didn't already record
+            this call. ``CreditExhausted`` promotion happens in the
+            wrapper itself (we need to know whether to ``raise from``).
+            Non-LLM steps don't call this — they propagate unchanged.
+            """
+            if kind != "llm" or ctx.runtime_reporter is None:
+                return
+            if _interceptor_already_emitted(ctx):
+                return
+            duration_ms_exc = int((_time.monotonic() - ctx.start) * 1000)
+            try:
+                ctx.runtime_reporter.report_llm_call(
+                    label=label,
+                    usage=LlmUsage(None, None, None, None, None, "unknown"),
+                    duration_ms=duration_ms_exc,
+                    error_category=classify_provider_error(exc),
+                )
+            except Exception:
+                pass
+
+        if is_async:
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                cache_hit, ctx = _pre_call()
+                if ctx is None:
+                    return cache_hit
+                try:
+                    try:
+                        result = await fn(*args, **kwargs)
+                    except Exception as exc:
+                        _post_call_exception(exc, ctx)
+                        if kind == "llm":
+                            category = classify_provider_error(exc)
+                            if category == "credit" and not isinstance(exc, CreditExhausted):
+                                raise CreditExhausted(
+                                    f"{label}: provider credits exhausted ({exc})"
+                                ) from exc
+                        raise
+                    return _post_call_success(result, ctx, args, kwargs)
+                finally:
+                    _ensure_cleanup(ctx)
+
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            cache_hit, ctx = _pre_call()
+            if ctx is None:
+                return cache_hit
+            try:
+                try:
+                    result = fn(*args, **kwargs)
+                except Exception as exc:
+                    _post_call_exception(exc, ctx)
+                    if kind == "llm":
+                        category = classify_provider_error(exc)
+                        if category == "credit" and not isinstance(exc, CreditExhausted):
+                            raise CreditExhausted(
+                                f"{label}: provider credits exhausted ({exc})"
+                            ) from exc
+                    raise
+                return _post_call_success(result, ctx, args, kwargs)
+            finally:
+                _ensure_cleanup(ctx)
+
+        return sync_wrapper
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                           #

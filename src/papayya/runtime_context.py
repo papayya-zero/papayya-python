@@ -29,16 +29,47 @@ class LlmCallReporter(Protocol):
     code (currently ``run.step(kind="llm")``) consults the contextvar
     to decide whether to emit.
 
-    Dedupe lives in the implementation, not the caller: if the shim's
-    interceptor already recorded a step for the same call — detectable
-    via :meth:`intercepted_call_count` — the implementation should
-    treat :meth:`report_llm_call` as a no-op.
+    Dedupe is per-call: the SDK opens a scope via :meth:`begin_call`
+    before invoking the wrapped fn and asks :meth:`was_emitted_for`
+    after. The implementation tracks, for each token, whether its
+    interceptor recorded a step while that token was active — typically
+    by stashing the active token in a ``ContextVar`` that the
+    interceptor reads on every emission. Per-call scoping is correct
+    under ``asyncio.gather`` (each task gets its own contextvar copy);
+    the legacy global counter (:meth:`intercepted_call_count`) was not.
     """
 
+    def begin_call(self, label: str) -> object:
+        """Open a per-call dedupe scope.
+
+        Returns an opaque token the caller passes back to
+        :meth:`was_emitted_for`. Implementations MAY tag concurrent
+        emissions from their interceptor against the active token so
+        the SDK can ask, post-call, whether the interceptor handled
+        this particular call.
+
+        Tokens are opaque to callers — they MUST NOT inspect them.
+        """
+        ...
+
+    def was_emitted_for(self, token: object) -> bool:
+        """Return True iff the interceptor already emitted a step for
+        the call associated with ``token``. The SDK uses this to skip
+        a second emission for the same underlying call.
+
+        Callers MUST invoke this exactly once per :meth:`begin_call`
+        (cleanup is idempotent on the implementation side, but the
+        single-call contract makes leak audits easy).
+        """
+        ...
+
     def intercepted_call_count(self) -> int:
-        """Return the monotonic count of LLM calls recorded by the
-        interceptor so far. Callers snapshot this before and after a
-        wrapped call to decide whether the interceptor saw it.
+        """DEPRECATED — use :meth:`begin_call` + :meth:`was_emitted_for`.
+
+        Returns the monotonic count of LLM calls recorded by the
+        interceptor so far. Implementations SHOULD keep this method
+        for one release so older SDK builds (which snapshot pre/post
+        counts) keep working against newer shims.
         """
         ...
 

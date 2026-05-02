@@ -40,8 +40,11 @@ Repository = "https://github.com/papayya-zero/papayya-python"
 papayya = "papayya.cli:main"
 
 [project.optional-dependencies]
-test = ["pytest>=8", "build", "twine"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "build", "twine"]
 dev = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/papayya"]
