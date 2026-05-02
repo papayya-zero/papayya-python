@@ -182,6 +182,133 @@ def test_worker_processes_batch_with_correct_lineage(
 
 
 # --------------------------------------------------------------------------- #
+#  Async lineage equivalence — Phase 2 of the async-support unit.              #
+#                                                                              #
+#  An async @agent registered against the same fixtures must produce the same  #
+#  lineage shape as the sync agent above: same labels, same kind="llm"         #
+#  propagation, same input_snapshot, same last-step result. If this test       #
+#  fails but the sync acceptance test passes, the bug is in either the         #
+#  @agent async wrapper (input snapshot didn't survive `await`) or the         #
+#  worker's async dispatch (event loop didn't drive the coroutine).            #
+# --------------------------------------------------------------------------- #
+
+_ASYNC_AGENT_SOURCE = '''\
+"""Async acceptance-test agent: same lineage as the sync version.
+
+Imported by the worker subprocess once on boot. ``run.step`` accepts a
+coroutine and returns an async wrapper (Phase 1); the @agent decorator
+detects the coroutine and produces an async wrapper (Phase 2); the
+worker drives it through asyncio.run (Phase 2).
+"""
+
+import asyncio
+import os
+from pathlib import Path
+
+from papayya import agent
+from papayya.durable import papayya
+
+
+_counter_path = os.environ.get("PAPAYYA_TEST_IMPORT_COUNTER")
+if _counter_path:
+    p = Path(_counter_path)
+    n = int(p.read_text() or "0") if p.exists() else 0
+    p.write_text(str(n + 1))
+
+
+@agent(name="enrich")
+async def enrich(item_id: str) -> dict:
+    run = papayya().run("enrich", item_id=item_id)
+
+    async def fetch():
+        await asyncio.sleep(0)
+        return f"snippet-for-{item_id}"
+
+    async def extract(data):
+        await asyncio.sleep(0)
+        return {"id": item_id, "data": data, "score": 0.42}
+
+    fetch_step = run.step("fetch", fetch)
+    extract_step = run.step("extract", extract, kind="llm")
+
+    snippet = await fetch_step()
+    extracted = await extract_step(snippet)
+    run.complete(extracted)
+    return extracted
+'''
+
+
+def test_worker_processes_batch_with_async_agent_lineage(
+    tmp_path,
+    fake_dispatcher,
+    in_memory_store,
+    worker_subprocess,
+):
+    """An async ``@agent`` produces lineage identical to the sync agent.
+
+    Same 10-item batch, same fixtures, same assertions as the sync
+    acceptance test — the difference is the agent module is async all
+    the way down (`async def @agent`, awaited `run.step` calls).
+    """
+    agent_path = write_test_agent(tmp_path, _ASYNC_AGENT_SOURCE)
+
+    items = [f"co_{i:02d}" for i in range(10)]
+    for item_id in items:
+        fake_dispatcher.enqueue(agent="enrich", item_id=item_id)
+
+    worker = worker_subprocess(
+        agent_module=agent_path,
+        dispatcher=fake_dispatcher,
+        store=in_memory_store,
+    )
+
+    fake_dispatcher.wait_until_drained(timeout=10.0)
+
+    assert worker.module_import_count == 1, (
+        f"agent module imported {worker.module_import_count} times; "
+        "the warm-worker promise is broken on the async path"
+    )
+
+    deadline = _t.monotonic() + 2.0
+    last_count = in_memory_store.completed_run_count()
+    while last_count < len(items) and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+        last_count = in_memory_store.completed_run_count()
+    assert last_count == len(items), (
+        f"expected {len(items)} completed runs after 2s poll, got {last_count}"
+    )
+
+    for item_id in items:
+        run = in_memory_store.run_for_item(item_id)
+        assert run is not None, f"no run found for item_id={item_id}"
+
+        labels = [t.label for t in run.tasks]
+        assert labels == ["fetch", "extract"], (
+            f"item {item_id}: expected ['fetch', 'extract'], got {labels}"
+        )
+
+        kinds = [t.kind for t in run.tasks]
+        assert kinds == [None, "llm"], (
+            f"item {item_id}: kind='llm' did not propagate through the "
+            f"async worker path. Got {kinds}."
+        )
+
+        last = run.tasks[-1]
+        assert last.result == {"id": item_id, "data": f"snippet-for-{item_id}", "score": 0.42}
+
+        assert run.input_snapshot == {"item_id": item_id}, (
+            f"item {item_id}: expected input_snapshot={{'item_id': {item_id!r}}}, "
+            f"got {run.input_snapshot!r}. The @agent async wrapper must "
+            "set _AGENT_INPUT before await and reset in finally."
+        )
+
+    worker.stop(timeout=5.0)
+    assert worker.exit_code == 0, (
+        f"worker exited with code {worker.exit_code}; expected clean shutdown"
+    )
+
+
+# --------------------------------------------------------------------------- #
 #  Sentinel: this test must never be skipped or xfailed without a flag.        #
 #                                                                              #
 #  The acceptance test is the gate for Phase 1. If someone marks it skipped    #

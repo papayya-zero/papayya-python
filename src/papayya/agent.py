@@ -268,14 +268,24 @@ def agent(
             # Snapshot capture skipped for these; runs still execute.
             sig = None
 
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
-            token = _AGENT_INPUT.set(snapshot)
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                _AGENT_INPUT.reset(token)
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
+                token = _AGENT_INPUT.set(snapshot)
+                try:
+                    return await fn(*args, **kwargs)
+                finally:
+                    _AGENT_INPUT.reset(token)
+        else:
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
+                token = _AGENT_INPUT.set(snapshot)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _AGENT_INPUT.reset(token)
 
         # Register the *wrapper*, not the raw fn — the runtime worker
         # calls registration.fn(item_id) directly, and the wrapper is

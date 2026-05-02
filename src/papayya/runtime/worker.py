@@ -22,7 +22,9 @@ with one module import.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -477,7 +479,23 @@ class Worker:
         The signal arming is local to this call. ``setitimer(0)`` and
         the handler restore in the finally block guarantee no SIGALRM
         leaks across leases.
+
+        Async registrations branch off to ``_invoke_async`` — the SIGALRM
+        watchdog is unsafe inside a running event loop (raising into
+        ``epoll_wait`` from a signal handler can leave the loop in an
+        inconsistent state). The async path uses ``asyncio.wait_for``
+        for the same wall-clock guarantee.
         """
+        if inspect.iscoroutinefunction(fn):
+            self._invoke_async(
+                fn=fn,
+                lease=lease,
+                started_at=started_at,
+                max_duration=max_duration,
+                short=short,
+            )
+            return
+
         prior_handler = None
         watchdog_armed = max_duration is not None and max_duration > 0
         if watchdog_armed:
@@ -521,6 +539,91 @@ class Worker:
                     signal.signal(signal.SIGALRM, prior_handler)
 
         # Success path (no exception, no early return).
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.info(
+            "finished %s item=%s duration=%dms",
+            short, lease.item_id, duration_ms,
+        )
+        self._report_complete(lease.lease_id, status="completed")
+
+    def _invoke_async(
+        self,
+        *,
+        fn: Any,
+        lease: Lease,
+        started_at: float,
+        max_duration: float | None,
+        short: str,
+    ) -> None:
+        """Run a coroutine ``fn(lease.item_id)`` to completion.
+
+        Uses ``asyncio.wait_for`` for timeout enforcement instead of the
+        sync path's SIGALRM watchdog. Signal handlers raising into a
+        running event loop can leave the loop in inconsistent state;
+        ``wait_for`` cancels the inner coroutine cleanly so any
+        ``finally`` / cleanup blocks the agent installed run before we
+        report failure.
+
+        Four terminal paths:
+          - Success: report completed.
+          - ``asyncio.TimeoutError`` from ``wait_for``: report failed
+            with ``error_category="timeout"`` (parity with sync path).
+          - ``asyncio.CancelledError``: report failed with
+            ``error_category="cancelled"``. Distinct from ``timeout``
+            because the operator response differs — ``timeout`` says
+            "max_duration_seconds is too tight", ``cancelled`` says
+            "look for who issued the cancel". CancelledError extends
+            ``BaseException`` so the generic ``except Exception`` below
+            doesn't catch it; without an explicit branch this would
+            propagate out of ``_handle_lease`` and the lease would only
+            recover via TTL.
+          - Any other ``Exception``: existing stringified-error path.
+        """
+        coro = fn(lease.item_id)
+        try:
+            if max_duration is not None and max_duration > 0:
+                asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
+            else:
+                asyncio.run(coro)
+        except asyncio.TimeoutError:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.warning(
+                "failed   %s item=%s duration=%dms category=timeout limit=%.2fs",
+                short, lease.item_id, duration_ms, max_duration,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"timeout: agent ran for >{max_duration}s",
+                error_category="timeout",
+            )
+            return
+        except asyncio.CancelledError:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.warning(
+                "failed   %s item=%s duration=%dms category=cancelled",
+                short, lease.item_id, duration_ms,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error="cancelled: asyncio.CancelledError",
+                error_category="cancelled",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — customer code; isolate
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.exception(
+                "failed   %s item=%s duration=%dms",
+                short, lease.item_id, duration_ms,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+
         duration_ms = int((time.monotonic() - started_at) * 1000)
         log.info(
             "finished %s item=%s duration=%dms",

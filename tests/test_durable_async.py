@@ -482,3 +482,133 @@ async def test_async_legacy_counter_intercepted_skips_wrapper_emit():
         reset_current_reporter(rtoken)
 
     assert reporter.emitted == []
+
+# ---------------------------------------------------------------------------
+# Phase 2 — @agent decorator async branch (subprocess-free)
+#
+# These cases exercise the wrapper directly without spawning a worker.
+# The acceptance test in tests/integration/test_worker_acceptance.py
+# covers the worker round-trip; here we focus on the wrapper contract:
+# coroutine detection, ContextVar bridging through ``await``, and
+# cancellation cleanup.
+# ---------------------------------------------------------------------------
+
+
+from papayya.agent import (  # noqa: E402 — late import: keeps the file's top section provider-shape only
+    _registry,
+    agent as agent_decorator,
+    consume_agent_input_snapshot,
+)
+
+
+@pytest.fixture
+def _clean_agent_registry():
+    """``@agent`` writes to a module-level registry; clear keys these
+    tests added so successive test runs don't see stale registrations.
+    """
+    snapshot = dict(_registry)
+    yield
+    _registry.clear()
+    _registry.update(snapshot)
+
+
+async def test_agent_async_wrapper_is_coroutine_function(_clean_agent_registry):
+    @agent_decorator(name="async-detect")
+    async def fn(item_id: str) -> str:
+        return f"hi-{item_id}"
+
+    registration = _registry["async-detect"]
+    # Worker dispatch keys off this — must be True for the worker to
+    # take the async branch in _invoke_with_timeout.
+    assert inspect.iscoroutinefunction(registration.fn)
+    assert await fn("abc") == "hi-abc"
+
+
+async def test_agent_async_wrapper_sets_input_snapshot_during_await(
+    _clean_agent_registry,
+):
+    """The contextvar must be visible inside the awaited body — that's
+    what DurableRun.init() reads when seeding ``runs.input_snapshot``.
+    """
+    seen: list = []
+
+    @agent_decorator(name="async-snapshot")
+    async def fn(item_id: str) -> str:
+        await asyncio.sleep(0)
+        seen.append(consume_agent_input_snapshot())
+        await asyncio.sleep(0)
+        return item_id
+
+    await fn("co_42")
+    assert seen == [{"item_id": "co_42"}]
+
+
+async def test_agent_async_wrapper_resets_snapshot_in_finally(
+    _clean_agent_registry,
+):
+    """After the coroutine returns, ``consume_agent_input_snapshot``
+    must return None — proves the ``finally``-block reset ran on the
+    success path."""
+
+    @agent_decorator(name="async-reset")
+    async def fn(item_id: str) -> str:
+        return item_id
+
+    await fn("co_x")
+    assert consume_agent_input_snapshot() is None
+
+
+async def test_agent_async_snapshot_isolated_across_gather(
+    _clean_agent_registry,
+):
+    """Each ``asyncio.gather`` task gets its own ContextVar copy, so
+    interleaved async @agent calls must not see each other's snapshot.
+    """
+    captured: dict[str, object] = {}
+
+    @agent_decorator(name="async-gather")
+    async def fn(item_id: str) -> str:
+        # Yield twice so the scheduler interleaves all three tasks
+        # before any reaches the snapshot read.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        captured[item_id] = consume_agent_input_snapshot()
+        return item_id
+
+    await asyncio.gather(fn("a"), fn("b"), fn("c"))
+    assert captured == {
+        "a": {"item_id": "a"},
+        "b": {"item_id": "b"},
+        "c": {"item_id": "c"},
+    }
+
+
+async def test_agent_async_cancellation_resets_snapshot(_clean_agent_registry):
+    """``asyncio.CancelledError`` extends ``BaseException`` — the
+    contextvar reset has to live in ``finally`` for the snapshot not to
+    leak across calls."""
+
+    @agent_decorator(name="async-cancel")
+    async def slow(item_id: str) -> str:
+        await asyncio.sleep(10)
+        return item_id
+
+    task = asyncio.create_task(slow("co_cancel"))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert consume_agent_input_snapshot() is None
+
+
+def test_agent_sync_path_unchanged(_clean_agent_registry):
+    """Regression: a sync agent fn still gets a sync wrapper. Phase 2's
+    branch must not affect sync registrations."""
+
+    @agent_decorator(name="sync-regression")
+    def fn(item_id: str) -> str:
+        return item_id
+
+    registration = _registry["sync-regression"]
+    assert not inspect.iscoroutinefunction(registration.fn)
+    assert fn("co_z") == "co_z"
