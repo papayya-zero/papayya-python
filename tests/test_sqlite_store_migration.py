@@ -213,19 +213,19 @@ class TestFreshInstall:
         assert _schema.COL_TASK_DELIVERY_ATTEMPTS in task_cols
         assert _schema.COL_TASK_JOURNALED_AT in task_cols
 
-    def test_fresh_db_has_metadata_tenant_columns(self, tmp_db: Path) -> None:
-        """v9 adds metadata + tenant_key on runs and tasks."""
+    def test_fresh_db_has_metadata_partition_columns(self, tmp_db: Path) -> None:
+        """v9 adds metadata + partition_key on runs and tasks."""
         SQLiteStore(str(tmp_db))
         conn = sqlite3.connect(tmp_db)
         run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
         task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
         assert _schema.COL_RUN_METADATA in run_cols
-        assert _schema.COL_RUN_TENANT_KEY in run_cols
+        assert _schema.COL_RUN_PARTITION_KEY in run_cols
         assert _schema.COL_TASK_METADATA in task_cols
-        assert _schema.COL_TASK_TENANT_KEY in task_cols
+        assert _schema.COL_TASK_PARTITION_KEY in task_cols
 
-    def test_fresh_db_has_tenant_indexes(self, tmp_db: Path) -> None:
-        """v9 adds tenant_key indexes on runs + tasks for filtered queries."""
+    def test_fresh_db_has_partition_indexes(self, tmp_db: Path) -> None:
+        """v9 adds partition_key indexes on runs + tasks for filtered queries."""
         SQLiteStore(str(tmp_db))
         conn = sqlite3.connect(tmp_db)
         indexes = {
@@ -234,8 +234,8 @@ class TestFreshInstall:
                 "SELECT name FROM sqlite_master WHERE type='index'"
             ).fetchall()
         }
-        assert _schema.IDX_RUNS_TENANT in indexes
-        assert _schema.IDX_TASKS_TENANT in indexes
+        assert _schema.IDX_RUNS_PARTITION in indexes
+        assert _schema.IDX_TASKS_PARTITION in indexes
 
     def test_fresh_db_drops_budget_and_cost_columns(self, tmp_db: Path) -> None:
         """v4 removes budget/cost/token columns. Fresh DBs end up v4 after the
@@ -536,7 +536,7 @@ class TestV7ToV8Migration:
 
 
 class TestV8ToV9Migration:
-    """Exercise the v8→v9 step: metadata + tenant_key on runs and tasks."""
+    """Exercise the v8→v9 step: metadata + partition_key on runs and tasks."""
 
     def _build_v8_db(self, tmp_db: Path) -> None:
         _build_v1_db(tmp_db)
@@ -562,7 +562,7 @@ class TestV8ToV9Migration:
         ).fetchone()[0]
         assert version == _schema.SCHEMA_VERSION
 
-    def test_v8_db_adds_metadata_tenant_columns_as_null(self, tmp_db: Path) -> None:
+    def test_v8_db_adds_metadata_partition_columns_as_null(self, tmp_db: Path) -> None:
         self._build_v8_db(tmp_db)
         SQLiteStore(str(tmp_db))
         conn = sqlite3.connect(tmp_db)
@@ -572,11 +572,11 @@ class TestV8ToV9Migration:
             "SELECT * FROM tasks WHERE run_id='run-1'"
         ).fetchone()
         assert run[_schema.COL_RUN_METADATA] is None
-        assert run[_schema.COL_RUN_TENANT_KEY] is None
+        assert run[_schema.COL_RUN_PARTITION_KEY] is None
         assert task[_schema.COL_TASK_METADATA] is None
-        assert task[_schema.COL_TASK_TENANT_KEY] is None
+        assert task[_schema.COL_TASK_PARTITION_KEY] is None
 
-    def test_v8_to_v9_creates_tenant_indexes(self, tmp_db: Path) -> None:
+    def test_v8_to_v9_creates_partition_indexes(self, tmp_db: Path) -> None:
         self._build_v8_db(tmp_db)
         SQLiteStore(str(tmp_db))
         conn = sqlite3.connect(tmp_db)
@@ -586,8 +586,8 @@ class TestV8ToV9Migration:
                 "SELECT name FROM sqlite_master WHERE type='index'"
             ).fetchall()
         }
-        assert _schema.IDX_RUNS_TENANT in indexes
-        assert _schema.IDX_TASKS_TENANT in indexes
+        assert _schema.IDX_RUNS_PARTITION in indexes
+        assert _schema.IDX_TASKS_PARTITION in indexes
 
     def test_v8_to_v9_creates_backup(self, tmp_db: Path) -> None:
         self._build_v8_db(tmp_db)

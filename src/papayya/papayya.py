@@ -56,7 +56,7 @@ from papayya.resources.usage import Usage
 from papayya.resources.webhooks import Webhooks
 
 
-_TENANT_KEY_SENTINEL = object()
+_PARTITION_KEY_SENTINEL = object()
 
 
 def _resolve_durable_api_key(explicit: str | None) -> str | None:
@@ -81,46 +81,47 @@ def _resolve_durable_base_url(explicit: str | None) -> str:
     return os.environ.get("PAPAYYA_BASE_URL") or DEFAULT_BASE_URL
 
 
-def _resolve_yaml_tenant_key_field(yaml_path: Path) -> str | None:
-    """Read the tenant_key declaration from papayya.yaml. None when absent.
+def _resolve_yaml_partition_key_field(yaml_path: Path) -> str | None:
+    """Read the partition_key declaration from papayya.yaml. None when absent.
 
-    Missing yaml is silent — single-tenant projects don't need to write
-    one. Malformed yaml or version mismatches raise PapayyaYamlError so
-    config bugs surface here rather than at first run().
+    Missing yaml is silent — single-partition projects don't need to
+    write one. Malformed yaml or version mismatches raise
+    PapayyaYamlError so config bugs surface here rather than at first
+    run().
     """
     if not yaml_path.exists():
         return None
     spec: PapayyaYaml = load_yaml(yaml_path)
-    return spec.tenant_key
+    return spec.partition_key
 
 
-def _extract_tenant_key(
+def _extract_partition_key(
     metadata: dict[str, Any] | None,
-    tenant_key_field: str,
+    partition_key_field: str,
 ) -> str:
-    """Pull the tenant key value from run metadata. Strict by design.
+    """Pull the partition key value from run metadata. Strict by design.
 
-    Raises ValueError when papayya.yaml declares a tenant_key but the
-    caller didn't include it in metadata, or included an empty/non-string
-    value. The error names the missing key so the caller knows what
-    contract they're violating.
+    Raises ValueError when papayya.yaml declares a partition_key but
+    the caller didn't include it in metadata, or included an
+    empty/non-string value. The error names the missing key so the
+    caller knows what contract they're violating.
     """
     if not metadata:
         raise ValueError(
-            f"papayya.yaml declares tenant_key={tenant_key_field!r} but "
+            f"papayya.yaml declares partition_key={partition_key_field!r} but "
             f"run() was called with no metadata. Pass "
-            f"metadata={{{tenant_key_field!r}: ...}} to identify the tenant."
+            f"metadata={{{partition_key_field!r}: ...}} to identify the partition."
         )
-    if tenant_key_field not in metadata:
+    if partition_key_field not in metadata:
         raise ValueError(
-            f"papayya.yaml declares tenant_key={tenant_key_field!r} but "
+            f"papayya.yaml declares partition_key={partition_key_field!r} but "
             f"run() metadata is missing this key. "
             f"metadata.keys()={sorted(metadata.keys())}"
         )
-    value = metadata[tenant_key_field]
+    value = metadata[partition_key_field]
     if not isinstance(value, str) or value == "":
         raise ValueError(
-            f"metadata[{tenant_key_field!r}] must be a non-empty string; "
+            f"metadata[{partition_key_field!r}] must be a non-empty string; "
             f"got {value!r}"
         )
     return value
@@ -149,8 +150,8 @@ class Papayya:
         # local-only durable script (no api_key) can construct Papayya
         # without ever needing credentials.
         self._api: APIClient | None = None
-        # papayya.yaml tenant_key declaration — resolved on first run().
-        self._tenant_key_field: Any = _TENANT_KEY_SENTINEL
+        # papayya.yaml partition_key declaration — resolved on first run().
+        self._partition_key_field: Any = _PARTITION_KEY_SENTINEL
 
     # --- internal ----------------------------------------------------- #
 
@@ -167,12 +168,12 @@ class Papayya:
             self._api = APIClient(config)
         return self._api
 
-    def _project_tenant_key_field(self) -> str | None:
-        if self._tenant_key_field is _TENANT_KEY_SENTINEL:
-            self._tenant_key_field = _resolve_yaml_tenant_key_field(
+    def _project_partition_key_field(self) -> str | None:
+        if self._partition_key_field is _PARTITION_KEY_SENTINEL:
+            self._partition_key_field = _resolve_yaml_partition_key_field(
                 Path("papayya.yaml")
             )
-        return self._tenant_key_field  # type: ignore[return-value]
+        return self._partition_key_field  # type: ignore[return-value]
 
     def _auto_store(self) -> Any:
         """Auto-select a CheckpointStore for durable runs.
@@ -207,18 +208,19 @@ class Papayya:
     ) -> Any:
         """Create a new durable run.
 
-        When ``papayya.yaml`` declares a ``tenant_key:``, the supplied
-        ``metadata`` MUST include that key — strict-when-declared. The
-        extracted value is persisted in the indexed ``tenant_key``
-        column on every row written under this run.
+        When ``papayya.yaml`` declares a ``partition_key:``, the
+        supplied ``metadata`` MUST include that key —
+        strict-when-declared. The extracted value is persisted in the
+        indexed ``partition_key`` column on every row written under
+        this run.
         """
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
 
-        tenant_key_field = self._project_tenant_key_field()
-        tenant_key_value: str | None = None
-        if tenant_key_field is not None:
-            tenant_key_value = _extract_tenant_key(metadata, tenant_key_field)
+        partition_key_field = self._project_partition_key_field()
+        partition_key_value: str | None = None
+        if partition_key_field is not None:
+            partition_key_value = _extract_partition_key(metadata, partition_key_field)
 
         resolved_store = store or self._store_override or self._auto_store()
         return PapayyaRun(
@@ -228,7 +230,7 @@ class Papayya:
                 metadata=metadata,
                 item_id=item_id,
                 store=resolved_store,
-                tenant_key=tenant_key_value,
+                partition_key=partition_key_value,
             )
         )
 

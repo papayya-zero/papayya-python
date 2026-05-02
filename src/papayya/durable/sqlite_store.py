@@ -355,21 +355,21 @@ _V8_ADD_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 
-# v9: multi-tenancy metadata convention. metadata is the JSON blob captured
-# at run() time; tenant_key is the extracted indexed value. Denormalized
-# onto tasks so dashboard filters by tenant don't need to join through runs.
+# v9: partition-key metadata convention. metadata is the JSON blob captured
+# at run() time; partition_key is the extracted indexed value. Denormalized
+# onto tasks so dashboard filters by partition don't need to join through runs.
 _V9_ADD_COLUMNS: list[tuple[str, str, str]] = [
     (_schema.TBL_RUNS, _schema.COL_RUN_METADATA, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_TENANT_KEY, "TEXT"),
+    (_schema.TBL_RUNS, _schema.COL_RUN_PARTITION_KEY, "TEXT"),
     (_schema.TBL_TASKS, _schema.COL_TASK_METADATA, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_TENANT_KEY, "TEXT"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_PARTITION_KEY, "TEXT"),
 ]
 
 _V9_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_TENANT} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_TENANT_KEY});",
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_TASKS_TENANT} "
-    f"ON {_schema.TBL_TASKS}({_schema.COL_TASK_TENANT_KEY});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_PARTITION} "
+    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_PARTITION_KEY});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_TASKS_PARTITION} "
+    f"ON {_schema.TBL_TASKS}({_schema.COL_TASK_PARTITION_KEY});",
 ]
 
 
@@ -648,7 +648,7 @@ class SQLiteStore:
                 error_category=t[_schema.COL_TASK_ERROR_CATEGORY],
                 agent_version=t[_schema.COL_TASK_AGENT_VERSION],
                 metadata=_decode_metadata(t[_schema.COL_TASK_METADATA]),
-                tenant_key=t[_schema.COL_TASK_TENANT_KEY],
+                partition_key=t[_schema.COL_TASK_PARTITION_KEY],
             )
             for t in task_rows
         ]
@@ -664,7 +664,7 @@ class SQLiteStore:
             input_snapshot=_decode_snapshot(row[_schema.COL_RUN_INPUT_SNAPSHOT]),
             agent_version=row[_schema.COL_RUN_AGENT_VERSION],
             metadata=_decode_metadata(row[_schema.COL_RUN_METADATA]),
-            tenant_key=row[_schema.COL_RUN_TENANT_KEY],
+            partition_key=row[_schema.COL_RUN_PARTITION_KEY],
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -687,7 +687,7 @@ class SQLiteStore:
                    {_schema.COL_TASK_ERROR_CATEGORY},
                    {_schema.COL_TASK_AGENT_VERSION},
                    {_schema.COL_TASK_METADATA},
-                   {_schema.COL_TASK_TENANT_KEY})
+                   {_schema.COL_TASK_PARTITION_KEY})
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
@@ -708,7 +708,7 @@ class SQLiteStore:
                     entry.error_category,
                     entry.agent_version,
                     _encode_metadata(entry.metadata),
-                    entry.tenant_key,
+                    entry.partition_key,
                 ),
             )
             self._conn.execute(
@@ -810,7 +810,7 @@ class SQLiteStore:
             f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
                batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT},
                {_schema.COL_RUN_AGENT_VERSION},
-               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_TENANT_KEY})
+               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_PARTITION_KEY})
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
@@ -823,7 +823,7 @@ class SQLiteStore:
                 _encode_snapshot(checkpoint.input_snapshot),
                 checkpoint.agent_version,
                 _encode_metadata(checkpoint.metadata),
-                checkpoint.tenant_key,
+                checkpoint.partition_key,
             ),
         )
         self._conn.commit()

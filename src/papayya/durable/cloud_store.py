@@ -138,7 +138,7 @@ class CloudStore:
                     output_snapshot=cp.get("output_snapshot"),
                     agent_version=cp.get("agent_version"),
                     metadata=cp.get("metadata"),
-                    tenant_key=cp.get("tenant_key"),
+                    partition_key=cp.get("partition_key"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
@@ -147,7 +147,7 @@ class CloudStore:
             updated_at=body["updated_at"],
             agent_version=body.get("agent_version"),
             metadata=body.get("metadata"),
-            tenant_key=body.get("tenant_key"),
+            partition_key=body.get("partition_key"),
         )
 
     def create(self, checkpoint: RunCheckpoint) -> None:
@@ -157,7 +157,7 @@ class CloudStore:
             "item_id": checkpoint.item_id,
             "agent_version": checkpoint.agent_version,
             "metadata": checkpoint.metadata,
-            "tenant_key": checkpoint.tenant_key,
+            "partition_key": checkpoint.partition_key,
         }
         self._execute(
             kind="create",
@@ -177,7 +177,7 @@ class CloudStore:
             "output_snapshot": json.loads(encode_user_value(entry.output_snapshot, strict=True)),
             "agent_version": entry.agent_version,
             "metadata": entry.metadata,
-            "tenant_key": entry.tenant_key,
+            "partition_key": entry.partition_key,
         }
         self._execute(
             kind="save_task",

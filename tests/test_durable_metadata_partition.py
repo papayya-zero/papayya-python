@@ -1,7 +1,7 @@
-"""v9 multi-tenancy metadata convention.
+"""v9 partition-key metadata convention.
 
 Covers store round-trip + PapayyaClient strict-when-declared enforcement
-against papayya.yaml. The yaml's tenant_key declaration is the contract:
+against papayya.yaml. The yaml's partition_key declaration is the contract:
 when set, every run() call must include the named key in metadata.
 """
 
@@ -44,7 +44,7 @@ class TestMetadataCodec:
 
 
 class TestSQLiteStoreRoundTrip:
-    def test_create_persists_metadata_and_tenant_key(self, tmp_db: Path) -> None:
+    def test_create_persists_metadata_and_partition_key(self, tmp_db: Path) -> None:
         store = SQLiteStore(str(tmp_db))
         checkpoint = RunCheckpoint(
             run_id="r1",
@@ -54,16 +54,16 @@ class TestSQLiteStoreRoundTrip:
             created_at="2026-05-01T00:00:00+00:00",
             updated_at="2026-05-01T00:00:00+00:00",
             metadata={"organization_id": "org_42", "user_id": "u_7"},
-            tenant_key="org_42",
+            partition_key="org_42",
         )
         store.create(checkpoint)
 
         loaded = store.load("r1")
         assert loaded is not None
         assert loaded.metadata == {"organization_id": "org_42", "user_id": "u_7"}
-        assert loaded.tenant_key == "org_42"
+        assert loaded.partition_key == "org_42"
 
-    def test_save_task_persists_metadata_and_tenant_key(self, tmp_db: Path) -> None:
+    def test_save_task_persists_metadata_and_partition_key(self, tmp_db: Path) -> None:
         store = SQLiteStore(str(tmp_db))
         store.create(
             RunCheckpoint(
@@ -81,7 +81,7 @@ class TestSQLiteStoreRoundTrip:
             duration_ms=42,
             completed_at="2026-05-01T00:00:01+00:00",
             metadata={"organization_id": "org_42"},
-            tenant_key="org_42",
+            partition_key="org_42",
         )
         store.save_task("r1", entry)
 
@@ -89,7 +89,7 @@ class TestSQLiteStoreRoundTrip:
         assert loaded is not None
         (task,) = loaded.tasks
         assert task.metadata == {"organization_id": "org_42"}
-        assert task.tenant_key == "org_42"
+        assert task.partition_key == "org_42"
 
     def test_null_metadata_stays_null(self, tmp_db: Path) -> None:
         """Backward-compat: existing callers that don't pass metadata must
@@ -116,10 +116,10 @@ class TestSQLiteStoreRoundTrip:
         loaded = store.load("r1")
         assert loaded is not None
         assert loaded.metadata is None
-        assert loaded.tenant_key is None
+        assert loaded.partition_key is None
         (task,) = loaded.tasks
         assert task.metadata is None
-        assert task.tenant_key is None
+        assert task.partition_key is None
 
 
 @pytest.fixture
@@ -135,9 +135,9 @@ def _write_yaml(dir: Path, body: str) -> None:
 
 class TestPapayyaClientStrictWhenDeclared:
     """PapayyaClient.run() reads papayya.yaml at first call and enforces
-    that every run includes the declared tenant_key in its metadata."""
+    that every run includes the declared partition_key in its metadata."""
 
-    def test_no_yaml_means_tenant_key_optional(
+    def test_no_yaml_means_partition_key_optional(
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         # No papayya.yaml exists — runs without metadata are accepted.
@@ -146,7 +146,7 @@ class TestPapayyaClientStrictWhenDeclared:
         run = client.run(agent="enrich")
         assert run is not None
 
-    def test_yaml_without_tenant_key_means_optional(
+    def test_yaml_without_partition_key_means_optional(
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(papayya_yaml_dir, "version: 1\n")
@@ -159,7 +159,7 @@ class TestPapayyaClientStrictWhenDeclared:
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(
-            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
         )
         store = SQLiteStore(str(tmp_path / "local.db"))
         client = PapayyaClient(PapayyaClientConfig(store=store))
@@ -172,16 +172,16 @@ class TestPapayyaClientStrictWhenDeclared:
         # Round-trip via the store.
         loaded = store.load("r1")
         assert loaded is not None
-        assert loaded.tenant_key == "org_42"
+        assert loaded.partition_key == "org_42"
         assert loaded.metadata == {"organization_id": "org_42", "user_id": "u_7"}
         (task,) = loaded.tasks
-        assert task.tenant_key == "org_42"
+        assert task.partition_key == "org_42"
 
     def test_declared_key_missing_metadata_raises(
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(
-            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
         )
         store = SQLiteStore(str(tmp_path / "local.db"))
         client = PapayyaClient(PapayyaClientConfig(store=store))
@@ -192,7 +192,7 @@ class TestPapayyaClientStrictWhenDeclared:
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(
-            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
         )
         store = SQLiteStore(str(tmp_path / "local.db"))
         client = PapayyaClient(PapayyaClientConfig(store=store))
@@ -203,7 +203,7 @@ class TestPapayyaClientStrictWhenDeclared:
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(
-            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
         )
         store = SQLiteStore(str(tmp_path / "local.db"))
         client = PapayyaClient(PapayyaClientConfig(store=store))
@@ -217,7 +217,7 @@ class TestPapayyaClientStrictWhenDeclared:
         self, tmp_path: Path, papayya_yaml_dir: Path
     ) -> None:
         _write_yaml(
-            papayya_yaml_dir, "version: 1\ntenant_key: organization_id\n"
+            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
         )
         store = SQLiteStore(str(tmp_path / "local.db"))
         client = PapayyaClient(PapayyaClientConfig(store=store))

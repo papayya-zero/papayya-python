@@ -185,12 +185,12 @@ class TestNonJsonNativePayloads:
             store.save_task("r1", entry)
 
 
-class TestCreateSendsMetadataAndTenantKey:
+class TestCreateSendsMetadataAndPartitionKey:
     """v9 multi-tenancy convention. metadata is the user-supplied JSON
-    blob; tenant_key is the extracted indexed value. Both ride the same
+    blob; partition_key is the extracted indexed value. Both ride the same
     POST /v1/durable/runs as the rest of the run header."""
 
-    def test_create_posts_metadata_and_tenant_key(self) -> None:
+    def test_create_posts_metadata_and_partition_key(self) -> None:
         captured: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -204,7 +204,7 @@ class TestCreateSendsMetadataAndTenantKey:
             tasks=[],
             status="running",
             metadata={"organization_id": "org_42", "user_id": "u_7"},
-            tenant_key="org_42",
+            partition_key="org_42",
             created_at="",
             updated_at="",
         )
@@ -212,9 +212,9 @@ class TestCreateSendsMetadataAndTenantKey:
 
         body = captured["body"]
         assert body["metadata"] == {"organization_id": "org_42", "user_id": "u_7"}
-        assert body["tenant_key"] == "org_42"
+        assert body["partition_key"] == "org_42"
 
-    def test_save_task_posts_metadata_and_tenant_key(self) -> None:
+    def test_save_task_posts_metadata_and_partition_key(self) -> None:
         captured: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -228,16 +228,16 @@ class TestCreateSendsMetadataAndTenantKey:
             duration_ms=50,
             completed_at="2026-05-01T00:00:00+00:00",
             metadata={"organization_id": "org_42"},
-            tenant_key="org_42",
+            partition_key="org_42",
         )
         store.save_task("r1", entry)
 
         body = captured["body"]
         assert body["metadata"] == {"organization_id": "org_42"}
-        assert body["tenant_key"] == "org_42"
+        assert body["partition_key"] == "org_42"
 
 
-class TestLoadRestoresMetadataAndTenantKey:
+class TestLoadRestoresMetadataAndPartitionKey:
     def test_load_reads_metadata_from_response(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -247,7 +247,7 @@ class TestLoadRestoresMetadataAndTenantKey:
                     "agent": "enrich",
                     "status": "running",
                     "metadata": {"organization_id": "org_42"},
-                    "tenant_key": "org_42",
+                    "partition_key": "org_42",
                     "checkpoints": [
                         {
                             "label": "enrich",
@@ -255,7 +255,7 @@ class TestLoadRestoresMetadataAndTenantKey:
                             "duration_ms": 50,
                             "completed_at": "2026-05-01T00:00:00+00:00",
                             "metadata": {"organization_id": "org_42"},
-                            "tenant_key": "org_42",
+                            "partition_key": "org_42",
                         }
                     ],
                     "created_at": "2026-05-01T00:00:00+00:00",
@@ -267,10 +267,10 @@ class TestLoadRestoresMetadataAndTenantKey:
         checkpoint = store.load("r1")
         assert checkpoint is not None
         assert checkpoint.metadata == {"organization_id": "org_42"}
-        assert checkpoint.tenant_key == "org_42"
+        assert checkpoint.partition_key == "org_42"
         (entry,) = checkpoint.tasks
         assert entry.metadata == {"organization_id": "org_42"}
-        assert entry.tenant_key == "org_42"
+        assert entry.partition_key == "org_42"
 
 
 class TestBackwardCompat:

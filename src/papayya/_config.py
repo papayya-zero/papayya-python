@@ -52,25 +52,27 @@ class EnvSpec(_Strict):
 class PapayyaYaml(_Strict):
     version: Literal[1]
     envs: dict[str, EnvSpec] = Field(default_factory=dict)
-    # v9 multi-tenancy convention: name the metadata key that carries the
-    # tenant identifier. When set, every run() call must include this key
-    # in its metadata; the SDK extracts it into the indexed tenant_key
-    # column so dashboards and downstream layers (per-tenant budgets,
-    # rate-limit pools, fairness) can filter and aggregate by tenant.
-    # Leave unset for single-tenant projects.
-    tenant_key: str | None = Field(
+    # v9 partition-key convention: name the metadata key whose value is
+    # the partitioning axis for this project (most often: a tenant /
+    # organization identifier). When set, every run() call must include
+    # this key in its metadata; the SDK extracts it into the indexed
+    # partition_key column so dashboards and downstream layers
+    # (per-partition budgets, rate-limit pools, fairness) can filter
+    # and aggregate without joining. Leave unset for single-partition
+    # projects.
+    partition_key: str | None = Field(
         default=None,
-        description="Metadata key whose value identifies the tenant for this project.",
+        description="Metadata key whose value identifies the partition (often a tenant) for this project.",
     )
 
-    @field_validator("tenant_key")
+    @field_validator("partition_key")
     @classmethod
-    def _tenant_key_nonempty(cls, value: str | None) -> str | None:
-        # An empty-string tenant_key is almost certainly a mistake — pydantic
-        # would otherwise accept it and the SDK would extract empty values
-        # without complaint. Fail loud at parse time instead.
+    def _partition_key_nonempty(cls, value: str | None) -> str | None:
+        # An empty-string partition_key is almost certainly a mistake —
+        # pydantic would otherwise accept it and the SDK would extract
+        # empty values without complaint. Fail loud at parse time instead.
         if value is not None and value.strip() == "":
-            raise ValueError("tenant_key must be a non-empty string when set")
+            raise ValueError("partition_key must be a non-empty string when set")
         return value
 
 

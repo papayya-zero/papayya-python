@@ -109,17 +109,18 @@ COL_TASK_DELIVERY_ATTEMPTS = "delivery_attempts"
 COL_TASK_JOURNALED_AT = "journaled_at"
 
 
-# v9 columns — multi-tenancy metadata convention. metadata is the full
-# user-supplied JSON blob captured at run() time; tenant_key is the value
-# extracted from metadata at the path declared by `tenant_key:` in
-# papayya.yaml. Both denormalize onto every task row written under the run
-# so the dashboard can filter/aggregate by tenant without joining through
-# runs. tenant_key is the indexed column; metadata stays opaque JSON for
+# v9 columns — partition-key metadata convention (most common use case:
+# multi-tenancy). metadata is the full user-supplied JSON blob captured
+# at run() time; partition_key is the value extracted from metadata at
+# the path declared by `partition_key:` in papayya.yaml. Both denormalize
+# onto every task row written under the run so the dashboard can
+# filter/aggregate by partition without joining through runs.
+# partition_key is the indexed column; metadata stays opaque JSON for
 # queryability via json_extract when needed.
 COL_RUN_METADATA = "metadata"
-COL_RUN_TENANT_KEY = "tenant_key"
+COL_RUN_PARTITION_KEY = "partition_key"
 COL_TASK_METADATA = "metadata"
-COL_TASK_TENANT_KEY = "tenant_key"
+COL_TASK_PARTITION_KEY = "partition_key"
 
 
 # Schema version bumps — update both sides when adding a migration
@@ -133,5 +134,5 @@ IDX_RUNS_BATCH = "idx_runs_batch"
 IDX_TASKS_ITEM = "idx_tasks_item"
 IDX_RUNS_ITEM = "idx_runs_item"
 IDX_RUNS_DLQ = "idx_runs_dlq"
-IDX_RUNS_TENANT = "idx_runs_tenant"
-IDX_TASKS_TENANT = "idx_tasks_tenant"
+IDX_RUNS_PARTITION = "idx_runs_partition"
+IDX_TASKS_PARTITION = "idx_tasks_partition"
