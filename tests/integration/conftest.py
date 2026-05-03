@@ -46,13 +46,20 @@ def worker_subprocess(tmp_path):
     """
     procs: list[WorkerSubprocess] = []
 
-    def _spawn(*, agent_module: Path, dispatcher, store) -> WorkerSubprocess:
+    def _spawn(
+        *,
+        agent_module: Path,
+        dispatcher,
+        store,
+        api_key: str | None = None,
+    ) -> WorkerSubprocess:
         counter = tmp_path / "import_counter"
         proc = WorkerSubprocess(
             agent_module=agent_module,
             dispatcher_url=dispatcher.url,
             store_path=store.db_path,
             counter_path=counter,
+            api_key=api_key,
         )
         procs.append(proc)
         return proc

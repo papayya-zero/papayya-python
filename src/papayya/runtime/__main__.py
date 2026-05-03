@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from .worker import (
@@ -69,6 +70,16 @@ def _build_parser() -> argparse.ArgumentParser:
             f"(default: {_DEFAULT_DRAIN_TIMEOUT_SECONDS})."
         ),
     )
+    p.add_argument(
+        "--api-key",
+        default=None,
+        help=(
+            "Project-scoped Papayya API key, sent as X-Api-Key on every "
+            "dispatcher request. Falls back to the PAPAYYA_API_KEY env "
+            "var when omitted. Required for the hosted dispatcher; "
+            "optional for the local dispatcher."
+        ),
+    )
     return p
 
 
@@ -78,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # CLI flag wins; env var is the containerized-deploy fallback (ECS
+    # task secret injection). Read here rather than via argparse default
+    # so changes to the env between import and parse take effect.
+    api_key = args.api_key or os.environ.get("PAPAYYA_API_KEY")
     worker = Worker(
         dispatcher_url=args.dispatcher,
         store_path=args.store,
@@ -85,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         worker_id=args.worker_id,
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
+        api_key=api_key,
     )
     worker.run()
     return 0

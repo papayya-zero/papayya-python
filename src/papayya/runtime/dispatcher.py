@@ -50,6 +50,11 @@ class _PendingItem:
     agent: str
     item_id: str
     payload: dict | None
+    # Optional bundle version tag. Local dev typically leaves this None
+    # (the worker boots from --agent-module FILE and is version-unaware);
+    # set when a test or external caller exercises the hosted code-
+    # distribution wire shape. ADR-0003 § 1.
+    agent_version: str | None = None
 
 
 @dataclass
@@ -101,6 +106,7 @@ class LocalDispatcher:
         on_event: Callable[[str, dict], None] | None = None,
         lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
         heartbeat_check_interval: float | None = None,
+        expected_api_key: str | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._pending: deque[_PendingItem] = deque()
@@ -108,6 +114,10 @@ class LocalDispatcher:
         self._completed: dict[str, dict[str, Any]] = {}
         self._enqueued_total = 0
         self._on_event = on_event or (lambda _kind, _data: None)
+        # When set, lease/complete/heartbeat require X-Api-Key to match.
+        # Mirrors the hosted dispatcher's API-key middleware. Default
+        # None preserves the unauthenticated local-dev surface.
+        self._expected_api_key = expected_api_key
 
         self._lease_ttl = lease_ttl_seconds
         self._heartbeat_check_interval = (
@@ -161,10 +171,17 @@ class LocalDispatcher:
         agent: str,
         item_id: str,
         payload: dict | None = None,
+        agent_version: str | None = None,
     ) -> str:
         """Enqueue one item. Returns the lease_id (used as completion handle)."""
         lease_id = uuid.uuid4().hex
-        item = _PendingItem(lease_id=lease_id, agent=agent, item_id=item_id, payload=payload)
+        item = _PendingItem(
+            lease_id=lease_id,
+            agent=agent,
+            item_id=item_id,
+            payload=payload,
+            agent_version=agent_version,
+        )
         with self._lock:
             self._pending.append(item)
             self._enqueued_total += 1
@@ -247,9 +264,28 @@ class LocalDispatcher:
                 except ValueError:
                     return None
 
+            def _check_auth(self) -> bool:
+                """Return True iff the request passes the API-key check.
+
+                When the dispatcher has no expected key, every request
+                passes (default local-dev posture). When set, the
+                request's X-Api-Key must match exactly. Mismatch writes
+                a 401 and returns False so the caller can early-exit.
+                """
+                expected = dispatcher._expected_api_key
+                if expected is None:
+                    return True
+                provided = self.headers.get("X-Api-Key", "")
+                if provided == expected:
+                    return True
+                self._send_json(401, {"error": "invalid api key"})
+                return False
+
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
                 if parsed.path == "/lease":
+                    if not self._check_auth():
+                        return
                     qs = parse_qs(parsed.query)
                     worker_id = (qs.get("worker_id") or ["unknown"])[0]
                     lease = dispatcher._take_lease(worker_id)
@@ -257,12 +293,18 @@ class LocalDispatcher:
                         self.send_response(204)
                         self.end_headers()
                         return
-                    self._send_json(200, {
+                    body = {
                         "lease_id": lease.lease_id,
                         "agent": lease.agent,
                         "item_id": lease.item_id,
                         "payload": lease.payload,
-                    })
+                    }
+                    # Mirror the control-pane wire shape: omit the key
+                    # entirely when unset rather than emitting a null.
+                    # Keeps legacy callers' parsed-body shape unchanged.
+                    if lease.agent_version is not None:
+                        body["agent_version"] = lease.agent_version
+                    self._send_json(200, body)
                     return
 
                 if parsed.path == "/stats":
@@ -283,11 +325,14 @@ class LocalDispatcher:
                         agent=body["agent"],
                         item_id=body["item_id"],
                         payload=body.get("payload"),
+                        agent_version=body.get("agent_version"),
                     )
                     self._send_json(200, {"lease_id": lease_id})
                     return
 
                 if parsed.path == "/complete":
+                    if not self._check_auth():
+                        return
                     body = self._read_json()
                     if body is None or "lease_id" not in body:
                         self._send_json(400, {"error": "lease_id required"})
@@ -303,6 +348,8 @@ class LocalDispatcher:
                     return
 
                 if parsed.path == "/heartbeat":
+                    if not self._check_auth():
+                        return
                     body = self._read_json()
                     if body is None or "lease_id" not in body or "worker_id" not in body:
                         self._send_json(400, {"error": "lease_id and worker_id required"})

@@ -35,6 +35,7 @@ class WorkerSubprocess:
         store_path: str,
         counter_path: Path,
         worker_id: str = "test-worker-1",
+        api_key: str | None = None,
     ) -> None:
         self._counter_path = counter_path
         self._counter_path.write_text("0")
@@ -53,22 +54,26 @@ class WorkerSubprocess:
         log_path = counter_path.parent / "worker.log"
         self._log_path = log_path
 
+        argv = [
+            sys.executable,
+            "-m",
+            "papayya.runtime",
+            "--agent-module",
+            str(agent_module),
+            "--dispatcher",
+            dispatcher_url,
+            "--store",
+            store_path,
+            "--worker-id",
+            worker_id,
+            "--log-level",
+            "INFO",
+        ]
+        if api_key is not None:
+            argv += ["--api-key", api_key]
+
         self._proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "papayya.runtime",
-                "--agent-module",
-                str(agent_module),
-                "--dispatcher",
-                dispatcher_url,
-                "--store",
-                store_path,
-                "--worker-id",
-                worker_id,
-                "--log-level",
-                "INFO",
-            ],
+            argv,
             env=env,
             stdout=open(log_path, "wb"),
             stderr=subprocess.STDOUT,

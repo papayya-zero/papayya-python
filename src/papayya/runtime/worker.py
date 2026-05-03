@@ -62,6 +62,11 @@ class Lease:
     agent: str
     item_id: str
     payload: dict[str, Any] | None = None
+    # Set by the hosted dispatcher (control-pane RuntimeLease) when the
+    # lease was enqueued against a specific deployed bundle. None when the
+    # local LocalDispatcher served the lease — local dev loads the agent
+    # module from --agent-module FILE and is version-unaware. ADR-0003 § 1.
+    agent_version: str | None = None
 
 
 class _AgentTimeout(BaseException):
@@ -150,6 +155,7 @@ class Worker:
         poll_idle_seconds: float = 0.05,
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
+        api_key: Optional[str] = None,
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
@@ -157,6 +163,11 @@ class Worker:
         self.poll_idle_seconds = poll_idle_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.drain_timeout_seconds = drain_timeout_seconds
+        # Sent as X-Api-Key on lease/complete/heartbeat. Matches the
+        # dispatcher's API-key middleware (control-pane auth.go) which
+        # requires a project-scoped key — JWT Bearer tokens are rejected
+        # for runtime endpoints. None = no header (LocalDispatcher accepts).
+        self._api_key = api_key
         self._running = True
         now = time.monotonic()
         self._last_activity_at = now
@@ -324,6 +335,11 @@ class Worker:
 
     # --- dispatcher I/O ------------------------------------------------ #
 
+    def _auth_headers(self) -> dict[str, str]:
+        if self._api_key is None:
+            return {}
+        return {"X-Api-Key": self._api_key}
+
     def _poll_lease(self) -> tuple[str, Lease | None]:
         """Poll the dispatcher for one lease.
 
@@ -333,8 +349,9 @@ class Worker:
         the latter triggers exponential backoff.
         """
         url = f"{self.dispatcher_url}/lease?worker_id={self.worker_id}"
+        req = urllib_request.Request(url, headers=self._auth_headers())
         try:
-            with urllib_request.urlopen(url, timeout=2.0) as resp:
+            with urllib_request.urlopen(req, timeout=2.0) as resp:
                 if resp.status == 204:
                     return (_PollOutcome.IDLE, None)
                 if resp.status != 200:
@@ -350,6 +367,7 @@ class Worker:
             agent=body["agent"],
             item_id=body["item_id"],
             payload=body.get("payload"),
+            agent_version=body.get("agent_version"),
         ))
 
     def _report_complete(
@@ -372,7 +390,7 @@ class Worker:
         req = urllib_request.Request(
             f"{self.dispatcher_url}/complete",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self._auth_headers()},
             method="POST",
         )
 
@@ -701,7 +719,7 @@ class Worker:
         req = urllib_request.Request(
             f"{self.dispatcher_url}/heartbeat",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self._auth_headers()},
             method="POST",
         )
         try:

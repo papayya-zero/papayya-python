@@ -20,5 +20,5 @@ class FakeDispatcher(LocalDispatcher):
     nothing beyond what LocalDispatcher already exposes.
     """
 
-    def __init__(self) -> None:
-        super().__init__(host="127.0.0.1", port=0)
+    def __init__(self, *, expected_api_key: str | None = None) -> None:
+        super().__init__(host="127.0.0.1", port=0, expected_api_key=expected_api_key)
