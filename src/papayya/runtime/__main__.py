@@ -16,6 +16,8 @@ import sys
 from .worker import (
     _DEFAULT_DRAIN_TIMEOUT_SECONDS,
     _DEFAULT_HEARTBEAT_INTERVAL,
+    _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
+    _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE,
     Worker,
 )
 
@@ -111,6 +113,36 @@ def _build_parser() -> argparse.ArgumentParser:
             "that point at a fake bundle server."
         ),
     )
+    p.add_argument(
+        "--max-items-before-recycle",
+        type=int,
+        default=int(
+            os.environ.get("PAPAYYA_RECYCLE_AFTER_ITEMS")
+            or _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE
+        ),
+        help=(
+            "Recycle the worker after this many items have flowed "
+            "through it (success or failure). 0 or negative disables "
+            "the trigger. Falls back to PAPAYYA_RECYCLE_AFTER_ITEMS "
+            f"env var (default: {_DEFAULT_MAX_ITEMS_BEFORE_RECYCLE}). "
+            "ADR-0002 #6."
+        ),
+    )
+    p.add_argument(
+        "--max-rss-percent-before-recycle",
+        type=float,
+        default=float(
+            os.environ.get("PAPAYYA_RECYCLE_AT_MEMORY_PCT")
+            or _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE
+        ),
+        help=(
+            "Recycle the worker once resident memory exceeds this "
+            "percentage of system/container memory. 0 or negative "
+            "disables the trigger. Falls back to "
+            "PAPAYYA_RECYCLE_AT_MEMORY_PCT env var (default: "
+            f"{_DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE}). ADR-0002 #6."
+        ),
+    )
     return p
 
 
@@ -160,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
         drain_timeout_seconds=args.drain_timeout_seconds,
         api_key=api_key,
         bundle_url_base=args.bundle_url_base,
+        max_items_before_recycle=args.max_items_before_recycle,
+        max_rss_percent_before_recycle=args.max_rss_percent_before_recycle,
     )
     worker.run()
     return 0

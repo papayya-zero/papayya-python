@@ -35,7 +35,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -53,6 +53,30 @@ _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 # `terminationGracePeriodSeconds` (30s) so a worker pod gets to finish
 # the in-flight item before kubelet escalates to SIGKILL. ADR-0002 #12.
 _DEFAULT_DRAIN_TIMEOUT_SECONDS = 30.0
+
+
+# ADR-0001 § 4 designed-but-unshipped recycling triggers. ADR-0002 #6
+# closes the loop. Defaults are guesses — Phase 1 prototype must surface
+# real memory growth and item-throughput numbers; Phase 2 tunes from
+# data. 0 or negative on either disables that trigger.
+_DEFAULT_MAX_ITEMS_BEFORE_RECYCLE = 100
+_DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE = 80.0
+
+
+def _default_rss_percent_provider() -> float:
+    """Return this process's RSS as a percentage of system/container memory.
+
+    Under containerized runtimes (Fargate, k8s) the cgroup memory
+    limit normally surfaces as MemTotal, so this percentage tracks the
+    container's allotment rather than the host. Swap to a cgroup-aware
+    reader (`/sys/fs/cgroup/memory.max`) if production proves that wrong.
+
+    Pulled into a module-level function (rather than a Worker method) so
+    tests can swap it via the ``rss_percent_provider`` constructor kwarg.
+    """
+    import psutil
+
+    return float(psutil.Process().memory_percent())
 
 
 @dataclass
@@ -208,6 +232,9 @@ class Worker:
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
         api_key: Optional[str] = None,
         bundle_url_base: Optional[str] = None,
+        max_items_before_recycle: int = _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
+        max_rss_percent_before_recycle: float = _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE,
+        rss_percent_provider: Optional[Callable[[], float]] = None,
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
@@ -269,14 +296,32 @@ class Worker:
         self._drain_lock = threading.Lock()
         self._drain_thread: Optional[threading.Thread] = None
 
-        # Recycle-pending flag (ADR-0003 § Worker #6). Set when
-        # ``_ensure_loaded`` detects a different ``requirements.txt``
-        # hash between the resident version and a newly-fetched
-        # version of the same agent slug. The triggering lease is
-        # failed with ``error_category="recycle_pending"`` and the
-        # main loop exits cleanly so the orchestrator brings up a
-        # fresh process.
+        # Recycle-pending flag (ADR-0003 § Worker #6, ADR-0002 #6).
+        # Set when:
+        #   1. ``_ensure_loaded`` detects a different ``requirements.txt``
+        #      hash between the resident version and a newly-fetched
+        #      version of the same agent slug (the triggering lease is
+        #      failed with ``error_category="recycle_pending"``).
+        #   2. ``_check_recycle_thresholds`` observes
+        #      ``items_processed`` or RSS% past their configured
+        #      ceilings (between items, after the current item finished
+        #      normally — no lease failure needed).
+        # Either path also sets ``self._running = False`` so the main
+        # loop exits cleanly and the orchestrator brings up a fresh
+        # process.
         self._recycle_pending: bool = False
+
+        # ADR-0002 #6 / ADR-0001 § 4 recycling counters.
+        self._items_processed: int = 0
+        self._max_items_before_recycle = max_items_before_recycle
+        self._max_rss_percent_before_recycle = max_rss_percent_before_recycle
+        # Module-level default lazy-imports psutil so tests that inject
+        # their own provider don't pay for the dep — and so a busted
+        # psutil install doesn't break worker boot when the operator
+        # has the trigger disabled (max=0).
+        self._rss_percent_provider: Callable[[], float] = (
+            rss_percent_provider or _default_rss_percent_provider
+        )
 
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
@@ -569,8 +614,15 @@ class Worker:
 
     def run(self) -> None:
         """Block, pulling items from the dispatcher, until stopped."""
-        signal.signal(signal.SIGTERM, self._on_signal)
-        signal.signal(signal.SIGINT, self._on_signal)
+        # ``signal.signal`` raises ValueError when called off the main
+        # thread (CPython implementation constraint). Production workers
+        # always boot ``run()`` from the main thread of a subprocess so
+        # this is the normal path. In-process tests that drive ``run()``
+        # from a worker thread skip the registration — ``stop()`` and
+        # ``_running=False`` are still the orderly exit path.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, self._on_signal)
+            signal.signal(signal.SIGINT, self._on_signal)
 
         try:
             while self._running:
@@ -864,6 +916,49 @@ class Worker:
             with self._hb_lock:
                 self._in_flight_lease = None
             self._last_activity_at = time.monotonic()
+            self._items_processed += 1
+            self._check_recycle_thresholds()
+
+    def _check_recycle_thresholds(self) -> None:
+        """Trip the recycle flags if item-count or RSS% exceed their caps.
+
+        Called from ``_handle_lease``'s finally block — between items,
+        after the current lease has fully released the worker. Unlike
+        the dep-hash branch this never fails a lease: the item that
+        triggered the threshold already completed normally, so we just
+        flip ``_recycle_pending`` and ``_running=False`` and let the
+        main loop exit on its next iteration. ADR-0002 #6 / ADR-0001 § 4.
+        """
+        if (
+            self._max_items_before_recycle > 0
+            and self._items_processed >= self._max_items_before_recycle
+        ):
+            log.warning(
+                "scheduling recycle: reason=item_count items_processed=%d max=%d",
+                self._items_processed,
+                self._max_items_before_recycle,
+            )
+            self._recycle_pending = True
+            self._running = False
+            return
+
+        if self._max_rss_percent_before_recycle > 0:
+            try:
+                rss_pct = self._rss_percent_provider()
+            except Exception as exc:  # noqa: BLE001 — observability over crash
+                # Reading RSS must never crash the worker. The dep-hash
+                # and SIGTERM triggers stay armed; we just skip the RSS
+                # check this iteration.
+                log.debug("rss percent provider failed: %s", exc)
+                return
+            if rss_pct >= self._max_rss_percent_before_recycle:
+                log.warning(
+                    "scheduling recycle: reason=rss_percent rss_percent=%.1f max=%.1f",
+                    rss_pct,
+                    self._max_rss_percent_before_recycle,
+                )
+                self._recycle_pending = True
+                self._running = False
 
     def _invoke_with_timeout(
         self,
