@@ -201,7 +201,7 @@ class Worker:
         *,
         dispatcher_url: str,
         store_path: str,
-        agent_module_path: str,
+        agent_module_path: Optional[str] = None,
         worker_id: Optional[str] = None,
         poll_idle_seconds: float = 0.05,
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
@@ -215,6 +215,12 @@ class Worker:
         self.poll_idle_seconds = poll_idle_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.drain_timeout_seconds = drain_timeout_seconds
+        # Bootstrap mode: hosted workers boot without --agent-module and
+        # load every bundle on demand from lease.agent_version. A lease
+        # with agent_version=None (LocalDispatcher) in this mode is a
+        # misconfiguration — the lease handler emits error_category=
+        # "no_agent_module" so the failure is loud. ADR-0003 § Worker #5.
+        self._bootstrap_mode = agent_module_path is None
         # Sent as X-Api-Key on lease/complete/heartbeat. Matches the
         # dispatcher's API-key middleware (control-pane auth.go) which
         # requires a project-scoped key — JWT Bearer tokens are rejected
@@ -280,7 +286,13 @@ class Worker:
         # env from the parent shell.
         os.environ.pop("PAPAYYA_API_KEY", None)
 
-        self._import_agent_module(agent_module_path)
+        if agent_module_path is not None:
+            self._import_agent_module(agent_module_path)
+        else:
+            log.info(
+                "starting in bootstrap mode (no agent module pre-loaded; "
+                "first lease's agent_version triggers first import)"
+            )
 
         # Heartbeat thread starts after module import so any import
         # error fails fast without leaving a daemon thread behind.
@@ -797,6 +809,28 @@ class Worker:
             registration = get_agent(lease.agent, lease.agent_version)
             if registration is None:
                 duration_ms = int((time.monotonic() - started_at) * 1000)
+                # ADR-0003 § Worker #5 — bootstrap workers have no
+                # pre-loaded module, so a lease without agent_version
+                # is a misconfiguration (LocalDispatcher pointed at a
+                # hosted worker, or env var leaked into a container).
+                # Emit a distinct category so it doesn't get lumped
+                # in with "agent name typo" / version_not_found.
+                if self._bootstrap_mode and lease.agent_version is None:
+                    log.warning(
+                        "failed   %s item=%s duration=%dms category=no_agent_module",
+                        short, lease.item_id, duration_ms,
+                    )
+                    self._report_complete(
+                        lease.lease_id,
+                        status="failed",
+                        error=(
+                            "bootstrap worker received lease without "
+                            "agent_version (LocalDispatcher misconfigured "
+                            "against hosted worker?)"
+                        ),
+                        error_category="no_agent_module",
+                    )
+                    return
                 log.warning(
                     "failed   %s item=%s duration=%dms unknown-agent=%s version=%s",
                     short, lease.item_id, duration_ms, lease.agent, lease.agent_version,

@@ -30,7 +30,7 @@ class WorkerSubprocess:
     def __init__(
         self,
         *,
-        agent_module: Path,
+        agent_module: Path | None,
         dispatcher_url: str,
         store_path: str,
         counter_path: Path,
@@ -38,6 +38,7 @@ class WorkerSubprocess:
         api_key: str | None = None,
         bundle_url_base: str | None = None,
         env_overrides: dict[str, str] | None = None,
+        bootstrap: bool = False,
     ) -> None:
         self._counter_path = counter_path
         self._counter_path.write_text("0")
@@ -60,8 +61,6 @@ class WorkerSubprocess:
             sys.executable,
             "-m",
             "papayya.runtime",
-            "--agent-module",
-            str(agent_module),
             "--dispatcher",
             dispatcher_url,
             "--store",
@@ -71,6 +70,10 @@ class WorkerSubprocess:
             "--log-level",
             "INFO",
         ]
+        if agent_module is not None:
+            argv += ["--agent-module", str(agent_module)]
+        if bootstrap:
+            argv += ["--bootstrap"]
         if api_key is not None:
             argv += ["--api-key", api_key]
         if bundle_url_base is not None:

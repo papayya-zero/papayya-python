@@ -48,12 +48,13 @@ def worker_subprocess(tmp_path):
 
     def _spawn(
         *,
-        agent_module: Path,
+        agent_module: Path | None = None,
         dispatcher,
         store,
         api_key: str | None = None,
         bundle_url_base: str | None = None,
         env_overrides: dict[str, str] | None = None,
+        bootstrap: bool = False,
     ) -> WorkerSubprocess:
         counter = tmp_path / "import_counter"
         proc = WorkerSubprocess(
@@ -64,6 +65,7 @@ def worker_subprocess(tmp_path):
             api_key=api_key,
             bundle_url_base=bundle_url_base,
             env_overrides=env_overrides,
+            bootstrap=bootstrap,
         )
         procs.append(proc)
         return proc

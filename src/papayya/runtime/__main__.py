@@ -27,8 +27,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--agent-module",
-        required=True,
-        help="Absolute path to a .py file with @agent-decorated function(s).",
+        required=False,
+        default=None,
+        help=(
+            "Absolute path to a .py file with @agent-decorated function(s). "
+            "Required for local dev (`papayya dev`); omit when --bootstrap "
+            "or PAPAYYA_BOOTSTRAP=1 is set (hosted ECS workers load every "
+            "bundle on demand via lease.agent_version)."
+        ),
+    )
+    p.add_argument(
+        "--bootstrap",
+        action="store_true",
+        default=False,
+        help=(
+            "Hosted-worker mode: boot without --agent-module; the first "
+            "lease's agent_version triggers the first bundle fetch + "
+            "import. Mutually exclusive with --agent-module. Falls back "
+            "to PAPAYYA_BOOTSTRAP=1 when omitted."
+        ),
     )
     p.add_argument(
         "--dispatcher",
@@ -97,6 +114,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _truthy(s: str | None) -> bool:
+    """Parse env-var booleans the way the rest of the CLI does."""
+    if s is None:
+        return False
+    return s.strip().lower() in {"1", "true", "yes"}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(
@@ -107,10 +131,30 @@ def main(argv: list[str] | None = None) -> int:
     # task secret injection). Read here rather than via argparse default
     # so changes to the env between import and parse take effect.
     api_key = args.api_key or os.environ.get("PAPAYYA_API_KEY")
+
+    # Bootstrap mode: hosted workers boot without --agent-module and
+    # load every bundle on demand from the lease's agent_version
+    # (ADR-0003 § Worker #5). Mutually exclusive with --agent-module —
+    # validated manually because argparse's add_mutually_exclusive_group
+    # doesn't model "exactly one of (flag, env, flag)" cleanly.
+    bootstrap = args.bootstrap or _truthy(os.environ.get("PAPAYYA_BOOTSTRAP"))
+    if bootstrap and args.agent_module:
+        sys.stderr.write(
+            "papayya runtime: --bootstrap and --agent-module are "
+            "mutually exclusive\n"
+        )
+        return 2
+    if not bootstrap and not args.agent_module:
+        sys.stderr.write(
+            "papayya runtime: pass --agent-module FILE or --bootstrap "
+            "(or PAPAYYA_BOOTSTRAP=1)\n"
+        )
+        return 2
+
     worker = Worker(
         dispatcher_url=args.dispatcher,
         store_path=args.store,
-        agent_module_path=args.agent_module,
+        agent_module_path=None if bootstrap else args.agent_module,
         worker_id=args.worker_id,
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
