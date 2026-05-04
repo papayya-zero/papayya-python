@@ -53,7 +53,12 @@ from papayya import agent
 from papayya.durable import papayya
 
 
-@agent(name="enrich")
+# Explicit ``agent_version="1"`` makes registration deterministic under
+# slice 3's tuple-keyed registry. The worker also injects
+# ``PAPAYYA_AGENT_VERSION`` from the lease, so the env-driven path would
+# resolve to the same value — explicit decorator arg is just clearer
+# for readers of the test.
+@agent(name="enrich", agent_version="1")
 def enrich(item_id: str) -> dict:
     run = papayya().run("enrich", item_id=item_id)
     step = run.step("extract", lambda: {"id": item_id, "loaded_from": "bundle_v1"})

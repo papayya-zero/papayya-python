@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from papayya import agent
-from papayya.agent import AgentRegistration, get_registry
+from papayya.agent import AgentRegistration, get_agent
 
 
 def test_max_duration_defaults_to_none():
@@ -20,7 +20,7 @@ def test_max_duration_defaults_to_none():
     def fn(item_id: str) -> dict:
         return {"id": item_id}
 
-    reg = get_registry()["default_dur"]
+    reg = get_agent("default_dur")
     assert isinstance(reg, AgentRegistration)
     assert reg.max_duration_seconds is None
 
@@ -30,7 +30,7 @@ def test_max_duration_persists_on_registration():
     def fn(item_id: str) -> dict:
         return {"id": item_id}
 
-    reg = get_registry()["explicit_dur"]
+    reg = get_agent("explicit_dur")
     assert reg.max_duration_seconds == 12.5
 
 
@@ -58,4 +58,4 @@ def test_max_duration_fractional_seconds_accepted():
     def fn(item_id: str) -> None:
         pass
 
-    assert get_registry()["frac_dur"].max_duration_seconds == 0.25
+    assert get_agent("frac_dur").max_duration_seconds == 0.25

@@ -179,18 +179,52 @@ def _resolve_agent_version(explicit: str | None) -> tuple[str, str]:
     return _AGENT_VERSION_FALLBACK, "unknown"
 
 
-# Global registry, keyed by agent name (slug)
-_registry: dict[str, AgentRegistration] = {}
+# Global registry, keyed by ``(agent_name, agent_version)`` so a hosted
+# worker can hold v1 and v2 simultaneously and route each lease to the
+# matching registration (ADR-0003 § Worker #4). Local-dev parity is
+# preserved because ``get_agent(name)`` (no version) returns the
+# most-recently-registered entry — the same overwrite-by-import semantics
+# the slug-keyed dict gave pre-slice-3.
+#
+# Contract: ``@agent`` registration MUST happen at import time. The
+# multi-version routing relies on the registration being keyed by
+# ``(name, agent_version)`` *before* the worker resolves the lease;
+# deferred or runtime registration would break dispatch silently.
+_registry: dict[tuple[str, str], AgentRegistration] = {}
 
 
-def get_registry() -> dict[str, AgentRegistration]:
-    """Return the current module-level agent registry."""
+def get_registry() -> dict[tuple[str, str], AgentRegistration]:
+    """Return the current module-level agent registry, keyed by
+    ``(name, agent_version)``.
+
+    Callers that just want one registration per name should use
+    :func:`get_agent` instead — the tuple-keyed view is internal.
+    """
     return _registry
 
 
-def get_agent(name: str) -> AgentRegistration | None:
-    """Look up a registered agent by name."""
-    return _registry.get(name)
+def get_agent(name: str, version: str | None = None) -> AgentRegistration | None:
+    """Look up a registered agent by name and (optional) version.
+
+    ``version is None`` preserves the local-dev / single-resident
+    semantics: returns the most-recently-registered entry for ``name``
+    (insertion order in the dict, latest wins — same as the pre-slice-3
+    slug-keyed overwrite behaviour). ``papayya dev`` and tests that
+    register one agent per slug rely on this branch.
+
+    ``version is not None`` does the multi-version lookup. Used by
+    ``Worker._handle_lease`` so the dispatched fn matches the lease's
+    ``agent_version``.
+    """
+    if version is not None:
+        return _registry.get((name, version))
+    candidates = [reg for (n, _v), reg in _registry.items() if n == name]
+    if not candidates:
+        return None
+    # Latest insertion wins. Python dicts preserve insertion order
+    # (3.7+), so this matches the legacy "last @agent on the same name
+    # overwrites the previous" behaviour.
+    return candidates[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +338,14 @@ def agent(
             max_duration_seconds=max_duration_seconds,
             agent_version=resolved_version,
         )
-        _registry[name] = registration
-
         # Attach metadata so callers can inspect without the registry
         wrapper._papayya_agent = registration
+        # ADR-0003 § Worker #4 — keyed by (name, version) so a hosted
+        # worker can hold multiple versions of the same agent slug
+        # resident at once. Local-dev parity is preserved by
+        # ``get_agent(name, version=None)`` falling back to the
+        # latest-registered entry for ``name``.
+        _registry[(name, resolved_version)] = registration
         return wrapper
 
     return decorator

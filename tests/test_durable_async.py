@@ -498,6 +498,7 @@ from papayya.agent import (  # noqa: E402 — late import: keeps the file's top 
     _registry,
     agent as agent_decorator,
     consume_agent_input_snapshot,
+    get_agent,
 )
 
 
@@ -517,7 +518,8 @@ async def test_agent_async_wrapper_is_coroutine_function(_clean_agent_registry):
     async def fn(item_id: str) -> str:
         return f"hi-{item_id}"
 
-    registration = _registry["async-detect"]
+    registration = get_agent("async-detect")
+    assert registration is not None
     # Worker dispatch keys off this — must be True for the worker to
     # take the async branch in _invoke_with_timeout.
     assert inspect.iscoroutinefunction(registration.fn)
@@ -609,6 +611,7 @@ def test_agent_sync_path_unchanged(_clean_agent_registry):
     def fn(item_id: str) -> str:
         return item_id
 
-    registration = _registry["sync-regression"]
+    registration = get_agent("sync-regression")
+    assert registration is not None
     assert not inspect.iscoroutinefunction(registration.fn)
     assert fn("co_z") == "co_z"

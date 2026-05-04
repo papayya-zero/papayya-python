@@ -73,17 +73,20 @@ class Lease:
 class _LoadedBundle:
     """Tracking entry for a bundle the worker has already imported.
 
-    ADR-0003 § Worker #4 says the multi-version registry is keyed by
-    ``(agent_name, agent_version)``. Slice 2 ships single-resident
-    semantics (one entry per tuple, replaced on collision); slice 3
-    introduces real multi-resident dispatch. Storing the bundle path +
-    sys.modules name here lets slice 3 recycle/reload without
-    rediscovering them.
+    ADR-0003 § Worker #4 makes the multi-version registry keyed by
+    ``(agent_name, agent_version)`` so slice 3 holds multiple versions
+    resident. Storing the bundle path + sys.modules name lets a future
+    eviction path (Slice E) clean up without rediscovering them.
+
+    ``dep_hash`` carries forward from the bundle cache so
+    ``_ensure_loaded`` can detect dep-graph changes without re-reading
+    the on-disk sidecar on every miss (ADR-0003 § Worker #6).
     """
     agent_name: str
     agent_version: str
     bundle_path: str
     module_name: str
+    dep_hash: str | None = None
 
 
 class _VersionNotFound(Exception):
@@ -95,6 +98,25 @@ class _VersionNotFound(Exception):
     type so generic ``Exception`` handlers in ``_handle_lease`` route
     it through the categorised path rather than a stringified
     ``RuntimeError`` message.
+    """
+
+
+class _RecyclePending(Exception):
+    """A new bundle's dep-graph differs from the resident version's.
+
+    ``importlib.reload()`` is unreliable for transitively-imported
+    modules + new C extensions, so when a deploy ships a new
+    ``requirements.txt`` (or ``pyproject.toml``) the worker can't
+    safely import the new version in this process — it must recycle.
+
+    The triggering lease is failed with
+    ``error_category="recycle_pending"``; the dispatcher's lease TTL
+    re-dispatches it to a fresh worker that has no resident versions.
+    The current worker drains its main loop cleanly (``_running =
+    False``) and exits; the orchestrator's restart policy brings up a
+    new worker.
+
+    ADR-0003 § Worker #6, extends ADR-0002 #6.
     """
 
 
@@ -241,6 +263,15 @@ class Worker:
         self._drain_lock = threading.Lock()
         self._drain_thread: Optional[threading.Thread] = None
 
+        # Recycle-pending flag (ADR-0003 § Worker #6). Set when
+        # ``_ensure_loaded`` detects a different ``requirements.txt``
+        # hash between the resident version and a newly-fetched
+        # version of the same agent slug. The triggering lease is
+        # failed with ``error_category="recycle_pending"`` and the
+        # main loop exits cleanly so the orchestrator brings up a
+        # fresh process.
+        self._recycle_pending: bool = False
+
         # Point the customer's papayya() client at our shared SQLite. Must be
         # set BEFORE importing the agent module — the customer code may
         # call `papayya()` at module top-level (rare but legal).
@@ -328,6 +359,44 @@ class Worker:
             fetch=lambda: self._fetch_bundle(lease.agent, version_int),
         )
 
+        # ADR-0003 § Worker #6 — if a *different* version of this
+        # agent slug is already resident with a *different* dep-hash,
+        # the new version's pip deps can't be loaded safely into this
+        # process. Mark recycle pending and bail; the lease will be
+        # failed with ``error_category="recycle_pending"`` and the
+        # main loop will exit cleanly so the orchestrator brings up
+        # a fresh worker. ``None`` on either side (no manifest in the
+        # bundle) means we can't tell deps apart, so we proceed —
+        # explicit absence is treated as "no dep change."
+        prior = next(
+            (
+                lb
+                for (slug, _v), lb in self._loaded_versions.items()
+                if slug == lease.agent and _v != lease.agent_version
+            ),
+            None,
+        )
+        if (
+            prior is not None
+            and prior.dep_hash is not None
+            and bundle.dep_hash is not None
+            and prior.dep_hash != bundle.dep_hash
+        ):
+            self._recycle_pending = True
+            self._running = False
+            log.warning(
+                "scheduling recycle: agent=%s prior=v%s new=v%s dep-hash differs (%s != %s)",
+                lease.agent,
+                prior.agent_version,
+                lease.agent_version,
+                prior.dep_hash[:12],
+                bundle.dep_hash[:12],
+            )
+            raise _RecyclePending(
+                f"agent {lease.agent} dep-hash differs between v{prior.agent_version} "
+                f"and v{lease.agent_version}; recycling worker for fresh pip env"
+            )
+
         module_name = self._import_bundle_module(
             bundle_path=Path(bundle.path),
             entrypoint=bundle.entrypoint or "agent.py",
@@ -339,6 +408,7 @@ class Worker:
             agent_version=lease.agent_version,
             bundle_path=str(bundle.path),
             module_name=module_name,
+            dep_hash=bundle.dep_hash,
         )
 
     @staticmethod
@@ -429,17 +499,20 @@ class Worker:
                 f"bundle for {agent_name}@{agent_version} missing entrypoint {entrypoint!r}"
             )
 
-        # Make the bundle root importable so the entrypoint can do
-        # relative imports of sibling files (the customer's project
-        # layout — ``from helpers import ...`` etc.).
-        bundle_root_str = str(bundle_path.resolve())
-        if bundle_root_str not in sys.path:
-            sys.path.insert(0, bundle_root_str)
+        # ADR-0003 § Worker #4 — register the bundle root with the
+        # per-version MetaPathFinder instead of mutating ``sys.path``.
+        # The finder, scoped via ``activate(version)`` below, intercepts
+        # top-level imports made *during* the bundle's execution so two
+        # versions' ``helpers.py`` siblings don't collide in
+        # ``sys.modules``.
+        from papayya.runtime import _bundle_loader
+
+        _bundle_loader.register_bundle(agent_version, bundle_path)
 
         module_name = f"_papayya_user_{entry_path.stem}__v{agent_version}"
         if module_name in sys.modules:
             log.warning(
-                "module name %s already in sys.modules — overwriting (slice 3 will namespace per-version)",
+                "module name %s already in sys.modules — overwriting",
                 module_name,
             )
 
@@ -448,7 +521,32 @@ class Worker:
             raise RuntimeError(f"cannot build module spec for: {entry_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        # Pin ``PAPAYYA_AGENT_VERSION`` for the duration of the bundle's
+        # exec so the customer's ``@agent`` decorator (which resolves
+        # version via decorator-arg → env → git → "unknown") stamps the
+        # registration with the lease's version. The env-cache is
+        # cleared before AND after so the resolution actually re-runs
+        # against this scoped value, and we don't poison subsequent
+        # imports with a cached "v1" after we've moved on.
+        # ADR-0003 § Worker #4.
+        from papayya.agent import _clear_agent_version_cache
+
+        prior_env = os.environ.get("PAPAYYA_AGENT_VERSION")
+        os.environ["PAPAYYA_AGENT_VERSION"] = agent_version
+        _clear_agent_version_cache()
+        try:
+            # ``activate`` wires top-level imports made during
+            # exec_module (e.g., the entrypoint's ``from helpers
+            # import ...``) to this version's bundle root, so two
+            # bundles' sibling files don't collide in sys.modules.
+            with _bundle_loader.activate(agent_version):
+                spec.loader.exec_module(module)
+        finally:
+            if prior_env is None:
+                os.environ.pop("PAPAYYA_AGENT_VERSION", None)
+            else:
+                os.environ["PAPAYYA_AGENT_VERSION"] = prior_env
+            _clear_agent_version_cache()
         log.info(
             "loaded bundle %s@%s from %s (module=%s)",
             agent_name, agent_version, entry_path, module_name,
@@ -673,18 +771,40 @@ class Worker:
                     error_category="version_not_found",
                 )
                 return
-
-            registration = get_agent(lease.agent)
-            if registration is None:
+            except _RecyclePending as exc:
+                # ADR-0003 § Worker #6 — fail this lease with a
+                # categorised error so the dispatcher's lease-TTL
+                # path can re-dispatch it; main loop exits via the
+                # ``_running = False`` set inside ``_ensure_loaded``.
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 log.warning(
-                    "failed   %s item=%s duration=%dms unknown-agent=%s",
-                    short, lease.item_id, duration_ms, lease.agent,
+                    "failed   %s item=%s duration=%dms category=recycle_pending %s",
+                    short, lease.item_id, duration_ms, exc,
                 )
                 self._report_complete(
                     lease.lease_id,
                     status="failed",
-                    error=f"unknown agent: {lease.agent}",
+                    error=str(exc),
+                    error_category="recycle_pending",
+                )
+                return
+
+            # ADR-0003 § Worker #4 — dispatch to the registration that
+            # matches the lease's version. ``lease.agent_version is
+            # None`` (LocalDispatcher) preserves single-resident
+            # behaviour: ``get_agent`` returns the latest-registered
+            # entry for the slug.
+            registration = get_agent(lease.agent, lease.agent_version)
+            if registration is None:
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                log.warning(
+                    "failed   %s item=%s duration=%dms unknown-agent=%s version=%s",
+                    short, lease.item_id, duration_ms, lease.agent, lease.agent_version,
+                )
+                self._report_complete(
+                    lease.lease_id,
+                    status="failed",
+                    error=f"unknown agent: {lease.agent} (version={lease.agent_version})",
                 )
                 return
 
@@ -747,13 +867,22 @@ class Worker:
             )
             return
 
+        # Late import: keep the worker boot path free of the bundle
+        # loader's importlib pull-in cost when no bundles are involved.
+        from papayya.runtime import _bundle_loader
+
         prior_handler = None
         watchdog_armed = max_duration is not None and max_duration > 0
         if watchdog_armed:
             prior_handler = signal.signal(signal.SIGALRM, _on_agent_alarm)
             signal.setitimer(signal.ITIMER_REAL, max_duration)
         try:
-            fn(lease.item_id)
+            # Activate the version's bundle finder so function-body
+            # imports (``def fn(): from helpers import x``) resolve
+            # against the right version's siblings. ``None`` is a
+            # no-op so local-dev / LocalDispatcher leases pay nothing.
+            with _bundle_loader.activate(lease.agent_version):
+                fn(lease.item_id)
         except _AgentTimeout:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
@@ -830,12 +959,19 @@ class Worker:
             recover via TTL.
           - Any other ``Exception``: existing stringified-error path.
         """
+        from papayya.runtime import _bundle_loader
+
         coro = fn(lease.item_id)
         try:
-            if max_duration is not None and max_duration > 0:
-                asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
-            else:
-                asyncio.run(coro)
+            # Same activate-scope rationale as the sync path; mirrored
+            # here because ``asyncio.run`` runs the coroutine on a new
+            # loop and we want imports inside it to see the right
+            # version's siblings.
+            with _bundle_loader.activate(lease.agent_version):
+                if max_duration is not None and max_duration > 0:
+                    asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
+                else:
+                    asyncio.run(coro)
         except asyncio.TimeoutError:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(

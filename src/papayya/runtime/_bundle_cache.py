@@ -78,6 +78,15 @@ class BundleEntry:
     headers of the original fetch when available; on a hot-path hit
     (no fetch), they are read from the entrypoint sidecar and may be
     None until slice 3 starts persisting them.
+
+    ``dep_hash`` is the SHA256 of the bundle's ``requirements.txt``
+    (or ``pyproject.toml`` if the former is absent) computed at
+    extract time and persisted in ``.papayya_dep_hash``. The worker
+    uses it to decide whether a new version's pip dependency graph
+    differs from the resident version's — if so, it self-recycles
+    rather than trying to ``importlib.reload`` (ADR-0003 § Worker #6,
+    extends ADR-0002 #6). ``None`` when neither dep file is present
+    in the bundle, in which case recycle is skipped.
     """
     path: Path
     agent_slug: str
@@ -87,6 +96,7 @@ class BundleEntry:
     agent_id: str | None = None
     deployment_id: str | None = None
     artifact_hash: str | None = None
+    dep_hash: str | None = None
 
 
 class BundleVerificationError(RuntimeError):
@@ -205,6 +215,14 @@ def ensure_bundle(
             # have no way to recover the entrypoint name.
             if fetched.entrypoint:
                 write_entrypoint_sidecar(partial, fetched.entrypoint)
+            # ADR-0003 § Worker #6 — compute the bundle's dep-list hash
+            # and persist a sidecar so the worker can detect dep-graph
+            # changes across deploys without re-extracting. ``None``
+            # (neither requirements.txt nor pyproject.toml present)
+            # means recycle is skipped on subsequent loads.
+            dep_hash = _compute_dep_hash(partial)
+            if dep_hash is not None:
+                _write_dep_hash_sidecar(partial, dep_hash)
             # Atomic rename. If a concurrent writer somehow won this
             # race despite the lock (e.g., NFS-style lock failure), the
             # rename will fail with EEXIST or ENOTEMPTY; drop our partial
@@ -229,6 +247,7 @@ def ensure_bundle(
         agent_id=fetched.agent_id,
         deployment_id=fetched.deployment_id,
         artifact_hash=fetched.artifact_hash,
+        dep_hash_override=dep_hash,
     )
 
 
@@ -245,6 +264,7 @@ def _entry_from_disk(
     agent_id: str | None = None,
     deployment_id: str | None = None,
     artifact_hash: str | None = None,
+    dep_hash_override: str | None = None,
 ) -> BundleEntry:
     """Build a BundleEntry pointing at an already-extracted bundle.
 
@@ -253,12 +273,22 @@ def _entry_from_disk(
     reconstruct the entry without the response-header context that
     triggered the original fetch. Falls back to ``entrypoint_override``
     when called from the freshly-fetched path.
+
+    Slice 3 adds the same pattern for the dep-hash sidecar
+    (``.papayya_dep_hash``), so a hot-path hit can compare the
+    resident bundle's dep graph against a newly-fetched one without
+    re-hashing.
     """
     entrypoint = entrypoint_override
     if entrypoint is None:
         sidecar = final_path / ".papayya_entrypoint"
         if sidecar.exists():
             entrypoint = sidecar.read_text(encoding="utf-8").strip()
+    dep_hash = dep_hash_override
+    if dep_hash is None:
+        dep_sidecar = final_path / ".papayya_dep_hash"
+        if dep_sidecar.exists():
+            dep_hash = dep_sidecar.read_text(encoding="utf-8").strip() or None
     return BundleEntry(
         path=final_path,
         agent_slug=agent_slug,
@@ -268,6 +298,7 @@ def _entry_from_disk(
         agent_id=agent_id,
         deployment_id=deployment_id,
         artifact_hash=artifact_hash,
+        dep_hash=dep_hash,
     )
 
 
@@ -345,6 +376,38 @@ class _file_lock:
             finally:
                 os.close(self._fd)
                 self._fd = None
+
+
+def _compute_dep_hash(bundle_path: Path) -> str | None:
+    """SHA256 of the bundle's pip-dep manifest, or None if absent.
+
+    Prefers ``requirements.txt`` (still the dominant manifest in the
+    Python world); falls back to ``pyproject.toml`` so projects that
+    only declare deps via PEP 621 / Poetry still get recycle behaviour.
+    Both files are tiny so a single read+hash is fine.
+
+    The hash is over the *raw bytes* of the file. Re-ordering lines or
+    whitespace edits to ``requirements.txt`` will trigger a recycle
+    even if the resolved package set is unchanged — accepted false
+    positive. The alternative (parsing + canonicalising) bakes in
+    pip-resolver semantics we don't want to track.
+    """
+    for candidate in ("requirements.txt", "pyproject.toml"):
+        path = bundle_path / candidate
+        if path.is_file():
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+    return None
+
+
+def _write_dep_hash_sidecar(bundle_path: Path, dep_hash: str) -> None:
+    """Persist the dep-list hash beside the entrypoint sidecar.
+
+    Called from ``ensure_bundle`` right before the atomic rename so
+    the file rides into the final tree atomically with the rest of
+    the bundle. Worker hot-path hits read this back via
+    ``_entry_from_disk`` to populate ``BundleEntry.dep_hash``.
+    """
+    (bundle_path / ".papayya_dep_hash").write_text(dep_hash, encoding="utf-8")
 
 
 def write_entrypoint_sidecar(bundle_path: Path, entrypoint: str) -> None:
