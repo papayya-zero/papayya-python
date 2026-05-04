@@ -69,6 +69,35 @@ class Lease:
     agent_version: str | None = None
 
 
+@dataclass
+class _LoadedBundle:
+    """Tracking entry for a bundle the worker has already imported.
+
+    ADR-0003 § Worker #4 says the multi-version registry is keyed by
+    ``(agent_name, agent_version)``. Slice 2 ships single-resident
+    semantics (one entry per tuple, replaced on collision); slice 3
+    introduces real multi-resident dispatch. Storing the bundle path +
+    sys.modules name here lets slice 3 recycle/reload without
+    rediscovering them.
+    """
+    agent_name: str
+    agent_version: str
+    bundle_path: str
+    module_name: str
+
+
+class _VersionNotFound(Exception):
+    """Bundle endpoint returned 404 for the lease's agent_version.
+
+    Worker maps this to ``_report_complete(status="failed",
+    error_category="version_not_found")`` so the dispatcher's
+    idempotent-complete + lease TTL can clean up. Distinct exception
+    type so generic ``Exception`` handlers in ``_handle_lease`` route
+    it through the categorised path rather than a stringified
+    ``RuntimeError`` message.
+    """
+
+
 class _AgentTimeout(BaseException):
     """Raised by the SIGALRM handler when an agent fn exceeds its
     ``max_duration_seconds`` budget.
@@ -156,6 +185,7 @@ class Worker:
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
         api_key: Optional[str] = None,
+        bundle_url_base: Optional[str] = None,
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
@@ -168,6 +198,20 @@ class Worker:
         # requires a project-scoped key — JWT Bearer tokens are rejected
         # for runtime endpoints. None = no header (LocalDispatcher accepts).
         self._api_key = api_key
+        # Base URL of the bundle download endpoint (ADR-0003 § 7).
+        # Hosted: ``https://api.papayya.com/v1/runtime/bundles``. Local
+        # dev: ``LocalDispatcher`` doesn't host this route, so the field
+        # is unused — only consulted when a lease arrives carrying
+        # ``agent_version`` (which LocalDispatcher never sets). Tests
+        # that exercise the fetch path point this at their own fake
+        # bundle server.
+        self._bundle_url_base = (bundle_url_base or f"{self.dispatcher_url}/v1/runtime/bundles").rstrip("/")
+        # Per-(agent_name, agent_version) cache of bundle entries the
+        # worker has already loaded into the registry. Slice 2 guarantees
+        # at most one resident entry per (name, version) tuple — multi-
+        # version dispatch is slice 3. Hot-path lookup avoids re-reading
+        # the on-disk cache and re-importing the module on every lease.
+        self._loaded_versions: dict[tuple[str, str], "_LoadedBundle"] = {}
         self._running = True
         now = time.monotonic()
         self._last_activity_at = now
@@ -240,6 +284,176 @@ class Worker:
         spec.loader.exec_module(module)
 
         log.info("imported agent module: %s", p)
+
+    # --- versioned bundle loading (ADR-0003 § Worker #2/#3) ----------- #
+
+    def _ensure_loaded(self, lease: "Lease") -> None:
+        """Make sure the lease's ``(agent, agent_version)`` is importable.
+
+        Called from ``_handle_lease`` *before* ``get_agent(lease.agent)``.
+        Three cases:
+
+        1. ``lease.agent_version is None`` — local-dev / legacy. The
+           file-loaded module from ``--agent-module`` already populated
+           the registry; no-op.
+        2. ``(agent, agent_version)`` already in ``self._loaded_versions``
+           — hot path. The earlier import already registered the
+           ``@agent``; no-op.
+        3. Cache miss. Fetch the tarball from the bundle endpoint,
+           extract under the on-disk cache, build a ``ModuleSpec`` from
+           the entrypoint, ``exec_module`` it (the ``@agent`` decorator
+           re-registers under the agent's slug), record the bundle in
+           ``self._loaded_versions``.
+
+        Raises ``_VersionNotFound`` on 404 from the bundle endpoint;
+        ``_handle_lease`` maps that to a categorised failure. Network /
+        verification errors bubble — the lease TTL is the safety net.
+        """
+        if lease.agent_version is None:
+            return
+
+        key = (lease.agent, lease.agent_version)
+        if key in self._loaded_versions:
+            return
+
+        # Late import to keep the hot path (no agent_version) free of the
+        # bundle-cache module's tarfile/fcntl pull-in cost. Worker boot
+        # is unaffected; only the first hosted lease pays it.
+        from papayya.runtime import _bundle_cache
+
+        version_int = self._parse_version(lease.agent_version)
+        bundle = _bundle_cache.ensure_bundle(
+            agent_slug=lease.agent,
+            version=version_int,
+            fetch=lambda: self._fetch_bundle(lease.agent, version_int),
+        )
+
+        module_name = self._import_bundle_module(
+            bundle_path=Path(bundle.path),
+            entrypoint=bundle.entrypoint or "agent.py",
+            agent_name=lease.agent,
+            agent_version=lease.agent_version,
+        )
+        self._loaded_versions[key] = _LoadedBundle(
+            agent_name=lease.agent,
+            agent_version=lease.agent_version,
+            bundle_path=str(bundle.path),
+            module_name=module_name,
+        )
+
+    @staticmethod
+    def _parse_version(version: str) -> int:
+        """Parse the wire ``agent_version`` into the int the bundle endpoint expects.
+
+        Accepts ``"3"`` and ``"v3"`` symmetrically with the control-pane
+        handler, which strips a leading ``v`` before atoi.
+        """
+        cleaned = version.lstrip("v") if version.startswith("v") else version
+        try:
+            n = int(cleaned)
+        except ValueError as exc:
+            raise _VersionNotFound(
+                f"agent_version {version!r} is not parseable as an integer"
+            ) from exc
+        if n < 1:
+            raise _VersionNotFound(
+                f"agent_version {version!r} must be a positive integer"
+            )
+        return n
+
+    def _fetch_bundle(self, agent: str, version: int) -> Any:
+        """HTTP GET the bundle endpoint and adapt to ``FetchedBundle``.
+
+        Stored as a closure so ``ensure_bundle``'s lazy-fetch contract
+        works: zero-arg callable, only invoked on cache miss. Response
+        headers — entrypoint, account_id, agent_id, deployment_id, ETag
+        — ride along on the ``FetchedBundle`` so ``ensure_bundle`` can
+        annotate the resulting cache entry without a second round-trip.
+        """
+        from papayya.runtime._bundle_cache import FetchedBundle
+
+        url = f"{self._bundle_url_base}?agent={agent}&version={version}"
+        req = urllib_request.Request(url, headers=self._auth_headers())
+        try:
+            resp = urllib_request.urlopen(req, timeout=30.0)
+        except urllib_error.HTTPError as exc:
+            if exc.code == 404:
+                raise _VersionNotFound(
+                    f"bundle endpoint returned 404 for agent={agent} version={version}"
+                ) from exc
+            raise
+
+        with resp:
+            body = resp.read()
+            account_id = resp.headers.get("X-Papayya-Account-Id")
+            agent_id = resp.headers.get("X-Papayya-Agent-Id")
+            entrypoint = resp.headers.get("X-Papayya-Entrypoint") or "agent.py"
+            deployment_id = resp.headers.get("X-Papayya-Deployment-Id")
+            etag = resp.headers.get("ETag")
+            artifact_hash = etag.strip('"') if etag else None
+
+        return FetchedBundle(
+            tarball_bytes=body,
+            entrypoint=entrypoint,
+            artifact_hash=artifact_hash,
+            account_id=account_id,
+            agent_id=agent_id,
+            deployment_id=deployment_id,
+        )
+
+    def _import_bundle_module(
+        self,
+        *,
+        bundle_path: Path,
+        entrypoint: str,
+        agent_name: str,
+        agent_version: str,
+    ) -> str:
+        """exec_module the bundle's entrypoint; return the sys.modules key.
+
+        The entrypoint is interpreted relative to ``bundle_path`` (the
+        extracted tarball root). We use ``importlib.util`` to keep the
+        loader path-aware, and we register sys.modules under a name
+        suffixed with the agent_version so a future multi-version
+        registry (slice 3) can keep both modules resident.
+
+        Module identity collision is the slice-2 risk the hand-off
+        flagged: two bundles sharing entrypoint stems will produce
+        identical ``_papayya_user_<stem>`` keys without the version
+        suffix. Slice 2 namespaces the suffix so the warning fires only
+        when an actual collision happens.
+        """
+        entry_path = (bundle_path / entrypoint).resolve()
+        if not entry_path.exists():
+            raise _VersionNotFound(
+                f"bundle for {agent_name}@{agent_version} missing entrypoint {entrypoint!r}"
+            )
+
+        # Make the bundle root importable so the entrypoint can do
+        # relative imports of sibling files (the customer's project
+        # layout — ``from helpers import ...`` etc.).
+        bundle_root_str = str(bundle_path.resolve())
+        if bundle_root_str not in sys.path:
+            sys.path.insert(0, bundle_root_str)
+
+        module_name = f"_papayya_user_{entry_path.stem}__v{agent_version}"
+        if module_name in sys.modules:
+            log.warning(
+                "module name %s already in sys.modules — overwriting (slice 3 will namespace per-version)",
+                module_name,
+            )
+
+        spec = importlib.util.spec_from_file_location(module_name, entry_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot build module spec for: {entry_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        log.info(
+            "loaded bundle %s@%s from %s (module=%s)",
+            agent_name, agent_version, entry_path, module_name,
+        )
+        return module_name
 
     # --- main loop ----------------------------------------------------- #
 
@@ -441,6 +655,25 @@ class Worker:
         with self._hb_lock:
             self._in_flight_lease = lease
         try:
+            # ADR-0003 § Worker #3 — make sure the lease's agent_version
+            # is loaded before resolving the registration. No-op when
+            # agent_version is None (local-dev parity).
+            try:
+                self._ensure_loaded(lease)
+            except _VersionNotFound as exc:
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                log.warning(
+                    "failed   %s item=%s duration=%dms category=version_not_found %s",
+                    short, lease.item_id, duration_ms, exc,
+                )
+                self._report_complete(
+                    lease.lease_id,
+                    status="failed",
+                    error=str(exc),
+                    error_category="version_not_found",
+                )
+                return
+
             registration = get_agent(lease.agent)
             if registration is None:
                 duration_ms = int((time.monotonic() - started_at) * 1000)

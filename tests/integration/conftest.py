@@ -52,6 +52,8 @@ def worker_subprocess(tmp_path):
         dispatcher,
         store,
         api_key: str | None = None,
+        bundle_url_base: str | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> WorkerSubprocess:
         counter = tmp_path / "import_counter"
         proc = WorkerSubprocess(
@@ -60,6 +62,8 @@ def worker_subprocess(tmp_path):
             store_path=store.db_path,
             counter_path=counter,
             api_key=api_key,
+            bundle_url_base=bundle_url_base,
+            env_overrides=env_overrides,
         )
         procs.append(proc)
         return proc

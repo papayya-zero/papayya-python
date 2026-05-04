@@ -80,6 +80,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "optional for the local dispatcher."
         ),
     )
+    p.add_argument(
+        "--bundle-url-base",
+        default=None,
+        help=(
+            "Base URL of the deployment-bundle download endpoint "
+            "(ADR-0003 § 7). Defaults to "
+            "<dispatcher>/v1/runtime/bundles. Local-dev workers don't "
+            "need this — LocalDispatcher never sets agent_version on "
+            "leases, so _ensure_loaded short-circuits before any "
+            "fetch happens. Hosted ECS workers will rely on the "
+            "default; the flag exists primarily for integration tests "
+            "that point at a fake bundle server."
+        ),
+    )
     return p
 
 
@@ -101,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
         api_key=api_key,
+        bundle_url_base=args.bundle_url_base,
     )
     worker.run()
     return 0

@@ -36,6 +36,8 @@ class WorkerSubprocess:
         counter_path: Path,
         worker_id: str = "test-worker-1",
         api_key: str | None = None,
+        bundle_url_base: str | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> None:
         self._counter_path = counter_path
         self._counter_path.write_text("0")
@@ -71,6 +73,10 @@ class WorkerSubprocess:
         ]
         if api_key is not None:
             argv += ["--api-key", api_key]
+        if bundle_url_base is not None:
+            argv += ["--bundle-url-base", bundle_url_base]
+        if env_overrides:
+            env.update(env_overrides)
 
         self._proc = subprocess.Popen(
             argv,

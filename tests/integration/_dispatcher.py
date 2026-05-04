@@ -22,3 +22,19 @@ class FakeDispatcher(LocalDispatcher):
 
     def __init__(self, *, expected_api_key: str | None = None) -> None:
         super().__init__(host="127.0.0.1", port=0, expected_api_key=expected_api_key)
+
+    def failed_completions(self) -> list[dict]:
+        """Return the full ``_completed`` records for terminal failures.
+
+        ``LocalDispatcher.failed()`` returns ``(lease_id, error_msg)``
+        pairs only; tests need ``error_category`` and friends to assert
+        on categorised paths (slice 2 introduces
+        ``error_category="version_not_found"``). Snapshot under the lock
+        so the caller doesn't see torn rows.
+        """
+        with self._lock:  # type: ignore[attr-defined]
+            return [
+                dict(record, lease_id=lease_id)
+                for lease_id, record in self._completed.items()  # type: ignore[attr-defined]
+                if record.get("status") != "completed"
+            ]
