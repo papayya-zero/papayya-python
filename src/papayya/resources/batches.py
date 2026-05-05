@@ -245,14 +245,18 @@ class Batches:
         poll_interval: float = 2,
         include_failed: bool = False,
     ) -> Iterator[dict[str, Any]]:
-        """Yield child runs as they reach terminal status.
+        """Live-tail child runs as they reach terminal status (polling).
+
+        Prefer :meth:`results` for after-the-fact bulk export — it consumes
+        the server-streamed ``GET /v1/batches/{id}/results`` endpoint in
+        one round-trip instead of paging ``/runs?status=...&page=N&limit=200``
+        repeatedly. ``stream_results`` is kept for the live-tail use case
+        (yield rows as they go terminal on a still-running batch) where
+        polling is the right shape.
 
         Polls ``GET /v1/batches/{id}/runs?status=completed`` (and failed,
         if requested) and yields each newly-terminal run once. Generator
         exits when the parent batch itself reaches terminal status.
-
-        Will be rewired to the SSE endpoint when Phase 4b ships — the
-        public signature is designed to stay stable across that swap.
         """
         seen: set[str] = set()
         terminal_run_statuses = ["completed"]

@@ -47,6 +47,9 @@ class _FakeBatches:
         self.cancel_return: dict[str, Any] = {"id": "batch-xyz", "status": "cancelled"}
         self.retry_failed_return: dict[str, Any] = {"id": "batch-xyz", "total_items": 12}
         self.stream_results_items: list[dict[str, Any]] = []
+        # Used by the rewired `batch results` CLI command (NDJSON server stream).
+        self.results_items: list[dict[str, Any]] = []
+        self.wait_return: dict[str, Any] = {"id": "batch-xyz", "status": "completed"}
         self.raise_on: str | None = None
 
     def _maybe_raise(self, method: str) -> None:
@@ -92,6 +95,21 @@ class _FakeBatches:
         )
         self._maybe_raise("stream_results")
         yield from self.stream_results_items
+
+    def wait(self, batch_id: str, *, timeout: float = 3600, poll_interval: float = 5.0) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "wait",
+                {"batch_id": batch_id, "timeout": timeout, "poll_interval": poll_interval},
+            )
+        )
+        self._maybe_raise("wait")
+        return self.wait_return
+
+    def results(self, batch_id: str):
+        self.calls.append(("results", {"batch_id": batch_id}))
+        self._maybe_raise("results")
+        yield from self.results_items
 
 
 class _FakeClient:
@@ -257,7 +275,9 @@ def test_status_handles_no_budget_cap(fake_client: _FakeClient) -> None:
 def test_results_writes_jsonl_file(
     fake_client: _FakeClient, tmp_path: Path
 ) -> None:
-    fake_client.batches.stream_results_items = [
+    """CLI: wait until batch terminal, then dump every completed child via
+    the new server-streamed /results endpoint into a JSONL file."""
+    fake_client.batches.results_items = [
         {"id": "run-1", "status": "completed"},
         {"id": "run-2", "status": "completed"},
     ]
@@ -269,10 +289,11 @@ def test_results_writes_jsonl_file(
     ])
     assert result.exit_code == 0, result.output
 
-    call = [c for c in fake_client.batches.calls if c[0] == "stream_results"][0]
-    assert call[1]["batch_id"] == "batch-xyz"
-    assert call[1]["include_failed"] is False
-    assert call[1]["poll_interval"] == 0.01
+    methods = [c[0] for c in fake_client.batches.calls]
+    assert methods == ["wait", "results"]
+    wait_call = fake_client.batches.calls[0][1]
+    assert wait_call["batch_id"] == "batch-xyz"
+    assert wait_call["poll_interval"] == 0.01
 
     lines = out.read_text().splitlines()
     assert [json.loads(x) for x in lines] == [
@@ -285,24 +306,45 @@ def test_results_writes_jsonl_file(
 def test_results_streams_to_stdout_without_output_flag(
     fake_client: _FakeClient,
 ) -> None:
-    fake_client.batches.stream_results_items = [
-        {"id": "run-1"},
+    fake_client.batches.results_items = [
+        {"id": "run-1", "status": "completed"},
     ]
     result = _run(["batch", "results", "batch-xyz", "--poll-interval", "0.01"])
     assert result.exit_code == 0
     # The CLI streams JSON to stdout; no trailing summary in the non-file path.
-    assert '{"id": "run-1"}' in result.output
+    assert '"id": "run-1"' in result.output
     assert "Wrote" not in result.output
 
 
-def test_results_include_failed_flag_forwards(fake_client: _FakeClient) -> None:
+def test_results_include_failed_flag_filters_client_side(
+    fake_client: _FakeClient,
+) -> None:
+    """The /results endpoint streams ALL terminal children (completed,
+    failed, cancelled, budget_exceeded). The --include-failed flag is now
+    a client-side filter: default = completed only, flag set = pass through."""
+    fake_client.batches.results_items = [
+        {"id": "ok", "status": "completed"},
+        {"id": "bad", "status": "failed"},
+        {"id": "cnx", "status": "cancelled"},
+    ]
+
+    # Default: failed/cancelled rows are dropped.
+    result = _run(["batch", "results", "batch-xyz", "--poll-interval", "0.01"])
+    assert result.exit_code == 0
+    assert '"id": "ok"' in result.output
+    assert '"id": "bad"' not in result.output
+    assert '"id": "cnx"' not in result.output
+
+    # With --include-failed, every terminal row passes through.
+    fake_client.batches.calls.clear()
     result = _run([
         "batch", "results", "batch-xyz",
         "--include-failed", "--poll-interval", "0.01",
     ])
     assert result.exit_code == 0
-    call = [c for c in fake_client.batches.calls if c[0] == "stream_results"][0]
-    assert call[1]["include_failed"] is True
+    assert '"id": "ok"' in result.output
+    assert '"id": "bad"' in result.output
+    assert '"id": "cnx"' in result.output
 
 
 # ---------------------------------------------------------------------------

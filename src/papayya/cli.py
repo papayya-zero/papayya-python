@@ -1761,8 +1761,8 @@ def batch_status(ctx: click.Context, batch_id: str) -> None:
 @batch.command("results")
 @click.argument("batch_id")
 @click.option("-o", "--output", "output_path", default=None, help="Output JSONL path (default: stdout)")
-@click.option("--include-failed", is_flag=True, default=False, help="Also stream failed/cancelled/budget_exceeded runs")
-@click.option("--poll-interval", type=float, default=2.0, help="Polling cadence in seconds")
+@click.option("--include-failed", is_flag=True, default=False, help="Also include failed/cancelled/budget_exceeded runs (default: completed only)")
+@click.option("--poll-interval", type=float, default=2.0, help="How often to poll batch status while waiting for terminal (seconds)")
 @click.pass_context
 def batch_results(
     ctx: click.Context,
@@ -1773,9 +1773,10 @@ def batch_results(
 ) -> None:
     """Stream completed child runs of a batch as JSON lines.
 
-    Blocks until the batch reaches a terminal status. Writes one JSON
-    object per line, containing the raw run record as returned by
-    ``GET /v1/batches/{id}/runs``.
+    Blocks until the batch reaches a terminal status, then streams every
+    terminal child in one server-side response (NDJSON over
+    ``GET /v1/batches/{id}/results``). One round-trip instead of the
+    paged polling earlier versions did — fast even on 10k-item batches.
     """
     client = _make_papayya_client(ctx)
 
@@ -1791,11 +1792,12 @@ def batch_results(
 
     count = 0
     try:
-        for run in client.batches.stream_results(
-            batch_id,
-            poll_interval=poll_interval,
-            include_failed=include_failed,
-        ):
+        # Preserve the historical "block until done, then dump" behaviour
+        # by waiting on batch status before opening the bulk stream.
+        client.batches.wait(batch_id, poll_interval=poll_interval)
+        for run in client.batches.results(batch_id):
+            if not include_failed and run.get("status") != "completed":
+                continue
             sink.write(json.dumps(run) + "\n")
             sink.flush()
             count += 1
