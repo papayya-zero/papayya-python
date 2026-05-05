@@ -242,3 +242,69 @@ def test_error_response_raises_papayya_api_error() -> None:
     with pytest.raises(PapayyaAPIError) as exc:
         batches.get("b")
     assert exc.value.status == 403
+
+
+# ── results() — server-streamed NDJSON export ─────────────────────────────
+
+
+def test_results_streams_ndjson_lines_in_order() -> None:
+    """Server emits one JSON object per line; results() yields them as
+    parsed dicts in arrival order."""
+    captured: dict[str, Any] = {}
+    payload_lines = [
+        {"id": "r-completed", "status": "completed", "output": "ok"},
+        {"id": "r-failed", "status": "failed", "error_code": "rate_limited"},
+        {"id": "r-cancelled", "status": "cancelled"},
+    ]
+    body = "\n".join(__import__("json").dumps(row) for row in payload_lines) + "\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/x-ndjson",
+                "X-Batch-Status": "terminal",
+            },
+            content=body.encode("utf-8"),
+        )
+
+    batches, _ = _make_batches(handler)
+    rows = list(batches.results("batch-x"))
+
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/v1/batches/batch-x/results"
+    assert rows == payload_lines
+
+
+def test_results_raises_before_yielding_on_non_200() -> None:
+    """A 404 from the server should raise PapayyaAPIError on the first
+    call to ``next()``, before any rows are yielded — caller should never
+    see a half-streamed response disguised as an empty iterator."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="batch not found")
+
+    batches, _ = _make_batches(handler)
+    iterator = batches.results("missing")
+    with pytest.raises(PapayyaAPIError) as exc:
+        next(iterator)
+    assert exc.value.status == 404
+
+
+def test_results_empty_body_yields_nothing() -> None:
+    """A batch with no terminal children yet still returns 200 + NDJSON;
+    the body is just empty. results() should yield zero rows and exit."""
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/x-ndjson",
+                "X-Batch-Status": "running",
+            },
+            content=b"",
+        )
+
+    batches, _ = _make_batches(handler)
+    rows = list(batches.results("running-batch"))
+    assert rows == []

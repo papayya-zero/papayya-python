@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Iterable, Iterator, TYPE_CHECKING
+
+import httpx
 
 if TYPE_CHECKING:
     from papayya.api import APIClient
@@ -93,8 +96,6 @@ class Batches:
             header["callback_url"] = callback_url
         if idempotency_key is not None:
             header["idempotency_key"] = idempotency_key
-
-        import json
 
         def _lines() -> Iterator[bytes]:
             yield (json.dumps(header) + "\n").encode("utf-8")
@@ -196,6 +197,46 @@ class Batches:
                 return batch
             time.sleep(poll_interval)
         raise TimeoutError(f"Batch {batch_id} did not reach terminal status within {timeout}s")
+
+    def results(self, batch_id: str) -> Iterator[dict[str, Any]]:
+        """Stream every terminal child of the batch as parsed run dicts.
+
+        One-shot consumer of ``GET /v1/batches/{id}/results`` — the server
+        opens a Postgres cursor, emits one JSON object per line for each
+        completed/failed/cancelled/budget_exceeded child, and closes. For
+        a 10k-item batch this is one round-trip instead of the ~50-page
+        polling that :meth:`stream_results` performs.
+
+        Inspect the ``X-Batch-Status`` response header (``terminal`` |
+        ``running``) on the underlying request if you need to know whether
+        the batch may produce more terminal rows later. v1 has no resumption
+        cursor, so retries replay from the beginning.
+
+        :meth:`stream_results` is left in place for callers that want
+        live-tail polling against an in-flight batch.
+        """
+        # Disable the read timeout for the stream body — first byte of a
+        # 10k-row scan can take several seconds. Connect/write/pool keep
+        # the configured deadline so a dead server still fails fast.
+        stream_timeout = httpx.Timeout(
+            connect=self._api._config.timeout,
+            read=None,
+            write=self._api._config.timeout,
+            pool=self._api._config.timeout,
+        )
+        with self._api._http.stream(
+            "GET",
+            f"/v1/batches/{batch_id}/results",
+            timeout=stream_timeout,
+        ) as response:
+            if response.status_code != 200:
+                body = response.read().decode("utf-8", errors="replace")
+                from papayya.api import PapayyaAPIError
+
+                raise PapayyaAPIError(response.status_code, body)
+            for line in response.iter_lines():
+                if line:
+                    yield json.loads(line)
 
     def stream_results(
         self,
