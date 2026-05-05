@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import json
 import os
 import re
@@ -110,29 +109,6 @@ def _discover_agents(path: str) -> list:
     return agents
 
 
-def _replay_invoke(fn: Any, snapshot: Any) -> Any:
-    """Re-invoke an @agent function with a captured input_snapshot.
-
-    Two shapes are accepted:
-
-      • dict whose keys bind to the agent's parameters — unpacked as
-        kwargs. This is the format the @agent wrapper captures via
-        ``inspect.signature.bind().arguments``.
-      • anything else (including a dict whose keys do *not* bind) —
-        passed as a single positional argument. Back-compat path for
-        snapshots that predate the @agent capture bridge or were
-        hand-populated via ``RunCheckpoint(input_snapshot=...)``.
-    """
-    if isinstance(snapshot, dict):
-        try:
-            inspect.signature(fn).bind(**snapshot)
-        except (TypeError, ValueError):
-            pass
-        else:
-            return fn(**snapshot)
-    return fn(snapshot)
-
-
 def _resolve_project_id(ctx_obj: dict) -> str | None:
     """Resolve project ID from flag, env, or the current env's saved config."""
     pid = os.environ.get("PAPAYYA_PROJECT_ID")
@@ -162,6 +138,10 @@ def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
     }
     if reg.budget_usd is not None:
         config["budget_usd"] = reg.budget_usd
+    if reg.concurrency_per_key is not None:
+        config["concurrency_per_key"] = reg.concurrency_per_key
+    if reg.rate_limit_per_min is not None:
+        config["rate_limit_per_min"] = reg.rate_limit_per_min
 
     result = api.create_agent(
         project_id=project_id,
@@ -977,128 +957,24 @@ def dlq_replay(run_id: str, file: str | None, db: str, latest: bool) -> None:
     with disposition='replayed'. If the replay also fails it shows up as a
     fresh dead letter, so the operator can see the pattern.
     """
-    import sqlite3 as _sqlite
-    import json as _json
+    from papayya.durable import ReplayError
+    from papayya.durable.client import replay as _sdk_replay
 
-    from papayya.durable import _schema
-
-    # Locate DB
-    db_path = Path(db)
-    if not db_path.exists():
-        click.echo(f"Error: No local database at {db_path.resolve()}", err=True)
-        sys.exit(1)
-
-    # Load run
-    conn = _sqlite.connect(str(db_path))
-    conn.row_factory = _sqlite.Row
+    click.echo(f"Replaying run {run_id}...")
     try:
-        row = conn.execute(
-            f"""SELECT run_id, agent, status,
-                       {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
-                       {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot,
-                       {_schema.COL_RUN_AGENT_VERSION} AS agent_version
-                FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
-            (run_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if row is None:
-        click.echo(f"Error: Run '{run_id}' not found in {db_path}", err=True)
-        sys.exit(1)
-    if row["status"] != "failed":
-        click.echo(
-            f"Error: Run '{run_id}' has status {row['status']!r}, not 'failed'. "
-            "Only failed runs can be replayed.", err=True,
+        result = _sdk_replay(
+            run_id,
+            agent_module=file,
+            db_path=db,
+            latest=latest,
         )
+    except ReplayError as exc:
+        click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
-    if row["disp"] is not None:
-        click.echo(
-            f"Error: Run '{run_id}' is already resolved (disposition={row['disp']!r}).",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Decode snapshot
-    raw = row["input_snapshot"]
-    if raw is None:
-        click.echo(
-            f"Error: Run '{run_id}' has no input_snapshot — cannot replay.\n"
-            "Input must be captured at run creation time; older runs predate\n"
-            "this feature and are not replayable.", err=True,
-        )
-        sys.exit(1)
-    try:
-        input_snapshot = _json.loads(raw)
-    except (TypeError, ValueError):
-        input_snapshot = raw
-
-    agent_name = row["agent"]
-
-    # Discover agent file
-    if file is None:
-        if Path("agent.py").exists():
-            file = "agent.py"
-        else:
-            click.echo(
-                "Error: No agent.py in cwd. Pass --file to point at the agent module.",
-                err=True,
-            )
-            sys.exit(1)
-
-    # Find matching registration
-    registrations = _discover_agents(file)
-    matching = next((r for r in registrations if r.name == agent_name), None)
-    if matching is None:
-        names = ", ".join(r.name for r in registrations) or "(none)"
-        click.echo(
-            f"Error: No @agent with name {agent_name!r} found in {file}.\n"
-            f"Registered agents: {names}", err=True,
-        )
-        sys.exit(1)
-
-    # Version-mismatch gate (ADR-0002 #7).
-    #
-    # Permissive on legacy runs: if the captured agent_version is NULL the
-    # run predates this feature and replays without the gate. Otherwise the
-    # captured value must equal the registration's current agent_version,
-    # or the operator must pass --latest. Either side being "unknown" while
-    # the other has a concrete value still trips the gate — that's the
-    # whole point of the unknown sentinel.
-    captured_version = row["agent_version"]
-    current_version = matching.agent_version
-    if not latest and captured_version is not None and captured_version != current_version:
-        click.echo(
-            f"Error: Run {run_id!r} captured agent_version="
-            f"{captured_version!r}; current registration is at "
-            f"{current_version!r}. Replay would run different code than "
-            "the original. Pass --latest to replay on the current version.",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Invoke
-    click.echo(f"Replaying run {run_id} through agent {agent_name}...")
-    replay_error: Exception | None = None
-    try:
-        result = _replay_invoke(matching.fn, input_snapshot)
-        click.echo(f"Replay returned: {result!r}")
     except Exception as exc:  # noqa: BLE001
-        replay_error = exc
         click.echo(f"Replay failed: {exc}", err=True)
-
-    # Mark old run as replayed — attempted, regardless of outcome. A
-    # failed replay becomes a fresh dead letter (the agent's own
-    # `run.fail(...)` path creates it).
-    from papayya.durable.sqlite_store import SQLiteStore
-    store = SQLiteStore(str(db_path))
-    try:
-        store.mark_dlq_disposition(run_id, _schema.DLQ_REPLAYED)
-    finally:
-        store.close()
-
-    if replay_error is not None:
         sys.exit(2)
+    click.echo(f"Replay returned: {result!r}")
 
 
 @main.group()

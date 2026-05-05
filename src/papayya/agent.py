@@ -90,6 +90,49 @@ class AgentRegistration:
     # whose version doesn't match the original run unless --latest.
     # ADR-0002 #7.
     agent_version: str = "unknown"
+    # Cap on concurrent in-flight items per partition_key value (where
+    # partition_key is the metadata field declared in papayya.yaml). When
+    # the cap is hit, additional items stay in runtime_pending until an
+    # in-flight one finishes. None disables the cap. Layer 3 #1.
+    concurrency_per_key: int | None = None
+    # Cap on lease throughput per partition_key value, in requests/min.
+    # Sliding window. None disables the cap. Layer 3 #2. Source format
+    # at the decorator is "N/min" or "N/sec" — parsed once and stored
+    # here as int RPM.
+    rate_limit_per_min: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit string parser (Layer 3 #2)
+#
+# Accepts ``"N/min"`` or ``"N/sec"``; normalises to integer requests per
+# minute. Fails fast at decoration time so a typo doesn't ship silently
+# disabled. ``"100/sec"`` → 6000; ``"100/min"`` → 100.
+# ---------------------------------------------------------------------------
+
+def _parse_rate_limit(value: str) -> int:
+    raw = value.strip()
+    if "/" not in raw:
+        raise ValueError(
+            f"rate_limit must be 'N/min' or 'N/sec', got {value!r}"
+        )
+    n_str, unit = (part.strip() for part in raw.split("/", 1))
+    try:
+        n = int(n_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"rate_limit numerator must be an integer, got {n_str!r}"
+        ) from exc
+    if n <= 0:
+        raise ValueError(f"rate_limit must be > 0, got {n}")
+    unit = unit.lower()
+    if unit in ("min", "minute", "m"):
+        return n
+    if unit in ("sec", "second", "s"):
+        return n * 60
+    raise ValueError(
+        f"rate_limit unit must be 'min' or 'sec', got {unit!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +284,8 @@ def agent(
     durable: bool = False,
     max_duration_seconds: float | None = None,
     agent_version: str | None = None,
+    concurrency_per_key: int | None = None,
+    rate_limit: str | None = None,
 ) -> Callable:
     """Decorator that registers a function as a deployable agent.
 
@@ -274,11 +319,32 @@ def agent(
             ``PAPAYYA_AGENT_VERSION`` → ``git rev-parse --short HEAD``
             → ``"unknown"``. CI/CD injecting the env var is the
             recommended path.
+        concurrency_per_key: Cap on concurrent in-flight items per
+            partition_key value (Layer 3 #1). When the cap is hit, the
+            hosted dispatcher keeps additional items in runtime_pending
+            until one in-flight finishes. The bucket key is the
+            partition_key value declared in papayya.yaml's
+            ``partition_key:`` field; falls back to the calling
+            account_id when no partition_key is set. None disables the
+            cap.
+        rate_limit: Cap on lease throughput per partition_key value
+            (Layer 3 #2). Format: ``"N/min"`` or ``"N/sec"``. Sliding
+            window enforced server-side; uses the same bucket key as
+            ``concurrency_per_key``. None disables the cap.
     """
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise ValueError(
             f"max_duration_seconds must be > 0 or None, got {max_duration_seconds!r}"
         )
+
+    if concurrency_per_key is not None and concurrency_per_key <= 0:
+        raise ValueError(
+            f"concurrency_per_key must be > 0 or None, got {concurrency_per_key!r}"
+        )
+
+    rate_limit_per_min: int | None = None
+    if rate_limit is not None:
+        rate_limit_per_min = _parse_rate_limit(rate_limit)
 
     resolved_version, version_source = _resolve_agent_version(agent_version)
     if version_source == "unknown":
@@ -337,6 +403,8 @@ def agent(
             durable=durable,
             max_duration_seconds=max_duration_seconds,
             agent_version=resolved_version,
+            concurrency_per_key=concurrency_per_key,
+            rate_limit_per_min=rate_limit_per_min,
         )
         # Attach metadata so callers can inspect without the registry
         wrapper._papayya_agent = registration
