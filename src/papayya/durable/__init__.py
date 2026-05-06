@@ -1,5 +1,6 @@
 """Durable execution wrapper for AI agents."""
 
+from ._replay import ReplayError, replay
 from .client import PapayyaClient, PapayyaClientConfig, papayya
 from .cloud_store import CloudStore, CloudStoreConfig
 from .run import PapayyaRun
@@ -28,4 +29,6 @@ __all__ = [
     "DurableRunResult",
     "RunCheckpoint",
     "TaskEntry",
+    "replay",
+    "ReplayError",
 ]

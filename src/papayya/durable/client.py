@@ -13,6 +13,7 @@ from typing import Any
 
 from papayya.papayya import Papayya
 
+from ._replay import ReplayError, replay
 from .types import CheckpointStore
 
 
@@ -71,4 +72,11 @@ def papayya(
     return Papayya(api_key=api_key, base_url=base_url, store=store)
 
 
-__all__ = ["Papayya", "PapayyaClient", "PapayyaClientConfig", "papayya"]
+__all__ = [
+    "Papayya",
+    "PapayyaClient",
+    "PapayyaClientConfig",
+    "papayya",
+    "replay",
+    "ReplayError",
+]
