@@ -91,6 +91,15 @@ class Lease:
     # local LocalDispatcher served the lease — local dev loads the agent
     # module from --agent-module FILE and is version-unaware. ADR-0003 § 1.
     agent_version: str | None = None
+    # account_id + project_id ride along on the lease wire so a v2
+    # platform-actor worker (ADR-0004 § 2/3) can address the bundle
+    # endpoint unambiguously: slug uniqueness is per-project, not per-
+    # account, so the bundle handler needs both query params under
+    # PrincipalPlatform auth. Project-scoped workers get them too —
+    # harmless because the principal already carries scope. Both stay
+    # ``None`` for LocalDispatcher leases.
+    account_id: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -260,7 +269,14 @@ class Worker:
         # ``agent_version`` (which LocalDispatcher never sets). Tests
         # that exercise the fetch path point this at their own fake
         # bundle server.
-        self._bundle_url_base = (bundle_url_base or f"{self.dispatcher_url}/v1/runtime/bundles").rstrip("/")
+        #
+        # When derived from ``dispatcher_url`` we append ``/bundles``
+        # only — the dispatcher_url already carries the ``/v1/runtime``
+        # path prefix (see ``/lease``, ``/complete``, ``/heartbeat``
+        # builders below at :727, :767, :1218 which all use the same
+        # base). Appending ``/v1/runtime/bundles`` here would double the
+        # path and 404 in production.
+        self._bundle_url_base = (bundle_url_base or f"{self.dispatcher_url}/bundles").rstrip("/")
         # Per-(agent_name, agent_version) cache of bundle entries the
         # worker has already loaded into the registry. Slice 2 guarantees
         # at most one resident entry per (name, version) tuple — multi-
@@ -413,7 +429,12 @@ class Worker:
         bundle = _bundle_cache.ensure_bundle(
             agent_slug=lease.agent,
             version=version_int,
-            fetch=lambda: self._fetch_bundle(lease.agent, version_int),
+            fetch=lambda: self._fetch_bundle(
+                lease.agent,
+                version_int,
+                account_id=lease.account_id,
+                project_id=lease.project_id,
+            ),
         )
 
         # ADR-0003 § Worker #6 — if a *different* version of this
@@ -488,7 +509,13 @@ class Worker:
             )
         return n
 
-    def _fetch_bundle(self, agent: str, version: int) -> Any:
+    def _fetch_bundle(
+        self,
+        agent: str,
+        version: int,
+        account_id: str | None = None,
+        project_id: str | None = None,
+    ) -> Any:
         """HTTP GET the bundle endpoint and adapt to ``FetchedBundle``.
 
         Stored as a closure so ``ensure_bundle``'s lazy-fetch contract
@@ -496,10 +523,22 @@ class Worker:
         headers — entrypoint, account_id, agent_id, deployment_id, ETag
         — ride along on the ``FetchedBundle`` so ``ensure_bundle`` can
         annotate the resulting cache entry without a second round-trip.
+
+        ``account_id`` + ``project_id`` are passed through as query
+        params under platform-actor auth (ADR-0004 § 2): the bundle
+        handler at control-pane needs both to disambiguate slug
+        uniqueness, since slug is unique per-project not per-account.
+        Project-scoped (PrincipalAPIKey) callers can omit them — the
+        principal already carries scope and the handler ignores extra
+        query params.
         """
         from papayya.runtime._bundle_cache import FetchedBundle
 
         url = f"{self._bundle_url_base}?agent={agent}&version={version}"
+        if account_id:
+            url += f"&account={account_id}"
+        if project_id:
+            url += f"&project={project_id}"
         req = urllib_request.Request(url, headers=self._auth_headers())
         try:
             resp = urllib_request.urlopen(req, timeout=30.0)
@@ -744,6 +783,8 @@ class Worker:
             item_id=body["item_id"],
             payload=body.get("payload"),
             agent_version=body.get("agent_version"),
+            account_id=body.get("account_id"),
+            project_id=body.get("project_id"),
         ))
 
     def _report_complete(
