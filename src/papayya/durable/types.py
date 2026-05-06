@@ -91,6 +91,17 @@ class DurableRunConfig:
     # construction time so PapayyaRun never has to re-read the project
     # config.
     partition_key: str | None = None
+    # Replay Phase 3 hydration transport. When set, PapayyaRun.init()
+    # seeds its in-memory _cache with these TaskEntry rows before the
+    # normal store.create() path so the wrapped agent fn's first
+    # step() calls find cache hits for labels < from_step. The list is
+    # never persisted to the new run's tasks table — it lives only in
+    # memory for this run's lifetime, so the on-disk artifact for the
+    # new run contains only steps it actually re-executed. Populated
+    # by Papayya.run() reading the one-shot _REPLAY_HYDRATION
+    # contextvar that papayya.durable._replay sets before invoking the
+    # agent fn. Stays None for non-replay callers.
+    prepopulated_tasks: list[TaskEntry] | None = None
 
 
 @dataclass

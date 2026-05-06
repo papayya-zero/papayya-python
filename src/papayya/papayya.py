@@ -214,6 +214,7 @@ class Papayya:
         indexed ``partition_key`` column on every row written under
         this run.
         """
+        from papayya.durable._replay import consume_replay_hydration
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
 
@@ -223,6 +224,31 @@ class Papayya:
             partition_key_value = _extract_partition_key(metadata, partition_key_field)
 
         resolved_store = store or self._store_override or self._auto_store()
+
+        # Replay Phase 3: when papayya.durable._replay is driving us, the
+        # one-shot _REPLAY_HYDRATION contextvar carries the new run's id
+        # and the TaskEntry rows to seed the cache with. We force run_id
+        # to the contextvar value (so caller-supplied run_id= is ignored
+        # mid-replay — the replayer owns identity) and pass the rows
+        # through as prepopulated_tasks. consume_* clears the contextvar
+        # so only the first papayya.run() call inside the replayed
+        # @agent body picks this up; subsequent intra-fn run() calls
+        # construct normal fresh runs.
+        hydration = consume_replay_hydration()
+        if hydration is not None:
+            forced_run_id, prepopulated = hydration
+            return PapayyaRun(
+                DurableRunConfig(
+                    agent=agent,
+                    run_id=forced_run_id,
+                    metadata=metadata,
+                    item_id=item_id,
+                    store=resolved_store,
+                    partition_key=partition_key_value,
+                    prepopulated_tasks=prepopulated,
+                )
+            )
+
         return PapayyaRun(
             DurableRunConfig(
                 agent=agent,

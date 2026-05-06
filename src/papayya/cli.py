@@ -932,7 +932,25 @@ def dlq() -> None:
         "runs whose agent_version is NULL replay freely."
     ),
 )
-def dlq_replay(run_id: str, file: str | None, db: str, latest: bool) -> None:
+@click.option(
+    "--from-step",
+    "from_step",
+    default=None,
+    help=(
+        "Phase 3 step-level rewind: resume from this step. Accepts a "
+        "step label (string) or a 1-indexed step number (integer). "
+        "Steps before this one are seeded into the new run's cache "
+        "from the original; this step and everything after re-execute "
+        "fresh."
+    ),
+)
+def dlq_replay(
+    run_id: str,
+    file: str | None,
+    db: str,
+    latest: bool,
+    from_step: str | None,
+) -> None:
     """Re-drive a failed run using its captured input snapshot.
 
     \b
@@ -960,6 +978,17 @@ def dlq_replay(run_id: str, file: str | None, db: str, latest: bool) -> None:
     from papayya.durable import ReplayError
     from papayya.durable.client import replay as _sdk_replay
 
+    # Click hands us a string from --from-step. Coerce to int when it
+    # parses as a positive number — that's the "1-indexed step number"
+    # form. Anything else stays a string and resolves as a label. None
+    # passes through to mean "replay from the top" (Phase 1 behaviour).
+    parsed_from_step: str | int | None = None
+    if from_step is not None:
+        try:
+            parsed_from_step = int(from_step)
+        except ValueError:
+            parsed_from_step = from_step
+
     click.echo(f"Replaying run {run_id}...")
     try:
         result = _sdk_replay(
@@ -967,6 +996,7 @@ def dlq_replay(run_id: str, file: str | None, db: str, latest: bool) -> None:
             agent_module=file,
             db_path=db,
             latest=latest,
+            from_step=parsed_from_step,
         )
     except ReplayError as exc:
         click.echo(f"Error: {exc}", err=True)

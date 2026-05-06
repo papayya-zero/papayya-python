@@ -126,6 +126,14 @@ class PapayyaRun:
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
+        # Replay Phase 3 hydration. When non-empty, init() seeds _cache
+        # with these TaskEntry rows before invoking store.create() so
+        # the wrapped agent fn's first step() calls find cache hits
+        # for labels < from_step. Hydrated rows are NOT persisted to
+        # the new run's tasks table — only steps the replay actually
+        # re-executes get written. Populated by Papayya.run() reading
+        # the one-shot _REPLAY_HYDRATION contextvar.
+        self._prepopulated_tasks: list[TaskEntry] | None = config.prepopulated_tasks
 
     def init(self) -> None:
         """Load any existing checkpoint from the store."""
@@ -156,6 +164,17 @@ class PapayyaRun:
             self._agent_version = (
                 registration.agent_version if registration is not None else None
             )
+
+            # Replay Phase 3: hydrate cache from prepopulated TaskEntry
+            # rows before store.create(). Order matters — _wrap reads
+            # _cache.get(label) on every invocation; entries seeded here
+            # short-circuit the wrapped fn for labels < from_step. The
+            # rows live only in memory; the new run's tasks table starts
+            # empty and only fills with steps the replay re-executes.
+            if self._prepopulated_tasks:
+                for entry in self._prepopulated_tasks:
+                    self._cache[entry.label] = entry
+                    self._task_call_order.append(entry.label)
 
             now = datetime.now(timezone.utc).isoformat()
             checkpoint = RunCheckpoint(

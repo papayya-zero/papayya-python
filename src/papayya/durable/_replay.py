@@ -26,17 +26,91 @@ import inspect
 import json
 import os
 import sqlite3
+import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from papayya.durable import _schema
 from papayya.durable.sqlite_store import SQLiteStore
+from papayya.durable.types import TaskEntry
 
 
 class ReplayError(Exception):
     """Raised when replay setup fails — bad run id, NULL snapshot,
     version mismatch, missing registration. The agent's own exception
     during invoke is re-raised unwrapped, not as ReplayError."""
+
+
+# Phase 3 step-rewind hydration transport. _replay.replay() sets this
+# before invoking the customer's @agent function; Papayya.run() reads
+# and clears it on the first construction inside that function so
+# only the outermost run picks up the seeded cache. Subsequent intra-
+# fn run() calls (rare but supported) construct normal fresh runs.
+_REPLAY_HYDRATION: ContextVar[tuple[str, list[TaskEntry]] | None] = ContextVar(
+    "papayya_replay_hydration", default=None
+)
+
+
+def consume_replay_hydration() -> tuple[str, list[TaskEntry]] | None:
+    """One-shot read of the replay hydration tuple. Returns
+    ``(new_run_id, [TaskEntry, ...])`` when ``_replay.replay()`` is
+    driving the call, ``None`` otherwise. Resets the contextvar to
+    None on read so only the first ``Papayya.run()`` call inside the
+    replayed ``@agent`` body picks up the hydration."""
+    value = _REPLAY_HYDRATION.get()
+    if value is not None:
+        _REPLAY_HYDRATION.set(None)
+    return value
+
+
+def _resolve_from_step(
+    from_step: str | int,
+    checkpoint_tasks: list[TaskEntry],
+    run_id: str,
+) -> int:
+    """Normalise from_step (str|int) to a hydration prefix count
+    (number of cached TaskEntry rows to seed before re-execution).
+
+    Semantics:
+    - **str** that matches a cached label → prefix = position of the
+      first matching entry. Re-executing this label means "redo a
+      previously-successful step." Hydrates everything strictly
+      before it.
+    - **str** that doesn't match any cached label → prefix = all
+      cached entries. This is the natural failure-replay case: the
+      step that died never made it into cache, so its label can't be
+      validated against stored data; hydrate everything we have and
+      let the agent fn pick up where it left off.
+    - **int** (1-indexed step number) in ``[1, len(cached) + 1]`` →
+      prefix = ``from_step - 1``. ``len + 1`` means "hydrate all
+      cached and re-execute the first uncached step." Out of range
+      raises ``ReplayError``.
+
+    Raised before any side effect so the original run's
+    ``dlq_disposition`` stays NULL on validation failure.
+    """
+    labels = [t.label for t in checkpoint_tasks]
+    if isinstance(from_step, str):
+        if from_step in labels:
+            return labels.index(from_step)
+        # Unmatched label is the natural failure-replay case (the step
+        # that failed isn't cached). Hydrate everything we have. We
+        # cannot detect typos here without knowing the agent's full
+        # label set, which is only discoverable by executing it.
+        return len(labels)
+    if isinstance(from_step, int) and not isinstance(from_step, bool):
+        if not (1 <= from_step <= len(labels) + 1):
+            raise ReplayError(
+                f"from_step={from_step} is out of range for run "
+                f"{run_id!r} (run has {len(labels)} cached step(s); "
+                f"valid range is 1..{len(labels) + 1})"
+            )
+        return from_step - 1
+    raise ReplayError(
+        f"from_step must be str (label) or int (1-indexed step number); "
+        f"got {type(from_step).__name__}"
+    )
 
 
 def _resolve_db_path() -> Path:
@@ -96,7 +170,7 @@ def replay(
     agent_module: str | Path | None = None,
     db_path: str | Path | None = None,
     latest: bool = False,
-    from_step: Any = None,
+    from_step: str | int | None = None,
 ) -> Any:
     """Re-drive a failed durable run from its captured input snapshot.
 
@@ -115,15 +189,28 @@ def replay(
     letter created by the agent's own ``run.fail(...)`` path will show
     up alongside.
 
-    ``from_step`` is reserved for Phase 3 (step-level rewind) and must
-    be ``None`` in Phase 1.
-    """
-    if from_step is not None:
-        raise NotImplementedError(
-            "from_step= is reserved for Phase 3 (step-level rewind); "
-            "Phase 1 only supports full replay from the top."
-        )
+    Phase 3 step-level rewind: pass ``from_step`` (label string or
+    1-indexed step number) to skip re-execution of cached predecessor
+    steps. The replay constructs a *new* run with a freshly-generated
+    ``run_id`` whose in-memory cache is pre-seeded with TaskEntry rows
+    for every step strictly before ``from_step`` in the original run's
+    task list. The wrapped agent's first ``step()`` calls then return
+    the cached values directly without re-invoking the wrapped fns;
+    ``from_step`` itself and every step after it re-execute fresh.
+    Hydrated cache entries are NOT persisted to the new run's tasks
+    table — only re-executed steps write rows. Local-SQLite-only;
+    hosted callers use ``Papayya(...).runs.replay(run_id, from_step=N)``
+    against the server-side endpoint.
 
+    Common gotcha — bounded by captured input: the cached predecessor
+    results are byte-for-byte identical to the originals. If the
+    customer's ``from_step`` (or later) function body has been edited
+    to read a field that the cached predecessor never produced, the
+    function will raise ``KeyError`` / ``AttributeError`` against the
+    cached payload. The exception propagates as-is — rewind further
+    by choosing an earlier ``from_step`` so the missing-data step
+    re-executes and produces the new shape.
+    """
     db_path = Path(db_path) if db_path is not None else _resolve_db_path()
     if not db_path.exists():
         raise ReplayError(f"No local database at {db_path.resolve()}")
@@ -197,8 +284,34 @@ def replay(
             f"Run {run_id!r} captured agent_version="
             f"{captured_version!r}; current registration is at "
             f"{current_version!r}. Replay would run different code than "
-            "the original. Pass latest=True to replay on the current version."
+            "the original. Pass latest=True (SDK) or --latest (CLI) to "
+            "replay on the current version."
         )
+
+    # Phase 3 from_step resolution + hydration setup. Done after every
+    # other validation gate so an out-of-range from_step on a run that
+    # would already have been rejected by the version gate fails on
+    # the version gate (better signal than "step 5 doesn't exist" when
+    # the real problem is "you're replaying the wrong code").
+    hydration_token = None
+    if from_step is not None:
+        load_store = SQLiteStore(str(db_path))
+        try:
+            checkpoint = load_store.load(run_id)
+        finally:
+            load_store.close()
+        # Defensive — the run row exists (we read it at the top of this
+        # function) so load() should never return None here. Guard
+        # anyway because store.load() could legally widen its contract
+        # to filter on status in the future.
+        if checkpoint is None:
+            raise ReplayError(
+                f"Run {run_id!r} could not be loaded for from_step rewind."
+            )
+        prefix_count = _resolve_from_step(from_step, checkpoint.tasks, run_id)
+        prepopulated = checkpoint.tasks[:prefix_count]
+        new_run_id = str(uuid.uuid4())
+        hydration_token = _REPLAY_HYDRATION.set((new_run_id, prepopulated))
 
     replay_error: BaseException | None = None
     result: Any = None
@@ -206,6 +319,9 @@ def replay(
         result = _replay_invoke(matching.fn, input_snapshot)
     except Exception as exc:  # noqa: BLE001 — agent's exception class is unknown
         replay_error = exc
+    finally:
+        if hydration_token is not None:
+            _REPLAY_HYDRATION.reset(hydration_token)
 
     store = SQLiteStore(str(db_path))
     try:
@@ -218,4 +334,4 @@ def replay(
     return result
 
 
-__all__ = ["replay", "ReplayError"]
+__all__ = ["replay", "ReplayError", "consume_replay_hydration"]
