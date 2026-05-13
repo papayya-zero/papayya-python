@@ -139,6 +139,12 @@ class CloudStore:
                     agent_version=cp.get("agent_version"),
                     metadata=cp.get("metadata"),
                     partition_key=cp.get("partition_key"),
+                    llm_prompt_tokens=cp.get("llm_prompt_tokens"),
+                    llm_completion_tokens=cp.get("llm_completion_tokens"),
+                    llm_total_tokens=cp.get("llm_total_tokens"),
+                    llm_model=cp.get("llm_model"),
+                    llm_stop_reason=cp.get("llm_stop_reason"),
+                    llm_provider_shape=cp.get("llm_provider_shape"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
@@ -178,6 +184,12 @@ class CloudStore:
             "agent_version": entry.agent_version,
             "metadata": entry.metadata,
             "partition_key": entry.partition_key,
+            "llm_prompt_tokens": entry.llm_prompt_tokens,
+            "llm_completion_tokens": entry.llm_completion_tokens,
+            "llm_total_tokens": entry.llm_total_tokens,
+            "llm_model": entry.llm_model,
+            "llm_stop_reason": entry.llm_stop_reason,
+            "llm_provider_shape": entry.llm_provider_shape,
         }
         self._execute(
             kind="save_task",

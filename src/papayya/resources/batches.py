@@ -175,6 +175,23 @@ class Batches:
         promotes to 'completed' automatically."""
         return self._api._request("GET", f"/v1/batches/{batch_id}/dlq")
 
+    def dlq_cost_preview(self, batch_id: str) -> dict[str, Any]:
+        """Predict the cost of replaying every unresolved DLQ entry in
+        this batch. Returns ``{run_count, estimated_sum_cents,
+        estimated_p50_cents, estimated_p95_cents, methodology}``.
+
+        Each predicted re-spend equals the original ``total_cost_cents``
+        of the failed run — DLQ replay restarts from scratch on the
+        original input, so the most accurate predictor is what it cost
+        before failing. Empty DLQ returns ``run_count=0`` and
+        ``estimated_sum_cents=0``.
+
+        Use this before calling :meth:`Runs.dlq_replay` in bulk — the
+        dashboard wires it into a confirmation modal so an operator
+        doesn't accidentally re-spend $4k on a 500-item batch (pain #7
+        in customer_pain_periodic_jobs.md)."""
+        return self._api._request("GET", f"/v1/batches/{batch_id}/dlq/cost-preview")
+
     def wait(
         self,
         batch_id: str,
