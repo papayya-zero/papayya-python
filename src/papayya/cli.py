@@ -1060,6 +1060,118 @@ def replay_cmd(
     click.echo(f"Replay returned: {result!r}")
 
 
+# ---------------------------------------------------------------------------
+# runs — hosted run ops (list, cancel, stream, replay-from-step)
+#
+# Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
+# stays unchanged. `runs` is the resource group for read/lifecycle verbs
+# that mirror client.runs.* one-for-one.
+# ---------------------------------------------------------------------------
+
+@main.group()
+def runs() -> None:
+    """Operate on hosted runs (list, cancel, stream, replay)."""
+
+
+@runs.command("list")
+@click.pass_context
+def runs_list(ctx: click.Context) -> None:
+    """List hosted runs (NDJSON, one run per line)."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.runs.list()
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for run in items:
+        click.echo(json.dumps(run))
+
+
+@runs.command("cancel")
+@click.argument("run_id")
+@click.pass_context
+def runs_cancel(ctx: click.Context, run_id: str) -> None:
+    """Cancel an in-flight hosted run."""
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.cancel(run_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(run, indent=2))
+
+
+@runs.command("stream")
+@click.argument("run_id")
+@click.option(
+    "--from-step",
+    type=int,
+    default=None,
+    help="Resume from this step (use the highest step number already observed)",
+)
+@click.pass_context
+def runs_stream(ctx: click.Context, run_id: str, from_step: int | None) -> None:
+    """Tail steps for a hosted run via SSE (NDJSON output).
+
+    Yields one JSON object per server-sent event: ``{"event": "step" |
+    "terminal" | "error", "data": {...}, "id": <step_number>}``. The
+    stream exits when the run reaches a terminal status.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        for event in client.runs.stream(run_id, from_step=from_step):
+            click.echo(json.dumps(event))
+            sys.stdout.flush()
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
+@runs.command("replay")
+@click.argument("run_id")
+@click.option(
+    "--from-step",
+    type=int,
+    required=True,
+    help="Rewind to this step (1-indexed) and re-execute from there",
+)
+@click.option(
+    "--latest",
+    is_flag=True,
+    default=False,
+    help="Replay against the registration's current agent_version even if it differs from the captured one",
+)
+@click.pass_context
+def runs_replay(
+    ctx: click.Context, run_id: str, from_step: int, latest: bool
+) -> None:
+    """Rewind a hosted durable run to a step and re-execute from there.
+
+    Distinct from ``papayya dlq replay`` (which re-issues a failed run
+    from its input_snapshot as a brand-new run) and from ``papayya replay``
+    (local SQLite dev-loop). This is the SDK's
+    ``client.runs.replay(run_id, from_step=N)`` path.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.replay(run_id, from_step=from_step, latest=latest)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(run, indent=2))
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
