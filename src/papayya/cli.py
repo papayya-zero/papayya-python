@@ -1652,6 +1652,50 @@ def projects_delete(ctx: click.Context, project_id: str) -> None:
     click.echo(f"Project {project_id} deleted")
 
 
+# ---------------------------------------------------------------------------
+# deployments — inspect hosted deployments (create stays as `papayya deploy`)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def deployments() -> None:
+    """Inspect hosted deployments. Create via `papayya deploy`."""
+
+
+@deployments.command("list")
+@click.argument("agent_id")
+@click.pass_context
+def deployments_list(ctx: click.Context, agent_id: str) -> None:
+    """List deployments for an agent (NDJSON, newest first)."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.deployments.list(agent_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for dep in items:
+        click.echo(json.dumps(dep))
+
+
+@deployments.command("get")
+@click.argument("deployment_id")
+@click.pass_context
+def deployments_get(ctx: click.Context, deployment_id: str) -> None:
+    """Fetch one deployment by ID."""
+    client = _make_papayya_client(ctx)
+    try:
+        dep = client.deployments.get(deployment_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(dep, indent=2))
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
