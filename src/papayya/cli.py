@@ -1955,3 +1955,112 @@ def batch_dlq(ctx: click.Context, batch_id: str) -> None:
 
     for run in runs:
         click.echo(json.dumps(run))
+
+
+@batch.command("list")
+@click.option("--status", default=None, help="Filter by status (queued/running/completed/...)")
+@click.option("--limit", type=int, default=None, help="Maximum rows to return")
+@click.option("--offset", type=int, default=None, help="Skip the first N rows")
+@click.pass_context
+def batch_list(
+    ctx: click.Context,
+    status: str | None,
+    limit: int | None,
+    offset: int | None,
+) -> None:
+    """List batches (NDJSON, one batch per line)."""
+    client = _make_papayya_client(ctx)
+    try:
+        batches = client.batches.list(status=status, limit=limit, offset=offset)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for b in batches:
+        click.echo(json.dumps(b))
+
+
+@batch.command("runs")
+@click.argument("batch_id")
+@click.option("--status", default=None, help="Filter children by status")
+@click.option("--page", type=int, default=None, help="Page index (paginated)")
+@click.option("--limit", type=int, default=None, help="Page size")
+@click.pass_context
+def batch_runs(
+    ctx: click.Context,
+    batch_id: str,
+    status: str | None,
+    page: int | None,
+    limit: int | None,
+) -> None:
+    """List the child runs of a batch (NDJSON, paginated)."""
+    client = _make_papayya_client(ctx)
+    try:
+        runs = client.batches.runs(batch_id, status=status, page=page, limit=limit)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for run in runs:
+        click.echo(json.dumps(run))
+
+
+@batch.command("dlq-cost-preview")
+@click.argument("batch_id")
+@click.pass_context
+def batch_dlq_cost_preview(ctx: click.Context, batch_id: str) -> None:
+    """Predict the cost of replaying every unresolved DLQ entry.
+
+    Returns ``{run_count, estimated_sum_cents, estimated_p50_cents,
+    estimated_p95_cents, methodology}``. Run before a bulk
+    ``papayya dlq replay`` so an operator doesn't accidentally re-spend
+    on a large failed batch.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        preview = client.batches.dlq_cost_preview(batch_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(preview, indent=2))
+
+
+@batch.command("stream-results")
+@click.argument("batch_id")
+@click.option("--include-failed", is_flag=True, default=False,
+              help="Also yield failed/cancelled/budget_exceeded children")
+@click.option("--poll-interval", type=float, default=2.0,
+              help="Seconds between polls of the runs endpoint")
+@click.pass_context
+def batch_stream_results(
+    ctx: click.Context,
+    batch_id: str,
+    include_failed: bool,
+    poll_interval: float,
+) -> None:
+    """Live-tail child runs as they reach terminal status (NDJSON).
+
+    Polls the batch's runs endpoint and emits each newly-terminal run on
+    its own line. Exits when the parent batch itself reaches terminal.
+    Use ``papayya batch results`` for one-shot bulk export of an
+    already-finished batch.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        for run in client.batches.stream_results(
+            batch_id, poll_interval=poll_interval, include_failed=include_failed
+        ):
+            click.echo(json.dumps(run))
+            sys.stdout.flush()
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()

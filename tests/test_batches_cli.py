@@ -51,6 +51,15 @@ class _FakeBatches:
         self.results_items: list[dict[str, Any]] = []
         self.wait_return: dict[str, Any] = {"id": "batch-xyz", "status": "completed"}
         self.dlq_return: list[dict[str, Any]] = []
+        self.list_return: list[dict[str, Any]] = []
+        self.runs_return: list[dict[str, Any]] = []
+        self.dlq_cost_preview_return: dict[str, Any] = {
+            "run_count": 0,
+            "estimated_sum_cents": 0,
+            "estimated_p50_cents": 0,
+            "estimated_p95_cents": 0,
+            "methodology": "sum-of-failed-total-cost-cents",
+        }
         self.raise_on: str | None = None
 
     def _maybe_raise(self, method: str) -> None:
@@ -116,6 +125,41 @@ class _FakeBatches:
         self.calls.append(("dlq", {"batch_id": batch_id}))
         self._maybe_raise("dlq")
         return self.dlq_return
+
+    def list(
+        self,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            ("list", {"status": status, "limit": limit, "offset": offset})
+        )
+        self._maybe_raise("list")
+        return self.list_return
+
+    def runs(
+        self,
+        batch_id: str,
+        *,
+        status: str | None = None,
+        page: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            (
+                "runs",
+                {"batch_id": batch_id, "status": status, "page": page, "limit": limit},
+            )
+        )
+        self._maybe_raise("runs")
+        return self.runs_return
+
+    def dlq_cost_preview(self, batch_id: str) -> dict[str, Any]:
+        self.calls.append(("dlq_cost_preview", {"batch_id": batch_id}))
+        self._maybe_raise("dlq_cost_preview")
+        return self.dlq_cost_preview_return
 
 
 class _FakeClient:
@@ -407,3 +451,68 @@ def test_dlq_lists_failed_runs_as_ndjson(fake_client: _FakeClient) -> None:
     assert len(lines) == 2
     assert json.loads(lines[0])["id"] == "run-a"
     assert json.loads(lines[1])["id"] == "run-b"
+
+
+# ---------------------------------------------------------------------------
+# list / runs / dlq-cost-preview / stream-results
+# ---------------------------------------------------------------------------
+
+def test_list_outputs_ndjson_and_forwards_filters(fake_client: _FakeClient) -> None:
+    fake_client.batches.list_return = [
+        {"id": "b1", "status": "completed"},
+        {"id": "b2", "status": "completed"},
+    ]
+    result = _run(["batch", "list", "--status", "completed", "--limit", "10", "--offset", "5"])
+    assert result.exit_code == 0, result.output
+    assert ("list", {"status": "completed", "limit": 10, "offset": 5}) in fake_client.batches.calls
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert [json.loads(ln)["id"] for ln in lines] == ["b1", "b2"]
+
+
+def test_runs_outputs_ndjson_and_forwards_pagination(fake_client: _FakeClient) -> None:
+    fake_client.batches.runs_return = [{"id": "r1"}, {"id": "r2"}]
+    result = _run([
+        "batch", "runs", "batch-xyz",
+        "--status", "completed", "--page", "2", "--limit", "200",
+    ])
+    assert result.exit_code == 0, result.output
+    assert (
+        "runs",
+        {"batch_id": "batch-xyz", "status": "completed", "page": 2, "limit": 200},
+    ) in fake_client.batches.calls
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
+
+
+def test_dlq_cost_preview_prints_prediction(fake_client: _FakeClient) -> None:
+    fake_client.batches.dlq_cost_preview_return = {
+        "run_count": 47,
+        "estimated_sum_cents": 7340,
+        "estimated_p50_cents": 120,
+        "estimated_p95_cents": 410,
+        "methodology": "sum-of-failed-total-cost-cents",
+    }
+    result = _run(["batch", "dlq-cost-preview", "batch-xyz"])
+    assert result.exit_code == 0, result.output
+    assert ("dlq_cost_preview", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
+    payload = json.loads(result.output)
+    assert payload["run_count"] == 47
+    assert payload["estimated_sum_cents"] == 7340
+
+
+def test_stream_results_emits_each_run_as_ndjson(fake_client: _FakeClient) -> None:
+    fake_client.batches.stream_results_items = [
+        {"id": "r1", "status": "completed"},
+        {"id": "r2", "status": "completed"},
+    ]
+    result = _run([
+        "batch", "stream-results", "batch-xyz",
+        "--include-failed", "--poll-interval", "0.5",
+    ])
+    assert result.exit_code == 0, result.output
+    assert (
+        "stream_results",
+        {"batch_id": "batch-xyz", "poll_interval": 0.5, "include_failed": True},
+    ) in fake_client.batches.calls
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
