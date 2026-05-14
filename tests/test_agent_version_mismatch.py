@@ -1,6 +1,6 @@
 """Tests for the agent_version replay-mismatch gate (ADR-0002 #7).
 
-The CLI's ``papayya dlq replay`` reads the agent_version captured on the
+The CLI's ``papayya replay`` reads the agent_version captured on the
 failed run and compares it to the registration's current value. A
 mismatch must abort the replay unless ``--latest`` is passed; pre-#7
 runs whose captured version is NULL replay without the gate (Q-1
@@ -96,7 +96,7 @@ def _disposition(db_path: Path, run_id: str) -> str | None:
 
 def _invoke_replay(*, db_path: Path, agent_path: Path, latest: bool = False):
     args = [
-        "dlq", "replay",
+        "replay",
         "--run", "dead-run",
         "--db", str(db_path),
         "--file", str(agent_path),

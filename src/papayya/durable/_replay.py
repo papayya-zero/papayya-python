@@ -1,6 +1,6 @@
 """Local-DB replay — Python entry point for the durable-run replay flow.
 
-The CLI's ``papayya dlq replay`` is a thin wrapper over this module.
+The CLI's ``papayya replay`` is a thin wrapper over this module.
 SDK callers can re-drive a failed run from a notebook or REPL::
 
     from papayya.durable import client

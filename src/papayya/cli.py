@@ -911,10 +911,63 @@ def dev(port: int, host: str, db: str) -> None:
 
 @main.group()
 def dlq() -> None:
-    """Dead letter queue — triage failed runs from a batch."""
+    """Dead letter queue — triage failed runs from a hosted batch."""
+
+
+@dlq.command("skip")
+@click.argument("run_id")
+@click.pass_context
+def dlq_skip(ctx: click.Context, run_id: str) -> None:
+    """Mark a failed run as 'skipped' — accept the failure as terminal.
+
+    Once every failure in the batch has a disposition (skip / acknowledge /
+    replay), the batch promotes from 'partial' to 'completed'.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.dlq_skip(run_id)
+    finally:
+        client.close()
+    click.echo(json.dumps(run, indent=2))
+
+
+@dlq.command("acknowledge")
+@click.argument("run_id")
+@click.pass_context
+def dlq_acknowledge(ctx: click.Context, run_id: str) -> None:
+    """Mark a failed run as 'acknowledged'.
+
+    Records that an operator has reviewed the failure but is choosing to
+    leave it. Functionally equivalent to skip; semantically distinct
+    (skip ≈ "not worth looking at"; acknowledge ≈ "I've looked at this").
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.dlq_acknowledge(run_id)
+    finally:
+        client.close()
+    click.echo(json.dumps(run, indent=2))
 
 
 @dlq.command("replay")
+@click.argument("run_id")
+@click.pass_context
+def dlq_replay(ctx: click.Context, run_id: str) -> None:
+    """Re-issue a failed run from its captured input_snapshot.
+
+    Returns the newly-queued run; the source run is marked 'replayed' and
+    linked via ``replayed_from``. For local dev-loop replays (against
+    ``.papayya/local.db``) use ``papayya replay --run <id>``.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.dlq_replay(run_id)
+    finally:
+        client.close()
+    click.echo(json.dumps(run, indent=2))
+
+
+@main.command("replay")
 @click.option("--run", "run_id", required=True, help="Run ID to replay")
 @click.option("--file", "file", default=None,
               help="Agent file (default: auto-discover agent.py in cwd)")
@@ -944,20 +997,20 @@ def dlq() -> None:
         "fresh."
     ),
 )
-def dlq_replay(
+def replay_cmd(
     run_id: str,
     file: str | None,
     db: str,
     latest: bool,
     from_step: str | None,
 ) -> None:
-    """Re-drive a failed run using its captured input snapshot.
+    """Re-drive a failed local run using its captured input snapshot.
 
     \b
     Usage:
-      papayya dlq replay --run <run_id>
-      papayya dlq replay --run <run_id> --file my_agents.py
-      papayya dlq replay --run <run_id> --latest
+      papayya replay --run <run_id>
+      papayya replay --run <run_id> --file my_agents.py
+      papayya replay --run <run_id> --latest
 
     Reads the run's input_snapshot from the local DB, finds the matching
     @agent-decorated function in the agent file, and re-invokes it. When
@@ -1878,3 +1931,27 @@ def batch_retry(ctx: click.Context, batch_id: str, retry_failed_flag: bool) -> N
         client.close()
 
     click.echo(f"Batch {b.get('id', batch_id)} re-enqueued (total_items now {b.get('total_items', '?')})")
+
+
+@batch.command("dlq")
+@click.argument("batch_id")
+@click.pass_context
+def batch_dlq(ctx: click.Context, batch_id: str) -> None:
+    """List failed runs in a batch awaiting triage.
+
+    Prints one JSON object per line (NDJSON), each a failed/budget_exceeded
+    run that has no dlq_disposition yet. Pipe into a tool, or pluck IDs and
+    feed them into ``papayya dlq skip`` / ``papayya dlq acknowledge`` /
+    ``papayya dlq replay``.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        runs = client.batches.dlq(batch_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for run in runs:
+        click.echo(json.dumps(run))

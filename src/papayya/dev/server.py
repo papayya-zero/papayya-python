@@ -451,7 +451,7 @@ def _h_dlq_disposition(
 
     Replay is only half-done here: this marks the original run as
     ``replayed`` but does NOT execute the replay — that's the
-    ``papayya dlq replay`` subprocess. Callers of this endpoint for the
+    ``papayya replay`` subprocess. Callers of this endpoint for the
     ``replayed`` disposition are therefore expected to have already
     created (or be about to create) the new run with
     ``replayed_from=<run_id>``.
@@ -502,7 +502,7 @@ def _h_dlq_replay(
     batch_id: str,
     run_id: str,
 ) -> dict[str, Any]:
-    """Spawn ``papayya dlq replay --run <id>`` and wait for it.
+    """Spawn ``papayya replay --run <id>`` and wait for it.
 
     Runs the CLI in a subprocess from the dashboard server's cwd — which is
     the user's project dir, where their agent module lives. Times out at
@@ -539,7 +539,7 @@ def _h_dlq_replay(
 
     try:
         proc = subprocess.run(
-            ["papayya", "dlq", "replay", "--run", run_id, "--db", db_path],
+            ["papayya", "replay", "--run", run_id, "--db", db_path],
             capture_output=True,
             text=True,
             timeout=120,

@@ -50,6 +50,7 @@ class _FakeBatches:
         # Used by the rewired `batch results` CLI command (NDJSON server stream).
         self.results_items: list[dict[str, Any]] = []
         self.wait_return: dict[str, Any] = {"id": "batch-xyz", "status": "completed"}
+        self.dlq_return: list[dict[str, Any]] = []
         self.raise_on: str | None = None
 
     def _maybe_raise(self, method: str) -> None:
@@ -110,6 +111,11 @@ class _FakeBatches:
         self.calls.append(("results", {"batch_id": batch_id}))
         self._maybe_raise("results")
         yield from self.results_items
+
+    def dlq(self, batch_id: str) -> list[dict[str, Any]]:
+        self.calls.append(("dlq", {"batch_id": batch_id}))
+        self._maybe_raise("dlq")
+        return self.dlq_return
 
 
 class _FakeClient:
@@ -381,3 +387,23 @@ def test_retry_with_failed_flag_calls_retry_failed(
     assert ("retry_failed", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
     assert "re-enqueued" in result.output
     assert "total_items now 12" in result.output
+
+
+# ---------------------------------------------------------------------------
+# dlq
+# ---------------------------------------------------------------------------
+
+def test_dlq_lists_failed_runs_as_ndjson(fake_client: _FakeClient) -> None:
+    fake_client.batches.dlq_return = [
+        {"id": "run-a", "status": "failed", "error_message": "rate limited"},
+        {"id": "run-b", "status": "budget_exceeded", "error_message": "over budget"},
+    ]
+    result = _run(["batch", "dlq", "batch-xyz"])
+    assert result.exit_code == 0, result.output
+    assert ("dlq", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
+
+    # NDJSON: one JSON object per line, both run IDs surface in order.
+    lines = [ln for ln in result.output.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert json.loads(lines[0])["id"] == "run-a"
+    assert json.loads(lines[1])["id"] == "run-b"

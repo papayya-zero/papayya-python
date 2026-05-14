@@ -1,7 +1,7 @@
 """Subprocess-free SDK tests for ``papayya.durable.client.replay``.
 
-The CLI integration path (``papayya dlq replay``) is covered by
-``tests/test_dlq_cli.py``; these tests exercise the Python entry point
+The CLI integration path (``papayya replay``) is covered by
+``tests/test_replay_cli.py``; these tests exercise the Python entry point
 directly so callers using replay from a notebook / REPL / script have
 the same coverage. DB path is steered via ``PAPAYYA_LOCAL_DB_PATH``
 (monkeypatched per-test); ``agent_module=`` is passed explicitly so
