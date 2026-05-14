@@ -1490,6 +1490,71 @@ def schedules_disable(ctx: click.Context, schedule_id: str) -> None:
     click.echo(json.dumps(sched, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# webhooks — outgoing webhooks per agent
+# ---------------------------------------------------------------------------
+
+@main.group()
+def webhooks() -> None:
+    """Manage outgoing webhooks (create, list, delete)."""
+
+
+@webhooks.command("create")
+@click.option("--agent", "agent_id", required=True, help="Agent the webhook belongs to")
+@click.option("--name", required=True, help="Display name")
+@click.option("--description", default=None, help="Optional description")
+@click.pass_context
+def webhooks_create(
+    ctx: click.Context, agent_id: str, name: str, description: str | None
+) -> None:
+    """Create a webhook on an agent. Returns the webhook with its signing secret."""
+    client = _make_papayya_client(ctx)
+    try:
+        hook = client.webhooks.create(agent_id, name, description=description)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(hook, indent=2))
+
+
+@webhooks.command("list")
+@click.argument("agent_id")
+@click.pass_context
+def webhooks_list(ctx: click.Context, agent_id: str) -> None:
+    """List webhooks on an agent (NDJSON)."""
+    client = _make_papayya_client(ctx)
+    try:
+        hooks = client.webhooks.list(agent_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for hook in hooks:
+        click.echo(json.dumps(hook))
+
+
+@webhooks.command("delete")
+@click.argument("webhook_id")
+@click.pass_context
+def webhooks_delete(ctx: click.Context, webhook_id: str) -> None:
+    """Delete a webhook."""
+    client = _make_papayya_client(ctx)
+    try:
+        client.webhooks.delete(webhook_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Webhook {webhook_id} deleted")
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
