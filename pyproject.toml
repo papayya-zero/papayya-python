@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papayya"
-version = "0.2.0"
-description = "Durable background jobs for AI agents"
+version = "0.2.1"
+description = "Durable execution and per-item observability for periodic LLM jobs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

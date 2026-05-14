@@ -2,6 +2,16 @@
 
 All notable changes to the `papayya` Python package.
 
+## 0.2.1 — 2026-05-14
+
+### Documentation
+
+- README rewritten around the workload — periodic and batch LLM jobs (KB ingestion, evals, enrichment, doc extraction, post-processing, codemod) — instead of the generic "durable background jobs for AI agents" framing. Concrete failure modes and the per-item visibility wedge now lead the page.
+- Quickstart code now shows a pile-of-items loop (`for company in companies: papayya().run(..., item_id=...)`) so the per-item tagging pattern is visible from the first read.
+- `papayya()` factory from `papayya.durable` documented as the canonical entry point. The `Papayya` class export is retained for back-compat but no longer appears in copy.
+- New "Examples" section pointing at [github.com/papayya-zero/examples](https://github.com/papayya-zero/examples).
+- Project description in `pyproject.toml` updated to match.
+
 ## 0.2.0 — 2026-04-29
 
 The launch release. Worker-pool runtime, declarative config, dead letter queue, BYOF observability.
