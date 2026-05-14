@@ -1306,6 +1306,190 @@ def agents_update(
     click.echo(json.dumps(agent, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# schedules — hosted cron schedules over agents
+# ---------------------------------------------------------------------------
+
+def _dollars_to_cents(dollars: float | None) -> int | None:
+    """$X.YZ → cents (int). None passes through."""
+    return None if dollars is None else int(round(dollars * 100))
+
+
+@main.group()
+def schedules() -> None:
+    """Hosted cron schedules (create, list, get, update, enable/disable, delete)."""
+
+
+@schedules.command("create")
+@click.option("--agent", "agent_id", required=True, help="Agent the schedule fires against")
+@click.option("--cron", required=True, help="Cron expression (e.g. '0 */6 * * *')")
+@click.option("--timezone", default=None, help="IANA timezone (e.g. 'America/Toronto')")
+@click.option("--input", "input_str", default=None, help="Run input passed each time the schedule fires")
+@click.option("--max-steps", type=int, default=None, help="Per-run max steps override")
+@click.option("--budget", type=float, default=None, help="Per-run budget cap in whole dollars")
+@click.pass_context
+def schedules_create(
+    ctx: click.Context,
+    agent_id: str,
+    cron: str,
+    timezone: str | None,
+    input_str: str | None,
+    max_steps: int | None,
+    budget: float | None,
+) -> None:
+    """Create a cron schedule on an agent."""
+    client = _make_papayya_client(ctx)
+    try:
+        sched = client.schedules.create(
+            agent_id,
+            cron,
+            timezone=timezone,
+            input=input_str,
+            max_steps=max_steps,
+            budget_cents=_dollars_to_cents(budget),
+        )
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(sched, indent=2))
+
+
+@schedules.command("list")
+@click.option("--agent", "agent_id", default=None,
+              help="Filter to one agent's schedules (defaults to all)")
+@click.pass_context
+def schedules_list(ctx: click.Context, agent_id: str | None) -> None:
+    """List schedules (NDJSON)."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.schedules.list(agent_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for sched in items:
+        click.echo(json.dumps(sched))
+
+
+@schedules.command("get")
+@click.argument("schedule_id")
+@click.pass_context
+def schedules_get(ctx: click.Context, schedule_id: str) -> None:
+    """Fetch one schedule by ID."""
+    client = _make_papayya_client(ctx)
+    try:
+        sched = client.schedules.get(schedule_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(sched, indent=2))
+
+
+@schedules.command("update")
+@click.argument("schedule_id")
+@click.option("--cron", default=None, help="New cron expression")
+@click.option("--timezone", default=None, help="New timezone")
+@click.option("--input", "input_str", default=None, help="New run input")
+@click.option("--max-steps", type=int, default=None, help="New per-run max-steps")
+@click.option("--budget", type=float, default=None, help="New per-run budget cap (whole dollars)")
+@click.pass_context
+def schedules_update(
+    ctx: click.Context,
+    schedule_id: str,
+    cron: str | None,
+    timezone: str | None,
+    input_str: str | None,
+    max_steps: int | None,
+    budget: float | None,
+) -> None:
+    """Patch fields on an existing schedule (only fields you pass are sent)."""
+    patch: dict[str, Any] = {}
+    if cron is not None:
+        patch["cron"] = cron
+    if timezone is not None:
+        patch["timezone"] = timezone
+    if input_str is not None:
+        patch["input"] = input_str
+    if max_steps is not None:
+        patch["max_steps"] = max_steps
+    if budget is not None:
+        patch["budget_cents"] = _dollars_to_cents(budget)
+
+    if not patch:
+        click.echo("Error: pass at least one of --cron / --timezone / --input / --max-steps / --budget", err=True)
+        sys.exit(1)
+
+    client = _make_papayya_client(ctx)
+    try:
+        sched = client.schedules.update(schedule_id, **patch)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(sched, indent=2))
+
+
+@schedules.command("delete")
+@click.argument("schedule_id")
+@click.pass_context
+def schedules_delete(ctx: click.Context, schedule_id: str) -> None:
+    """Delete a schedule."""
+    client = _make_papayya_client(ctx)
+    try:
+        client.schedules.delete(schedule_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Schedule {schedule_id} deleted")
+
+
+@schedules.command("enable")
+@click.argument("schedule_id")
+@click.pass_context
+def schedules_enable(ctx: click.Context, schedule_id: str) -> None:
+    """Enable a paused schedule."""
+    client = _make_papayya_client(ctx)
+    try:
+        sched = client.schedules.enable(schedule_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(sched, indent=2))
+
+
+@schedules.command("disable")
+@click.argument("schedule_id")
+@click.pass_context
+def schedules_disable(ctx: click.Context, schedule_id: str) -> None:
+    """Pause a schedule (it stays in the DB but won't fire)."""
+    client = _make_papayya_client(ctx)
+    try:
+        sched = client.schedules.disable(schedule_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(sched, indent=2))
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
