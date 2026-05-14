@@ -1555,6 +1555,103 @@ def webhooks_delete(ctx: click.Context, webhook_id: str) -> None:
     click.echo(f"Webhook {webhook_id} deleted")
 
 
+# ---------------------------------------------------------------------------
+# projects — hosted project resource (plural, distinct from local `project`)
+#
+# `papayya project` (singular) handles the LOCAL SQLite history (export /
+# import). `papayya projects` (plural) is the hosted CRUD surface.
+# ---------------------------------------------------------------------------
+
+@main.group()
+def projects() -> None:
+    """Hosted projects (list, get, update, delete). Create via `papayya envs create`."""
+
+
+@projects.command("list")
+@click.pass_context
+def projects_list(ctx: click.Context) -> None:
+    """List hosted projects (NDJSON)."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.projects.list()
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for proj in items:
+        click.echo(json.dumps(proj))
+
+
+@projects.command("get")
+@click.argument("project_id")
+@click.pass_context
+def projects_get(ctx: click.Context, project_id: str) -> None:
+    """Fetch one project by ID."""
+    client = _make_papayya_client(ctx)
+    try:
+        proj = client.projects.get(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(proj, indent=2))
+
+
+@projects.command("update")
+@click.argument("project_id")
+@click.option("--name", default=None, help="New display name")
+@click.option("--slug", default=None, help="New slug")
+@click.pass_context
+def projects_update(
+    ctx: click.Context, project_id: str, name: str | None, slug: str | None
+) -> None:
+    """Patch fields on a hosted project."""
+    patch: dict[str, Any] = {}
+    if name is not None:
+        patch["name"] = name
+    if slug is not None:
+        patch["slug"] = slug
+
+    if not patch:
+        click.echo("Error: pass at least one of --name / --slug", err=True)
+        sys.exit(1)
+
+    client = _make_papayya_client(ctx)
+    try:
+        proj = client.projects.update(project_id, **patch)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(proj, indent=2))
+
+
+@projects.command("delete")
+@click.argument("project_id")
+@click.confirmation_option(
+    prompt="Deleting a project is irreversible and removes all its agents, runs, and history. Continue?",
+)
+@click.pass_context
+def projects_delete(ctx: click.Context, project_id: str) -> None:
+    """Delete a hosted project (irreversible)."""
+    client = _make_papayya_client(ctx)
+    try:
+        client.projects.delete(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"Project {project_id} deleted")
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
