@@ -33,7 +33,6 @@ import os
 import time
 
 from papayya import agent
-from papayya.durable import papayya
 
 
 # Canned data. Stand in for a real fetch (Clearbit, scraper, etc.) so
@@ -65,9 +64,7 @@ def fake_extract(name: str, snippet: str) -> dict:
 
 
 @agent(name="enrich")
-def enrich(item_id: str) -> dict:
-    run = papayya().run("enrich", item_id=item_id)
-
+def enrich(run, item_id: str) -> dict:
     fetch = run.step("fetch_snippet", fetch_snippet)
     extract = run.step("fake_extract", fake_extract, kind="llm")
 

@@ -64,6 +64,23 @@ def consume_agent_input_snapshot() -> Any:
     return _AGENT_INPUT.get()
 
 
+# True when control is inside an @agent wrapper that took the legacy
+# (non-injected) path — i.e. the fn does not declare `run` as its first
+# positional parameter. Read by Papayya.run() so it can fire the Layer 3
+# #9 deprecation warning at the exact call site the customer needs to
+# delete.
+_LEGACY_AGENT_PATH_ACTIVE: ContextVar[bool] = ContextVar(
+    "papayya_legacy_agent_active", default=False
+)
+
+
+def legacy_agent_path_active() -> bool:
+    """True when an @agent wrapper above this frame took the legacy
+    (no `run` parameter) path. Used by Papayya.run() to gate the
+    deprecation warning."""
+    return _LEGACY_AGENT_PATH_ACTIVE.get()
+
+
 # ---------------------------------------------------------------------------
 # Module-level registry — maps function name → AgentRegistration
 # ---------------------------------------------------------------------------
@@ -368,24 +385,81 @@ def agent(
             # Snapshot capture skipped for these; runs still execute.
             sig = None
 
+        # Layer 3 #9: inject the run as fn's first positional argument when
+        # the customer declares `def process_note(run, ...)`. Detection is
+        # by literal parameter name — keeps the new shape obvious from the
+        # signature and avoids requiring type annotations.
+        inject_run = False
+        if sig is not None:
+            positional = [
+                p for p in sig.parameters.values()
+                if p.name not in ("self", "cls")
+                and p.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            inject_run = bool(positional) and positional[0].name == "run"
+
+        # When injecting, build_input_snapshot must bind worker-provided
+        # args to the user's *non-run* parameters, otherwise it tries to
+        # bind args[0] to `run` and the snapshot ends up shaped wrong.
+        sig_for_snapshot: inspect.Signature | None = sig
+        if inject_run and sig is not None:
+            sig_for_snapshot = sig.replace(parameters=[
+                p for p in sig.parameters.values() if p.name != "run"
+            ])
+
         if inspect.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def wrapper(*args, **kwargs):
-                snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
-                token = _AGENT_INPUT.set(snapshot)
-                try:
-                    return await fn(*args, **kwargs)
-                finally:
-                    _AGENT_INPUT.reset(token)
+                snapshot = _serialize.build_input_snapshot(
+                    sig_for_snapshot, args, kwargs,
+                )
+                input_token = _AGENT_INPUT.set(snapshot)
+                if inject_run:
+                    # Lazy import: papayya.durable.client imports
+                    # papayya.papayya which imports papayya.agent.
+                    from papayya.durable import papayya as _papayya_factory
+                    item_id = args[0] if args else None
+                    run_obj = _papayya_factory().run(
+                        agent=name, item_id=item_id,
+                    )
+                    try:
+                        return await fn(run_obj, *args, **kwargs)
+                    finally:
+                        _AGENT_INPUT.reset(input_token)
+                else:
+                    legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
+                    try:
+                        return await fn(*args, **kwargs)
+                    finally:
+                        _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
+                        _AGENT_INPUT.reset(input_token)
         else:
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
-                snapshot = _serialize.build_input_snapshot(sig, args, kwargs)
-                token = _AGENT_INPUT.set(snapshot)
-                try:
-                    return fn(*args, **kwargs)
-                finally:
-                    _AGENT_INPUT.reset(token)
+                snapshot = _serialize.build_input_snapshot(
+                    sig_for_snapshot, args, kwargs,
+                )
+                input_token = _AGENT_INPUT.set(snapshot)
+                if inject_run:
+                    from papayya.durable import papayya as _papayya_factory
+                    item_id = args[0] if args else None
+                    run_obj = _papayya_factory().run(
+                        agent=name, item_id=item_id,
+                    )
+                    try:
+                        return fn(run_obj, *args, **kwargs)
+                    finally:
+                        _AGENT_INPUT.reset(input_token)
+                else:
+                    legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
+                    try:
+                        return fn(*args, **kwargs)
+                    finally:
+                        _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
+                        _AGENT_INPUT.reset(input_token)
 
         # Register the *wrapper*, not the raw fn — the runtime worker
         # calls registration.fn(item_id) directly, and the wrapper is

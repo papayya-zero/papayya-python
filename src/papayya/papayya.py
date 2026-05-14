@@ -214,6 +214,25 @@ class Papayya:
         indexed ``partition_key`` column on every row written under
         this run.
         """
+        # Layer 3 #9: the documented pattern is now
+        # ``def process_note(run, note): ...`` with ``run`` injected by
+        # the @agent wrapper. Customers on the legacy pattern call this
+        # method themselves from inside the fn body — that's the line
+        # they need to delete, so we warn at the call site (the wrapper
+        # sets a contextvar before invoking the legacy fn).
+        from papayya.agent import legacy_agent_path_active
+        if legacy_agent_path_active():
+            import warnings
+            warnings.warn(
+                "Calling papayya().run() inside an @agent function is "
+                "deprecated. Add `run` as the first positional parameter of "
+                "your agent function (e.g. `def process_note(run, note):`) "
+                "and it will be injected automatically. The legacy pattern "
+                "will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         from papayya.durable._replay import consume_replay_hydration
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
