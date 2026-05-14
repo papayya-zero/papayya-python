@@ -1696,6 +1696,54 @@ def deployments_get(ctx: click.Context, deployment_id: str) -> None:
     click.echo(json.dumps(dep, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# api-keys — inspect and revoke API keys per project
+# ---------------------------------------------------------------------------
+
+@main.group("api-keys")
+def api_keys() -> None:
+    """Inspect and revoke project API keys. Create via `papayya envs create`."""
+
+
+@api_keys.command("list")
+@click.option("--project-id", required=True, help="Project whose keys to list")
+@click.pass_context
+def api_keys_list(ctx: click.Context, project_id: str) -> None:
+    """List API keys for a project (NDJSON). Key prefixes only — secrets are write-once."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.api_keys.list(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for key in items:
+        click.echo(json.dumps(key))
+
+
+@api_keys.command("revoke")
+@click.argument("key_id")
+@click.option("--project-id", required=True, help="Project the key belongs to")
+@click.confirmation_option(
+    prompt="Revoking an API key is immediate and will break any service still using it. Continue?",
+)
+@click.pass_context
+def api_keys_revoke(ctx: click.Context, key_id: str, project_id: str) -> None:
+    """Revoke an API key (irreversible)."""
+    client = _make_papayya_client(ctx)
+    try:
+        client.api_keys.revoke(project_id, key_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(f"API key {key_id} revoked")
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
