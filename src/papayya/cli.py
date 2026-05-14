@@ -1172,6 +1172,140 @@ def runs_replay(
     click.echo(json.dumps(run, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# agents — hosted agent CRUD
+# ---------------------------------------------------------------------------
+
+def _parse_json_option(raw: str | None, flag_name: str) -> Any:
+    """Parse a JSON-string CLI option into a Python value, or None.
+
+    Used by commands that accept a structured payload (config, kwargs)
+    as a single flag. Errors out cleanly on invalid JSON.
+    """
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        click.echo(f"Error: {flag_name} must be valid JSON: {exc}", err=True)
+        sys.exit(1)
+
+
+@main.group()
+def agents() -> None:
+    """Hosted agent CRUD (create, list, get, update)."""
+
+
+@agents.command("create")
+@click.option("--name", required=True, help="Display name")
+@click.option("--slug", required=True, help="URL-safe slug (unique per project)")
+@click.option("--project-id", required=True, help="Project the agent belongs to")
+@click.option("--description", default=None, help="Optional description")
+@click.option("--config", "config_raw", default=None,
+              help="Optional JSON config object")
+@click.pass_context
+def agents_create(
+    ctx: click.Context,
+    name: str,
+    slug: str,
+    project_id: str,
+    description: str | None,
+    config_raw: str | None,
+) -> None:
+    """Create a hosted agent."""
+    config = _parse_json_option(config_raw, "--config")
+    client = _make_papayya_client(ctx)
+    try:
+        agent = client.agents.create(
+            name, slug, project_id, config=config, description=description
+        )
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(agent, indent=2))
+
+
+@agents.command("list")
+@click.option("--project-id", default=None,
+              help="Filter by project (defaults to listing all agents the caller can see)")
+@click.pass_context
+def agents_list(ctx: click.Context, project_id: str | None) -> None:
+    """List agents (NDJSON)."""
+    client = _make_papayya_client(ctx)
+    try:
+        items = client.agents.list(project_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for agent in items:
+        click.echo(json.dumps(agent))
+
+
+@agents.command("get")
+@click.argument("agent_id")
+@click.pass_context
+def agents_get(ctx: click.Context, agent_id: str) -> None:
+    """Fetch one agent by ID."""
+    client = _make_papayya_client(ctx)
+    try:
+        agent = client.agents.get(agent_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(agent, indent=2))
+
+
+@agents.command("update")
+@click.argument("agent_id")
+@click.option("--name", default=None, help="New display name")
+@click.option("--description", default=None, help="New description")
+@click.option("--config", "config_raw", default=None,
+              help="Replacement JSON config object")
+@click.pass_context
+def agents_update(
+    ctx: click.Context,
+    agent_id: str,
+    name: str | None,
+    description: str | None,
+    config_raw: str | None,
+) -> None:
+    """Patch fields on an existing agent.
+
+    Only the flags you pass are sent; omitted fields stay untouched.
+    """
+    patch: dict[str, Any] = {}
+    if name is not None:
+        patch["name"] = name
+    if description is not None:
+        patch["description"] = description
+    if config_raw is not None:
+        patch["config"] = _parse_json_option(config_raw, "--config")
+
+    if not patch:
+        click.echo("Error: pass at least one of --name / --description / --config", err=True)
+        sys.exit(1)
+
+    client = _make_papayya_client(ctx)
+    try:
+        agent = client.agents.update(agent_id, **patch)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(agent, indent=2))
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
