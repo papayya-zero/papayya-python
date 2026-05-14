@@ -1744,6 +1744,56 @@ def api_keys_revoke(ctx: click.Context, key_id: str, project_id: str) -> None:
     click.echo(f"API key {key_id} revoked")
 
 
+# ---------------------------------------------------------------------------
+# usage — usage rollups (summary, breakdown)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def usage() -> None:
+    """Usage rollups (summary, breakdown)."""
+
+
+@usage.command("summary")
+@click.option("--from", "from_date", default=None,
+              help="Start of window (ISO date or RFC3339 timestamp)")
+@click.option("--to", "to_date", default=None,
+              help="End of window (ISO date or RFC3339 timestamp)")
+@click.pass_context
+def usage_summary(ctx: click.Context, from_date: str | None, to_date: str | None) -> None:
+    """Aggregate usage over an optional date range."""
+    client = _make_papayya_client(ctx)
+    try:
+        summary = client.usage.summary(from_date=from_date, to_date=to_date)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(summary, indent=2))
+
+
+@usage.command("breakdown")
+@click.option("--from", "from_date", default=None,
+              help="Start of window (ISO date or RFC3339 timestamp)")
+@click.option("--to", "to_date", default=None,
+              help="End of window (ISO date or RFC3339 timestamp)")
+@click.pass_context
+def usage_breakdown(ctx: click.Context, from_date: str | None, to_date: str | None) -> None:
+    """Per-dimension usage breakdown (NDJSON)."""
+    client = _make_papayya_client(ctx)
+    try:
+        rows = client.usage.breakdown(from_date=from_date, to_date=to_date)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    for row in rows:
+        click.echo(json.dumps(row))
+
+
 @main.group()
 def project() -> None:
     """Manage local project history (export, import)."""
