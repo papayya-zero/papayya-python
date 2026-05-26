@@ -207,6 +207,29 @@ class APIClient:
         if not resp.is_success:
             raise PapayyaAPIError(resp.status_code, resp.text)
 
+    def put_schedules(
+        self,
+        agent_id: str,
+        schedules: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Replace all code-managed schedules for an agent in one call.
+
+        ``schedules`` is a list of dicts each shaped like the POST body
+        (``cron_expression`` + optional ``timezone`` / ``input`` /
+        ``max_steps`` / ``budget_cents``). Each item carries
+        ``managed_by='code'`` on the wire so the server scopes its
+        full-replace to code-managed rows only — ``managed_by='api'``
+        rows (dashboard / direct-POST) are invisible to this call.
+
+        Returns the server's ``{items, summary}`` envelope.
+        """
+        body = {
+            "items": [{**item, "managed_by": "code"} for item in schedules],
+        }
+        return self._request(
+            "PUT", f"/v1/agents/{agent_id}/schedules", json=body,
+        )
+
     # -- Webhooks ------------------------------------------------------------
 
     def list_webhooks(self, agent_id: str) -> list[dict[str, Any]]:
@@ -224,6 +247,29 @@ class APIClient:
         resp = self._http.request("DELETE", f"/v1/webhooks/{webhook_id}")
         if not resp.is_success:
             raise PapayyaAPIError(resp.status_code, resp.text)
+
+    def put_webhooks(
+        self,
+        agent_id: str,
+        webhooks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Replace all code-managed webhooks for an agent in one call.
+
+        ``webhooks`` is a list of dicts each shaped like the POST body
+        (``name`` + optional ``description``). Each item carries
+        ``managed_by='code'`` on the wire — ``managed_by='api'`` rows
+        are not touched.
+
+        Returns the server's ``{items, summary}`` envelope. Newly-created
+        rows in the response carry ``secret`` + ``trigger_url`` exactly
+        once (same one-shot rotation semantic as ``create_webhook``).
+        """
+        body = {
+            "items": [{**item, "managed_by": "code"} for item in webhooks],
+        }
+        return self._request(
+            "PUT", f"/v1/agents/{agent_id}/webhooks", json=body,
+        )
 
     # -- Rate card -----------------------------------------------------------
 

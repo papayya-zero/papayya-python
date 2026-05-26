@@ -764,33 +764,48 @@ def deploy(
             deployed[slug] = resolved_agent_id
             click.echo(f"  Deployed {slug} → {resolved_agent_id}")
 
-        # Reconcile triggers if a yaml was present.
-        if spec is not None and env_name is not None:
-            env_spec = spec.envs[env_name]
-            has_triggers = any(a.schedules or a.webhooks for a in env_spec.agents.values())
-            if not has_triggers:
-                click.echo("\nNo triggers declared.")
+        # Reconcile triggers. Sources are:
+        #   1. papayya.yaml (if present) — yaml_env below.
+        #   2. @schedule / @trigger decorators attached to @agent functions
+        #      — populated in the module-level registry by _discover_agents
+        #      above, harvested via _decorator_synthesis.
+        #
+        # The synthesis helper is imported lazily because it transitively
+        # pulls papayya.decorators (croniter + zoneinfo). Eager import at
+        # cli-module load time changes module-init ordering enough to mask
+        # cross-process SQLite WAL writes in the worker subprocess test
+        # (see Plan 11's __init__.py __getattr__ fix for context).
+        yaml_env = spec.envs[env_name] if (spec is not None and env_name is not None) else None
+        from papayya.agent import get_registry
+        from papayya._decorator_synthesis import env_spec_from_registry_and_yaml
+        env_spec = env_spec_from_registry_and_yaml(yaml_env, get_registry())
+        has_triggers = any(
+            a.schedules or a.webhooks for a in env_spec.agents.values()
+        )
+        if spec is not None and env_name is not None and not has_triggers:
+            click.echo("\nNo triggers declared.")
+        elif has_triggers:
+            label = f" for env '{env_name}'" if env_name else ""
+            click.echo(f"\nReconciling triggers{label}...")
+            try:
+                plan = _reconcile.diff_env(env_spec, deployed, api)
+            except _reconcile.ReconcileError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+
+            _print_reconcile_plan(plan, api_base_url=ctx.obj["base_url"])
+
+            if dry_run:
+                click.echo("\nDry run — no changes applied.")
+                return
+
+            if plan.is_noop:
+                click.echo("\nNo changes to apply.")
             else:
-                click.echo(f"\nReconciling triggers for env '{env_name}'...")
-                try:
-                    plan = _reconcile.diff_env(env_spec, deployed, api)
-                except _reconcile.ReconcileError as e:
-                    click.echo(f"Error: {e}", err=True)
+                result = _reconcile.apply_plan(plan, api)
+                _print_apply_result(result, api_base_url=ctx.obj["base_url"])
+                if result.error is not None:
                     sys.exit(1)
-
-                _print_reconcile_plan(plan, api_base_url=ctx.obj["base_url"])
-
-                if dry_run:
-                    click.echo("\nDry run — no changes applied.")
-                    return
-
-                if plan.is_noop:
-                    click.echo("\nNo changes to apply.")
-                else:
-                    result = _reconcile.apply_plan(plan, api)
-                    _print_apply_result(result, api_base_url=ctx.obj["base_url"])
-                    if result.error is not None:
-                        sys.exit(1)
 
         # Per-env next-step nudge
         if deployed:
