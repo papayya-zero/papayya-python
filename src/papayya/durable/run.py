@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, overload
 
+from papayya import outcomes
 from papayya._serialize import build_input_snapshot
 from papayya.classify import classify_provider_error
 from papayya.errors import CreditExhausted
@@ -123,6 +124,11 @@ class PapayyaRun:
         # value. Both denormalize onto every TaskEntry written by this run.
         self._metadata: dict[str, Any] | None = config.metadata
         self._partition_key: str | None = config.partition_key
+        # v10 / Layer 3 #7 Phase 2: outer run id for sub-runs lineage.
+        # Set by Papayya.run() (explicit kwarg or @agent contextvar).
+        # Pinned at create time; on replay it's read from the loaded
+        # checkpoint, not re-derived.
+        self._parent_run_id: str | None = config.parent_run_id
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
@@ -151,6 +157,13 @@ class PapayyaRun:
                 self._metadata = existing.metadata
             if existing.partition_key is not None:
                 self._partition_key = existing.partition_key
+            # v10: parent_run_id pins at create time too. Trust the
+            # stored value on replay rather than the current invocation
+            # context (the @agent body that's re-executing might not
+            # be inside the same outer-run as when this child was
+            # originally spawned).
+            if existing.parent_run_id is not None:
+                self._parent_run_id = existing.parent_run_id
             for entry in existing.tasks:
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
@@ -189,6 +202,7 @@ class PapayyaRun:
                 agent_version=self._agent_version,
                 metadata=self._metadata,
                 partition_key=self._partition_key,
+                parent_run_id=self._parent_run_id,
             )
             self._store.create(checkpoint)
 
@@ -481,6 +495,7 @@ class PapayyaRun:
             # LLM usage extraction runs on the returned response when this
             # step was wrapped with kind="llm". Extraction never raises —
             # unknown shapes fall through to provider_shape="unknown".
+            usage: LlmUsage | None = None
             if kind == "llm":
                 usage = extract_llm_usage(result)
                 llm_prompt_tokens = usage.prompt_tokens
@@ -509,6 +524,19 @@ class PapayyaRun:
                 llm_model = None
                 llm_stop_reason = None
                 llm_provider_shape = None
+
+            # Structural outcome inspection. Defaults to OK; the inspectors
+            # overwrite when a known degraded shape (empty result, zero
+            # embedding, degenerate LLM stop reason) is detected. The
+            # parent run's worst_outcome/degraded_count aggregate updates
+            # automatically inside the store on save_task.
+            if outcomes.ENABLE_STRUCTURAL_DETECTION:
+                verdict = outcomes.inspect_result(result, usage=usage)
+                outcome_status = verdict.status
+                outcome_reason = verdict.reason
+            else:
+                outcome_status = "ok"
+                outcome_reason = None
 
             # Snapshots only populate when an item_id is in effect — the
             # lineage view has no home for snapshots that aren't attached
@@ -549,6 +577,8 @@ class PapayyaRun:
                 agent_version=self._agent_version,
                 metadata=self._metadata,
                 partition_key=self._partition_key,
+                outcome_status=outcome_status,
+                outcome_reason=outcome_reason,
             )
 
             self._cache[label] = entry

@@ -34,6 +34,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from papayya import _serialize
+from papayya._otel_baggage import (
+    annotate_current_span,
+    clear_papayya_baggage,
+    set_papayya_baggage,
+)
 from papayya.tools import ToolDefinition
 
 log = logging.getLogger("papayya.agent")
@@ -79,6 +84,26 @@ def legacy_agent_path_active() -> bool:
     (no `run` parameter) path. Used by Papayya.run() to gate the
     deprecation warning."""
     return _LEGACY_AGENT_PATH_ACTIVE.get()
+
+
+# Sub-runs lineage (Layer 3 #7 Phase 2). When an @agent body is
+# executing, this holds the active outer run's id; any Papayya.run()
+# call made from inside that body picks it up as parent_run_id (unless
+# the caller passes an explicit parent_run_id= to opt out / override).
+# The wrapper sets it AFTER creating the outer run object — so the outer
+# run itself stays parented to whatever was set when it was created
+# (None at the top level, or the grandparent if @agent was somehow
+# nested).
+_ACTIVE_RUN_ID: ContextVar[str | None] = ContextVar(
+    "papayya_active_run_id", default=None
+)
+
+
+def get_active_run_id() -> str | None:
+    """Return the run_id of the @agent body currently on this stack,
+    or None when called outside an @agent body. Used by Papayya.run()
+    to auto-set parent_run_id on child runs."""
+    return _ACTIVE_RUN_ID.get()
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +175,38 @@ def _parse_rate_limit(value: str) -> int:
     raise ValueError(
         f"rate_limit unit must be 'min' or 'sec', got {unit!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# OTel baggage extractors (Plan 07).
+#
+# The @agent wrapper has the workload name in scope (the decorator's
+# ``name`` arg) but item_id and partition_key live in the call args /
+# kwargs. Both helpers return ``None`` on absence — the baggage helper
+# treats ``None`` as "skip this key" so the matching column on
+# usage_events stays NULL instead of being stamped with a stringified
+# placeholder.
+# ---------------------------------------------------------------------------
+
+def _extract_item_id(args: tuple[Any, ...]) -> Any:
+    """Return the first positional arg, matching the ``inject_run``
+    path's existing ``item_id = args[0] if args else None`` convention.
+    Both the inject_run and legacy paths use the same extraction here so
+    baggage stays consistent across the two call shapes.
+    """
+    return args[0] if args else None
+
+
+def _extract_partition_key(kwargs: dict[str, Any]) -> Any:
+    """Pull ``partition_key`` out of kwargs if the caller passed it.
+
+    The dispatcher resolves partition_key from papayya.yaml's
+    ``partition_key:`` field and threads it into the worker invocation;
+    when uncertain we return ``None`` and the mapper writes NULL — the
+    UsageEvent still records provider/model/tokens, only workload
+    attribution is missing.
+    """
+    return kwargs.get("partition_key")
 
 
 # ---------------------------------------------------------------------------
@@ -417,17 +474,31 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
+                item_id_value = _extract_item_id(args)
+                partition_key_value = _extract_partition_key(kwargs)
+                baggage_token = set_papayya_baggage(
+                    workload=name,
+                    item_id=item_id_value,
+                    partition_key=partition_key_value,
+                )
+                annotate_current_span(
+                    workload=name,
+                    item_id=item_id_value,
+                    partition_key=partition_key_value,
+                )
                 if inject_run:
                     # Lazy import: papayya.durable.client imports
                     # papayya.papayya which imports papayya.agent.
                     from papayya.durable import papayya as _papayya_factory
-                    item_id = args[0] if args else None
                     run_obj = _papayya_factory().run(
-                        agent=name, item_id=item_id,
+                        agent=name, item_id=item_id_value,
                     )
+                    active_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
                     try:
                         return await fn(run_obj, *args, **kwargs)
                     finally:
+                        _ACTIVE_RUN_ID.reset(active_token)
+                        clear_papayya_baggage(baggage_token)
                         _AGENT_INPUT.reset(input_token)
                 else:
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
@@ -435,6 +506,7 @@ def agent(
                         return await fn(*args, **kwargs)
                     finally:
                         _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
+                        clear_papayya_baggage(baggage_token)
                         _AGENT_INPUT.reset(input_token)
         else:
             @functools.wraps(fn)
@@ -443,15 +515,29 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
+                item_id_value = _extract_item_id(args)
+                partition_key_value = _extract_partition_key(kwargs)
+                baggage_token = set_papayya_baggage(
+                    workload=name,
+                    item_id=item_id_value,
+                    partition_key=partition_key_value,
+                )
+                annotate_current_span(
+                    workload=name,
+                    item_id=item_id_value,
+                    partition_key=partition_key_value,
+                )
                 if inject_run:
                     from papayya.durable import papayya as _papayya_factory
-                    item_id = args[0] if args else None
                     run_obj = _papayya_factory().run(
-                        agent=name, item_id=item_id,
+                        agent=name, item_id=item_id_value,
                     )
+                    active_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
                     try:
                         return fn(run_obj, *args, **kwargs)
                     finally:
+                        _ACTIVE_RUN_ID.reset(active_token)
+                        clear_papayya_baggage(baggage_token)
                         _AGENT_INPUT.reset(input_token)
                 else:
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
@@ -459,6 +545,7 @@ def agent(
                         return fn(*args, **kwargs)
                     finally:
                         _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
+                        clear_papayya_baggage(baggage_token)
                         _AGENT_INPUT.reset(input_token)
 
         # Register the *wrapper*, not the raw fn — the runtime worker

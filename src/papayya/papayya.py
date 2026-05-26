@@ -204,6 +204,7 @@ class Papayya:
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         item_id: str | None = None,
+        parent_run_id: str | None = None,
         store: Any | None = None,
     ) -> Any:
         """Create a new durable run.
@@ -213,6 +214,11 @@ class Papayya:
         strict-when-declared. The extracted value is persisted in the
         indexed ``partition_key`` column on every row written under
         this run.
+
+        When called from inside an ``@agent`` body, the outer run's id
+        is picked up automatically (sub-runs lineage / Layer 3 #7). Pass
+        ``parent_run_id=`` to override the auto-detected value or to
+        link a run that was spawned out-of-band.
         """
         # Layer 3 #9: the documented pattern is now
         # ``def process_note(run, note): ...`` with ``run`` injected by
@@ -233,6 +239,7 @@ class Papayya:
                 stacklevel=2,
             )
 
+        from papayya.agent import get_active_run_id
         from papayya.durable._replay import consume_replay_hydration
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
@@ -243,6 +250,13 @@ class Papayya:
             partition_key_value = _extract_partition_key(metadata, partition_key_field)
 
         resolved_store = store or self._store_override or self._auto_store()
+
+        # Sub-runs lineage (Layer 3 #7 Phase 2): explicit kwarg wins, else
+        # auto-detect from the @agent wrapper's contextvar. Top-level
+        # calls outside any @agent body leave it None.
+        resolved_parent_run_id = (
+            parent_run_id if parent_run_id is not None else get_active_run_id()
+        )
 
         # Replay Phase 3: when papayya.durable._replay is driving us, the
         # one-shot _REPLAY_HYDRATION contextvar carries the new run's id
@@ -256,6 +270,8 @@ class Papayya:
         hydration = consume_replay_hydration()
         if hydration is not None:
             forced_run_id, prepopulated = hydration
+            # Replay preserves lineage as it was — don't re-derive
+            # parent_run_id from the current invocation context.
             return PapayyaRun(
                 DurableRunConfig(
                     agent=agent,
@@ -276,6 +292,7 @@ class Papayya:
                 item_id=item_id,
                 store=resolved_store,
                 partition_key=partition_key_value,
+                parent_run_id=resolved_parent_run_id,
             )
         )
 

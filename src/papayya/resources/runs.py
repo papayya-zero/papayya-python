@@ -22,6 +22,7 @@ class Runs:
         max_steps: int | None = None,
         budget_cents: int | None = None,
         callback_url: str | None = None,
+        parent_run_id: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"input": input}
         if model:
@@ -32,6 +33,16 @@ class Runs:
             body["budget_cents"] = budget_cents
         if callback_url:
             body["callback_url"] = callback_url
+        # Sub-runs lineage (Layer 3 #7 Phase 2). Explicit kwarg wins;
+        # else auto-pick the active @agent run's id when called from
+        # inside an @agent body. Lazy import — keeps the resource module
+        # importable without pulling in the agent contextvar machinery.
+        resolved_parent = parent_run_id
+        if resolved_parent is None:
+            from papayya.agent import get_active_run_id
+            resolved_parent = get_active_run_id()
+        if resolved_parent:
+            body["parent_run_id"] = resolved_parent
         return self._api._request("POST", f"/v1/agents/{agent_id}/runs", json=body)
 
     def get(self, run_id: str) -> dict[str, Any]:

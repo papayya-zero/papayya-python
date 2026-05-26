@@ -145,6 +145,10 @@ class CloudStore:
                     llm_model=cp.get("llm_model"),
                     llm_stop_reason=cp.get("llm_stop_reason"),
                     llm_provider_shape=cp.get("llm_provider_shape"),
+                    # Defaults match the SDK-side defaults so older control-pane
+                    # versions (pre-Plan-03) round-trip cleanly.
+                    outcome_status=cp.get("outcome_status", "ok"),
+                    outcome_reason=cp.get("outcome_reason"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
@@ -154,6 +158,9 @@ class CloudStore:
             agent_version=body.get("agent_version"),
             metadata=body.get("metadata"),
             partition_key=body.get("partition_key"),
+            parent_run_id=body.get("parent_run_id"),
+            worst_outcome_status=body.get("worst_outcome_status", "ok"),
+            degraded_count=body.get("degraded_count", 0),
         )
 
     def create(self, checkpoint: RunCheckpoint) -> None:
@@ -164,6 +171,7 @@ class CloudStore:
             "agent_version": checkpoint.agent_version,
             "metadata": checkpoint.metadata,
             "partition_key": checkpoint.partition_key,
+            "parent_run_id": checkpoint.parent_run_id,
         }
         self._execute(
             kind="create",
@@ -190,6 +198,8 @@ class CloudStore:
             "llm_model": entry.llm_model,
             "llm_stop_reason": entry.llm_stop_reason,
             "llm_provider_shape": entry.llm_provider_shape,
+            "outcome_status": entry.outcome_status,
+            "outcome_reason": entry.outcome_reason,
         }
         self._execute(
             kind="save_task",

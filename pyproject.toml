@@ -43,6 +43,17 @@ papayya = "papayya.cli:main"
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.23", "build", "twine"]
 dev = []
+# OpenTelemetry baggage propagation for auto-captured LLM cost (Plan 07).
+# Strictly optional: pip install papayya stays unchanged; customers who
+# want OTel-based cost attribution add this extra and the @agent wrapper
+# starts setting baggage + span attrs that the control-pane mapper
+# reads. opentelemetry-api alone is enough at runtime; the sdk extra is
+# included so customers who only install papayya[otel] also get a
+# working exporter pipeline.
+otel = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

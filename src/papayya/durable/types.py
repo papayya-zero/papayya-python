@@ -43,6 +43,22 @@ class TaskEntry:
     # joining (the most common use case is per-tenant filtering).
     metadata: dict[str, Any] | None = None
     partition_key: str | None = None
+    # v11: structural outcome accountability. status defaults to 'ok'; the
+    # @agent wrapper (Plan 02) overwrites it via structural inspectors.
+    # 'failed' is reserved for the future failed-row write path and for
+    # control-pane writes; this plan only writes 'ok' / 'degraded'.
+    outcome_status: str = "ok"
+    outcome_reason: str | None = None
+
+
+_OUTCOME_SEVERITY = {"ok": 0, "degraded": 1, "failed": 2}
+
+
+def _outcome_severity(status: str) -> int:
+    """Numeric severity for an outcome status. Unknown statuses are 'ok'-equivalent
+    (fail-safe: don't escalate a run's worst-outcome on a typo). Both stores
+    and Plan 02's inspectors use this to maintain a consistent severity order."""
+    return _OUTCOME_SEVERITY.get(status, 0)
 
 
 @dataclass
@@ -73,6 +89,18 @@ class RunCheckpoint:
     # with no partition_key declaration.
     metadata: dict[str, Any] | None = None
     partition_key: str | None = None
+    # v10: sub-runs lineage (Layer 3 #7). run_id of the outer run that
+    # spawned this one. None on top-level runs; populated by the
+    # dispatcher (Phase 2) when a run is created from inside another
+    # run's lifetime.
+    parent_run_id: str | None = None
+    # v11: denormalized worst-outcome across this run's task entries.
+    # worst_outcome_status is the max severity seen so far (see
+    # _outcome_severity); degraded_count is how many task entries are
+    # not 'ok'. Both update incrementally on each save_task and round-trip
+    # through the local + cloud stores.
+    worst_outcome_status: str = "ok"
+    degraded_count: int = 0
 
 
 @dataclass
@@ -91,6 +119,11 @@ class DurableRunConfig:
     # construction time so PapayyaRun never has to re-read the project
     # config.
     partition_key: str | None = None
+    # v10 / Layer 3 #7 Phase 2: sub-runs lineage. The outer run's id
+    # when this run was spawned from inside an @agent body; None for
+    # top-level runs. Resolved by Papayya.run() (explicit kwarg wins,
+    # else _ACTIVE_RUN_ID contextvar set by the @agent wrapper).
+    parent_run_id: str | None = None
     # Replay Phase 3 hydration transport. When set, PapayyaRun.init()
     # seeds its in-memory _cache with these TaskEntry rows before the
     # normal store.create() path so the wrapped agent fn's first

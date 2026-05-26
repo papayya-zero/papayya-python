@@ -21,7 +21,7 @@ from typing import Any
 
 from .. import _serialize
 from . import _errors, _schema
-from .types import RunCheckpoint, TaskEntry
+from .types import RunCheckpoint, TaskEntry, _outcome_severity
 
 
 # Flag gate for all Slice-2 capture logic. Setting to "false" restores the
@@ -373,6 +373,33 @@ _V9_INDEXES = [
 ]
 
 
+# v10: sub-runs lineage (Layer 3 #7). Mirrors hosted runs.parent_run_id
+# from control-pane migration 054. Full (not partial) index — SQLite
+# local DBs are small and partial-index syntax differs from Postgres.
+_V10_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_RUNS, _schema.COL_RUN_PARENT_RUN_ID, "TEXT"),
+]
+
+_V10_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_PARENT} "
+    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_PARENT_RUN_ID});",
+]
+
+
+# v11: structural outcome accountability (Plan 01). Adds outcome verdict
+# columns on tasks and denormalized worst-outcome aggregates on runs.
+# Both task columns are NOT NULL with sensible defaults so older rows
+# read as 'ok' / NULL after the migration without a backfill.
+_V11_ADD_COLUMNS: list[tuple[str, str, str]] = [
+    (_schema.TBL_TASKS, _schema.COL_TASK_OUTCOME_STATUS, "TEXT NOT NULL DEFAULT 'ok'"),
+    (_schema.TBL_TASKS, _schema.COL_TASK_OUTCOME_REASON, "TEXT"),
+    (_schema.TBL_RUNS,  _schema.COL_RUN_WORST_OUTCOME_STATUS, "TEXT NOT NULL DEFAULT 'ok'"),
+    (_schema.TBL_RUNS,  _schema.COL_RUN_DEGRADED_COUNT, "INTEGER NOT NULL DEFAULT 0"),
+]
+
+_V11_INDEXES: list[str] = []
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}
@@ -562,6 +589,30 @@ def _apply_v8_to_v9(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "9")
 
 
+def _apply_v9_to_v10(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "9")
+    with conn:
+        for table, column, type_decl in _V10_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        for index_sql in _V10_INDEXES:
+            conn.execute(index_sql)
+        _set_schema_version(conn, "10")
+
+
+def _apply_v10_to_v11(conn: sqlite3.Connection, db_path: Path) -> None:
+    _backup_db(db_path, "10")
+    with conn:
+        for table, column, type_decl in _V11_ADD_COLUMNS:
+            if column in _existing_columns(conn, table):
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+        for index_sql in _V11_INDEXES:
+            conn.execute(index_sql)
+        _set_schema_version(conn, "11")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
@@ -596,6 +647,12 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "8":
             _apply_v8_to_v9(conn, db_path)
             current = "9"
+        elif current == "9":
+            _apply_v9_to_v10(conn, db_path)
+            current = "10"
+        elif current == "10":
+            _apply_v10_to_v11(conn, db_path)
+            current = "11"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -649,6 +706,8 @@ class SQLiteStore:
                 agent_version=t[_schema.COL_TASK_AGENT_VERSION],
                 metadata=_decode_metadata(t[_schema.COL_TASK_METADATA]),
                 partition_key=t[_schema.COL_TASK_PARTITION_KEY],
+                outcome_status=t[_schema.COL_TASK_OUTCOME_STATUS],
+                outcome_reason=t[_schema.COL_TASK_OUTCOME_REASON],
             )
             for t in task_rows
         ]
@@ -665,6 +724,9 @@ class SQLiteStore:
             agent_version=row[_schema.COL_RUN_AGENT_VERSION],
             metadata=_decode_metadata(row[_schema.COL_RUN_METADATA]),
             partition_key=row[_schema.COL_RUN_PARTITION_KEY],
+            parent_run_id=row[_schema.COL_RUN_PARENT_RUN_ID],
+            worst_outcome_status=row[_schema.COL_RUN_WORST_OUTCOME_STATUS],
+            degraded_count=row[_schema.COL_RUN_DEGRADED_COUNT],
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -687,8 +749,10 @@ class SQLiteStore:
                    {_schema.COL_TASK_ERROR_CATEGORY},
                    {_schema.COL_TASK_AGENT_VERSION},
                    {_schema.COL_TASK_METADATA},
-                   {_schema.COL_TASK_PARTITION_KEY})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_TASK_PARTITION_KEY},
+                   {_schema.COL_TASK_OUTCOME_STATUS},
+                   {_schema.COL_TASK_OUTCOME_REASON})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -709,6 +773,8 @@ class SQLiteStore:
                     entry.agent_version,
                     _encode_metadata(entry.metadata),
                     entry.partition_key,
+                    entry.outcome_status,
+                    entry.outcome_reason,
                 ),
             )
             self._conn.execute(
@@ -725,6 +791,33 @@ class SQLiteStore:
                        WHERE run_id = ? AND {_schema.COL_RUN_ITEM_ID} IS NULL""",
                     (entry.item_id, run_id),
                 )
+            # Incremental aggregation of the run's worst-outcome severity.
+            # save_task is INSERT-only (no in-place task rewrites) so an
+            # incremental update is sound. Skips the UPDATE when neither
+            # value changes to avoid touching the row on the all-'ok' path.
+            run_row = self._conn.execute(
+                f"""SELECT {_schema.COL_RUN_WORST_OUTCOME_STATUS} AS worst,
+                          {_schema.COL_RUN_DEGRADED_COUNT} AS degraded
+                   FROM runs WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            if run_row is not None:
+                cur_status = run_row["worst"]
+                cur_count = run_row["degraded"]
+                next_status = (
+                    entry.outcome_status
+                    if _outcome_severity(entry.outcome_status) > _outcome_severity(cur_status)
+                    else cur_status
+                )
+                next_count = cur_count + (0 if entry.outcome_status == "ok" else 1)
+                if next_status != cur_status or next_count != cur_count:
+                    self._conn.execute(
+                        f"""UPDATE runs SET
+                               {_schema.COL_RUN_WORST_OUTCOME_STATUS} = ?,
+                               {_schema.COL_RUN_DEGRADED_COUNT} = ?
+                           WHERE run_id = ?""",
+                        (next_status, next_count, run_id),
+                    )
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
         """Transition a run's status, and roll up terminal counts to the batch."""
@@ -810,8 +903,9 @@ class SQLiteStore:
             f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
                batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT},
                {_schema.COL_RUN_AGENT_VERSION},
-               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_PARTITION_KEY})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_PARTITION_KEY},
+               {_schema.COL_RUN_PARENT_RUN_ID})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
                 checkpoint.agent,
@@ -824,6 +918,7 @@ class SQLiteStore:
                 checkpoint.agent_version,
                 _encode_metadata(checkpoint.metadata),
                 checkpoint.partition_key,
+                checkpoint.parent_run_id,
             ),
         )
         self._conn.commit()

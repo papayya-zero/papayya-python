@@ -123,8 +123,31 @@ COL_TASK_METADATA = "metadata"
 COL_TASK_PARTITION_KEY = "partition_key"
 
 
+# v10 column — sub-runs lineage (Layer 3 #7). Mirrors the hosted
+# control-pane runs.parent_run_id column from migration 054. NULL on
+# top-level runs; the dispatcher sets this in Phase 2 when a run is
+# created from inside another run's lifetime, so dashboards can roll
+# up children under their parent.
+COL_RUN_PARENT_RUN_ID = "parent_run_id"
+
+
+# v11 columns — structural outcome accountability (Plan 01 of the
+# workload-layer redesign). outcome_status / outcome_reason on tasks
+# carry the verdict produced by structural inspectors (Plan 02 wires
+# the writer). worst_outcome_status / degraded_count on runs are
+# denormalized aggregates maintained on each task insert so dashboards
+# can answer "which runs had any degraded step" without joining tasks.
+# 'failed' is part of the severity order but no SDK write path produces
+# it in this slice; reserved for the future failed-row path and for
+# control-pane writes.
+COL_TASK_OUTCOME_STATUS = "outcome_status"
+COL_TASK_OUTCOME_REASON = "outcome_reason"
+COL_RUN_WORST_OUTCOME_STATUS = "worst_outcome_status"
+COL_RUN_DEGRADED_COUNT = "degraded_count"
+
+
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "11"
 
 
 # Indexes — named explicitly so we can check for their presence in tests
@@ -136,3 +159,4 @@ IDX_RUNS_ITEM = "idx_runs_item"
 IDX_RUNS_DLQ = "idx_runs_dlq"
 IDX_RUNS_PARTITION = "idx_runs_partition"
 IDX_TASKS_PARTITION = "idx_tasks_partition"
+IDX_RUNS_PARENT = "idx_runs_parent"
