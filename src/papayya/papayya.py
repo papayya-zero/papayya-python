@@ -52,6 +52,7 @@ from papayya.resources.projects import Projects
 from papayya.resources.runs import Runs
 from papayya.resources.schedules import Schedules
 from papayya.resources.secrets import Secrets
+from papayya.resources.triage import Triage
 from papayya.resources.usage import Usage
 from papayya.resources.webhooks import Webhooks
 
@@ -337,6 +338,10 @@ class Papayya:
     @cached_property
     def usage(self) -> Usage:
         return Usage(self._api_client())
+
+    @cached_property
+    def triage(self) -> Triage:
+        return Triage(self._api_client())
 
     # --- lifecycle ---------------------------------------------------- #
 

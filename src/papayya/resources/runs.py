@@ -162,6 +162,38 @@ class Runs:
         replayed_from. Returns the new run (HTTP 202)."""
         return self._api._request("POST", f"/v1/runs/{run_id}/dlq/replay")
 
+    # ── Quarantine ─────────────────────────────────────────────────────────
+    # Quarantine is the non-terminal soft-pause lane (Plan 08/09): a run
+    # paused mid-stream, in-flight state preserved, awaiting an operator
+    # decision. Transitions: running ↔ quarantine, quarantine → cancelled.
+    # Distinct from DLQ above (DLQ handles terminal failed/budget_exceeded
+    # rows). Use Triage.list() to see both lanes through one feed.
+
+    def quarantine(self, run_id: str, reason: str) -> dict[str, Any]:
+        """Move a run into the non-terminal quarantine lane.
+
+        Reason is required; the server rejects an empty string. The run
+        keeps its in-flight state — call ``release(run_id)`` to resume or
+        ``discard(run_id)`` to abandon. 409 if the run isn't running.
+        """
+        return self._api._request(
+            "POST",
+            f"/v1/runs/{run_id}/quarantine",
+            json={"reason": reason},
+        )
+
+    def release(self, run_id: str) -> dict[str, Any]:
+        """Exit quarantine by resuming the run in-place. Returns the
+        updated run with ``quarantine_disposition='released'``. 409 if
+        the run is not currently in quarantine."""
+        return self._api._request("POST", f"/v1/runs/{run_id}/release")
+
+    def discard(self, run_id: str) -> dict[str, Any]:
+        """Exit quarantine by abandoning the run. Returns the updated
+        run with ``quarantine_disposition='discarded'`` and status
+        ``cancelled``. 409 if the run is not currently in quarantine."""
+        return self._api._request("POST", f"/v1/runs/{run_id}/discard")
+
 
 def _parse_sse(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
     """Parse the SSE wire format into ``{event, data, id?}`` dicts.

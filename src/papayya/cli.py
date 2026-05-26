@@ -967,6 +967,160 @@ def dlq_replay(ctx: click.Context, run_id: str) -> None:
     click.echo(json.dumps(run, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# triage — unified Needs Attention feed across DLQ + quarantine
+# ---------------------------------------------------------------------------
+
+@main.group()
+def triage() -> None:
+    """Unified triage feed: list runs needing attention; retry/dismiss/
+    acknowledge dispatch to the right per-state endpoint client-side."""
+
+
+@triage.command("list")
+@click.option("--workload", default=None, help="Filter by workload name")
+@click.option("--tenant", default=None, help="Filter by tenant (metadata.tenant)")
+@click.option(
+    "--kind",
+    type=click.Choice(["all", "dlq", "quarantine"]),
+    default="all",
+    show_default=True,
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Page size (server-clamped to [1,200])",
+)
+@click.pass_context
+def triage_list(
+    ctx: click.Context,
+    workload: str | None,
+    tenant: str | None,
+    kind: str,
+    limit: int,
+) -> None:
+    """List runs awaiting triage (NDJSON, auto-paginates)."""
+    client = _make_papayya_client(ctx)
+    try:
+        for row in client.triage.iter(
+            workload=workload,
+            tenant=tenant,
+            kind=kind,
+            page_size=limit,
+        ):
+            click.echo(json.dumps(row))
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
+@triage.command("retry")
+@click.argument("run_id")
+@click.pass_context
+def triage_retry(ctx: click.Context, run_id: str) -> None:
+    """Retry a triage row.
+
+    Client-side dispatch: GETs the run, inspects status, calls /release
+    (quarantine) or /dlq/replay (failed / budget_exceeded). Exits with
+    code 2 on any other status.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.get(run_id)
+        status = run.get("status")
+        if status == "quarantine":
+            out = client.runs.release(run_id)
+        elif status in ("failed", "budget_exceeded"):
+            out = client.runs.dlq_replay(run_id)
+        else:
+            click.echo(
+                f"Error: run {run_id} is status={status!r}; retry only "
+                "applies to quarantine / failed / budget_exceeded runs",
+                err=True,
+            )
+            sys.exit(2)
+        click.echo(json.dumps(out, indent=2))
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
+@triage.command("dismiss")
+@click.argument("run_id")
+@click.pass_context
+def triage_dismiss(ctx: click.Context, run_id: str) -> None:
+    """Dismiss a triage row.
+
+    Client-side dispatch: GETs the run, inspects status, calls /discard
+    (quarantine) or /dlq/skip (failed / budget_exceeded).
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.get(run_id)
+        status = run.get("status")
+        if status == "quarantine":
+            out = client.runs.discard(run_id)
+        elif status in ("failed", "budget_exceeded"):
+            out = client.runs.dlq_skip(run_id)
+        else:
+            click.echo(
+                f"Error: run {run_id} is status={status!r}; dismiss only "
+                "applies to quarantine / failed / budget_exceeded runs",
+                err=True,
+            )
+            sys.exit(2)
+        click.echo(json.dumps(out, indent=2))
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
+@triage.command("acknowledge")
+@click.argument("run_id")
+@click.pass_context
+def triage_acknowledge(ctx: click.Context, run_id: str) -> None:
+    """Acknowledge a triage row without resolving it.
+
+    DLQ rows: marks ``dlq_disposition='acknowledged'``. Quarantine rows
+    are not currently supported (Plan 09 amendment #3 — quarantine
+    acknowledge is not exposed in v1); use ``dismiss`` or ``retry``.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        run = client.runs.get(run_id)
+        status = run.get("status")
+        if status in ("failed", "budget_exceeded"):
+            out = client.runs.dlq_acknowledge(run_id)
+        elif status == "quarantine":
+            click.echo(
+                "Error: acknowledge is not supported for quarantine rows; "
+                "use `papayya triage dismiss` or `papayya triage retry`",
+                err=True,
+            )
+            sys.exit(2)
+        else:
+            click.echo(
+                f"Error: run {run_id} is status={status!r}; acknowledge "
+                "only applies to failed / budget_exceeded runs",
+                err=True,
+            )
+            sys.exit(2)
+        click.echo(json.dumps(out, indent=2))
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
 @main.command("replay")
 @click.option("--run", "run_id", required=True, help="Run ID to replay")
 @click.option("--file", "file", default=None,
