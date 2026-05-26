@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from papayya import _serialize
+from papayya._config import ScheduleSpec, WebhookSpec
 from papayya._otel_baggage import (
     annotate_current_span,
     clear_papayya_baggage,
@@ -142,6 +143,14 @@ class AgentRegistration:
     # at the decorator is "N/min" or "N/sec" — parsed once and stored
     # here as int RPM.
     rate_limit_per_min: int | None = None
+    # Decorator-attached schedule + webhook metadata (Plan 11). Populated
+    # by papayya.decorators.schedule / .trigger when those decorators
+    # wrap an already-@agent-wrapped function. Empty by default — agents
+    # without @schedule / @trigger continue to declare triggers in
+    # papayya.yaml. Plan 12's bundler-harvest path reads these lists to
+    # synthesise the EnvSpec the reconciler consumes.
+    schedules: list[ScheduleSpec] = field(default_factory=list)
+    webhooks: list[WebhookSpec] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

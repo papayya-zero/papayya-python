@@ -31,6 +31,10 @@ class _Strict(BaseModel):
 
 class ScheduleSpec(_Strict):
     cron: str = Field(..., description="Cron expression, UTC only in v1.")
+    timezone: str = Field(
+        default="UTC",
+        description="IANA timezone for the cron expression. Defaults to UTC.",
+    )
 
 
 class WebhookSpec(_Strict):

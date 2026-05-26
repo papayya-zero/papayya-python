@@ -25,10 +25,19 @@ def __getattr__(name: str):
             return _mark_degraded
         if name == "mark_outcome":
             return _mark_outcome
+    if name in ("schedule", "trigger"):
+        # Plan 11 decorators. Deferred for the same reason as Plan 10's
+        # iter/mark_* — pulling papayya.decorators (which transitively
+        # imports croniter + zoneinfo + papayya._config) at package
+        # import time changes module-init ordering in the worker
+        # subprocess enough to mask cross-process SQLite WAL writes.
+        from papayya.decorators import schedule as _schedule, trigger as _trigger
+        return _schedule if name == "schedule" else _trigger
     raise AttributeError(f"module 'papayya' has no attribute {name!r}")
 
 __all__ = [
     "agent", "get_registry", "get_agent",
+    "schedule", "trigger",
     "Papayya", "Client", "RunResult",
     "papayya", "PapayyaRun",
     "CreditExhausted", "BudgetExceeded",
