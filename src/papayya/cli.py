@@ -795,6 +795,18 @@ def deploy(
 
             _print_reconcile_plan(plan, api_base_url=ctx.obj["base_url"])
 
+            # Plan 13 — PUT-dry-run preview for managed_by='code'. Probes
+            # the same PUT endpoints apply_plan would call, so the preview
+            # is byte-faithful to what the next deploy would do. Runs on
+            # every deploy that hits reconcile (both --dry-run and apply)
+            # so the operator sees the same diff before the apply attempt.
+            try:
+                managed_diffs = _collect_managed_diff(env_spec, deployed, api)
+            except PapayyaAPIError as e:
+                click.echo(f"Error (managed_by preview): {e}", err=True)
+                sys.exit(1)
+            _print_managed_diff(managed_diffs)
+
             if dry_run:
                 click.echo("\nDry run — no changes applied.")
                 return
@@ -880,6 +892,95 @@ def _print_reconcile_plan(plan, *, api_base_url: str) -> None:
                         f"      note: $ {op.secret_env} is not set locally — "
                         "you'll need the secret printed after create"
                     )
+
+
+def _collect_managed_diff(
+    env_spec,
+    deployed: dict[str, str],
+    api,
+) -> list[tuple[str, str, dict]]:
+    """Probe the PUT endpoints with ?dry_run=true for each agent's
+    schedules + webhooks. Returns ordered (slug, resource, diff) tuples
+    so the renderer prints per agent with schedules before webhooks.
+
+    Probes both endpoints unconditionally even when the yaml declares
+    zero of a given resource type — an empty desired set is still a
+    valid desired state, and the operator needs to see "this deploy
+    would delete the N leftover managed_by='code' rows" before it
+    happens.
+    """
+    out: list[tuple[str, str, dict]] = []
+    for slug, agent_spec in env_spec.agents.items():
+        agent_id = deployed[slug]
+        sched_payload = [
+            {"cron_expression": s.cron, "timezone": getattr(s, "timezone", "UTC")}
+            for s in agent_spec.schedules
+        ]
+        wh_payload = [
+            {"name": w.name, "secret_env": w.secret_env}
+            for w in agent_spec.webhooks
+        ]
+        sched_diff = api.put_schedules(agent_id, sched_payload, dry_run=True)
+        wh_diff = api.put_webhooks(agent_id, wh_payload, dry_run=True)
+        out.append((slug, "schedule", sched_diff))
+        out.append((slug, "webhook", wh_diff))
+    return out
+
+
+def _summarize_field_changes(before: dict, after: dict) -> str:
+    """`"k: 'old' → 'new', k2: 'old2' → 'new2'"` for an update line.
+    Unchanged keys are omitted. Capped at three keys to keep the line
+    scannable; truncation marker is `…`.
+    """
+    parts: list[str] = []
+    for key in sorted(set(before) | set(after)):
+        if before.get(key) != after.get(key):
+            parts.append(f"{key}: {before.get(key)!r} → {after.get(key)!r}")
+        if len(parts) >= 3:
+            parts.append("…")
+            break
+    return ", ".join(parts)
+
+
+def _print_managed_diff(diffs: list[tuple[str, str, dict]]) -> None:
+    """Render the managed_by='code' diff produced by the PUT dry-run
+    probes. Composes below the legacy reconcile-plan output (additive)."""
+    if not diffs:
+        return
+    click.echo("\nmanaged_by='code' diff (PUT-replace preview):")
+    current_slug: str | None = None
+    for slug, resource, diff in diffs:
+        if slug != current_slug:
+            click.echo(f"\nagent: {slug}")
+            current_slug = slug
+        creates = diff.get("create") or []
+        updates = diff.get("update") or []
+        deletes = diff.get("delete") or []
+        n_unmanaged = diff.get("unmanaged_skipped", 0)
+        click.echo(
+            f"  managed_by='code' {resource}s: "
+            f"{len(creates)} to create, {len(updates)} to update, "
+            f"{len(deletes)} to delete "
+            f"({n_unmanaged} unmanaged rows untouched)"
+        )
+        for op in creates:
+            label = op.get("cron_expression") or op.get("name") or "?"
+            click.echo(f"    + {resource} {label:<22} create")
+        for op in updates:
+            before = op.get("before") or {}
+            after = op.get("after") or {}
+            label = (
+                after.get("cron_expression")
+                or after.get("name")
+                or op.get("id")
+                or "?"
+            )
+            changes = _summarize_field_changes(before, after)
+            suffix = f" ({changes})" if changes else ""
+            click.echo(f"    ~ {resource} {label:<22} update{suffix}")
+        for op in deletes:
+            label = op.get("cron_expression") or op.get("name") or "?"
+            click.echo(f"    - {resource} {label:<22} delete")
 
 
 def _print_apply_result(result, *, api_base_url: str) -> None:

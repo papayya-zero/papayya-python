@@ -211,6 +211,8 @@ class APIClient:
         self,
         agent_id: str,
         schedules: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Replace all code-managed schedules for an agent in one call.
 
@@ -221,14 +223,22 @@ class APIClient:
         full-replace to code-managed rows only — ``managed_by='api'``
         rows (dashboard / direct-POST) are invisible to this call.
 
-        Returns the server's ``{items, summary}`` envelope.
+        ``dry_run=True`` flips the server into preview mode: the same
+        diff is computed against current ``managed_by='code'`` rows but
+        no rows are mutated. The response shape changes to the diff
+        envelope (``managed_by``, ``create``, ``update``, ``delete``,
+        ``unmanaged_skipped``) — see Plan 13 for the consumer.
+
+        Returns the server's apply-mode ``{items, summary}`` envelope by
+        default, or the dry-run diff envelope when ``dry_run=True``.
         """
         body = {
             "items": [{**item, "managed_by": "code"} for item in schedules],
         }
-        return self._request(
-            "PUT", f"/v1/agents/{agent_id}/schedules", json=body,
-        )
+        path = f"/v1/agents/{agent_id}/schedules"
+        if dry_run:
+            path = f"{path}?dry_run=true"
+        return self._request("PUT", path, json=body)
 
     # -- Webhooks ------------------------------------------------------------
 
@@ -252,6 +262,8 @@ class APIClient:
         self,
         agent_id: str,
         webhooks: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Replace all code-managed webhooks for an agent in one call.
 
@@ -260,16 +272,23 @@ class APIClient:
         ``managed_by='code'`` on the wire — ``managed_by='api'`` rows
         are not touched.
 
-        Returns the server's ``{items, summary}`` envelope. Newly-created
-        rows in the response carry ``secret`` + ``trigger_url`` exactly
-        once (same one-shot rotation semantic as ``create_webhook``).
+        ``dry_run=True`` flips the server into preview mode: the proposed
+        diff is computed and returned without generating any new webhook
+        secrets and without mutating any row. Use Plan 13's CLI renderer
+        to surface the diff to the operator.
+
+        Returns the server's apply-mode ``{items, summary}`` envelope by
+        default (newly-created rows carry ``secret`` + ``trigger_url``
+        exactly once), or the dry-run diff envelope when
+        ``dry_run=True`` (no secret in the response).
         """
         body = {
             "items": [{**item, "managed_by": "code"} for item in webhooks],
         }
-        return self._request(
-            "PUT", f"/v1/agents/{agent_id}/webhooks", json=body,
-        )
+        path = f"/v1/agents/{agent_id}/webhooks"
+        if dry_run:
+            path = f"{path}?dry_run=true"
+        return self._request("PUT", path, json=body)
 
     # -- Rate card -----------------------------------------------------------
 

@@ -193,8 +193,19 @@ envs:
     api = deploy_env["api"]
     api.list_schedules.assert_called()
     api.list_webhooks.assert_called()
-    api.put_schedules.assert_not_called()
-    api.put_webhooks.assert_not_called()
+    # Plan 13: dry-run now probes the PUT endpoints with dry_run=True so
+    # the preview is byte-faithful to what apply would do. The probe must
+    # NOT trigger an apply.
+    api.put_schedules.assert_called_once_with(
+        "agt1",
+        [{"cron_expression": "0 9 * * *", "timezone": "UTC"}],
+        dry_run=True,
+    )
+    api.put_webhooks.assert_called_once_with(
+        "agt1",
+        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        dry_run=True,
+    )
     api.create_schedule.assert_not_called()
     api.create_webhook.assert_not_called()
     api.delete_schedule.assert_not_called()
@@ -216,13 +227,23 @@ envs:
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
     api = deploy_env["api"]
-    # Post-Plan 12: one PUT per agent per resource type. The old N-call
-    # create/delete loop is gone — create_schedule / create_webhook stay
-    # on the client for direct-API users but are not in the apply path.
-    api.put_schedules.assert_called_once_with(
-        "agt1", [{"cron_expression": "0 9 * * *"}],
+    # Post-Plan 12 + Plan 13: every non-dry-run deploy first probes the
+    # PUT endpoints with dry_run=True for the preview, then issues the
+    # real apply PUT. Two calls per resource per agent.
+    assert api.put_schedules.call_count == 2
+    api.put_schedules.assert_any_call(
+        "agt1",
+        [{"cron_expression": "0 9 * * *", "timezone": "UTC"}],
+        dry_run=True,
     )
-    api.put_webhooks.assert_called_once_with("agt1", [{"name": "trigger"}])
+    api.put_schedules.assert_any_call("agt1", [{"cron_expression": "0 9 * * *"}])
+    assert api.put_webhooks.call_count == 2
+    api.put_webhooks.assert_any_call(
+        "agt1",
+        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        dry_run=True,
+    )
+    api.put_webhooks.assert_any_call("agt1", [{"name": "trigger"}])
     api.create_schedule.assert_not_called()
     api.create_webhook.assert_not_called()
     assert "Applied 2 of 2 operations." in stdout
@@ -278,7 +299,14 @@ envs:
     assert "rotating webhook 'new-name'" in stdout
     # Desired set carries only the new name; the old name's absence is
     # what triggers the server-side DELETE inside the same transaction.
-    api.put_webhooks.assert_called_once_with("agt1", [{"name": "new-name"}])
+    # Plan 13: dry-run probe runs first, then the apply PUT.
+    assert api.put_webhooks.call_count == 2
+    api.put_webhooks.assert_any_call(
+        "agt1",
+        [{"name": "new-name", "secret_env": "MY_SECRET"}],
+        dry_run=True,
+    )
+    api.put_webhooks.assert_any_call("agt1", [{"name": "new-name"}])
     api.delete_webhook.assert_not_called()
     api.create_webhook.assert_not_called()
 
@@ -288,10 +316,21 @@ def test_deploy_partial_failure_stops_and_reports(
 ) -> None:
     from papayya.api import PapayyaAPIError
     api = deploy_env["api"]
-    # put_schedules succeeds; put_webhooks raises. Both webhook ops
-    # belong to the failed PUT — applied counts only the schedule op
-    # that landed before the failure.
-    api.put_webhooks.side_effect = PapayyaAPIError(500, "boom")
+    # put_schedules succeeds (twice: dry-run + apply). put_webhooks dry-run
+    # probe must succeed (so Plan 13's preview renders), then the apply
+    # call raises. Models a real-world failure where the preview matches
+    # reality but the transaction blows up at apply time.
+    dryrun_wh_response = {
+        "managed_by": "code",
+        "create": [{"name": "a"}, {"name": "b"}],
+        "update": [],
+        "delete": [],
+        "unmanaged_skipped": 0,
+    }
+    api.put_webhooks.side_effect = [
+        dryrun_wh_response,             # 1st call: Plan 13 preview probe
+        PapayyaAPIError(500, "boom"),   # 2nd call: apply
+    ]
     _write_yaml(deploy_env["tmp_path"], """\
 version: 1
 envs:
@@ -305,8 +344,10 @@ envs:
 """)
     exit_code, stdout, stderr = _invoke("deploy")
     assert exit_code != 0
-    api.put_schedules.assert_called_once()
-    assert api.put_webhooks.call_count == 1
+    # put_schedules: dry-run probe + apply = 2 calls.
+    # put_webhooks: dry-run probe (ok) + apply (raises) = 2 calls.
+    assert api.put_schedules.call_count == 2
+    assert api.put_webhooks.call_count == 2
     assert "Applied 1 of 3 operations." in stderr
 
 
@@ -421,8 +462,18 @@ envs:
     assert "schedule 0 9 * * *" in stdout
     assert "webhook  trigger" in stdout
     api = deploy_env["api"]
-    api.put_schedules.assert_not_called()
-    api.put_webhooks.assert_not_called()
+    # Plan 13: --dry-run still probes PUT endpoints to render the
+    # managed_by='code' preview. Apply is what's suppressed.
+    api.put_schedules.assert_called_once_with(
+        "agt1",
+        [{"cron_expression": "0 9 * * *", "timezone": "UTC"}],
+        dry_run=True,
+    )
+    api.put_webhooks.assert_called_once_with(
+        "agt1",
+        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        dry_run=True,
+    )
 
 
 def test_deploy_decorator_only_no_yaml_succeeds(
@@ -455,12 +506,25 @@ def test_deploy_decorator_only_no_yaml_succeeds(
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
     # The decorator-attached schedule + webhook reached the reconciler
-    # and produced one PUT each.
+    # and produced one apply PUT each. Plan 13 adds a preview probe
+    # alongside (dry-run flavor), so total = 2 calls per resource.
     api = deploy_env["api"]
-    api.put_schedules.assert_called_once_with(
+    assert api.put_schedules.call_count == 2
+    api.put_schedules.assert_any_call(
+        "agt1",
+        [{"cron_expression": "0 9 * * *", "timezone": "UTC"}],
+        dry_run=True,
+    )
+    api.put_schedules.assert_any_call(
         "agt1", [{"cron_expression": "0 9 * * *"}],
     )
-    api.put_webhooks.assert_called_once_with("agt1", [{"name": "trigger"}])
+    assert api.put_webhooks.call_count == 2
+    api.put_webhooks.assert_any_call(
+        "agt1",
+        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        dry_run=True,
+    )
+    api.put_webhooks.assert_any_call("agt1", [{"name": "trigger"}])
 
     # Clean up the global registry so this test doesn't leak.
     _registry.clear()
