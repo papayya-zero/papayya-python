@@ -139,19 +139,11 @@ class APIClient:
         # {step_number, step_type, output} shape.
         return self._request("GET", f"/v1/durable/runs/{run_id}/checkpoints")
 
-    # v1→v2 cutover: cancel_run retired with the v1 DROP — its
-    # POST /v1/runs/{id}/cancel endpoint is gone and durable runs have no
-    # cancel verb (use the quarantine→discard lifecycle instead).
-
-    # -- Tool Calls (worker bridge) ------------------------------------------
-
-    def poll_tool_calls(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/v1/tool-calls/pending")
-
-    def resolve_tool_call(self, tool_call_id: str, output: Any) -> dict[str, Any]:
-        from papayya._serialize import encode_user_value
-        output_str = output if isinstance(output, str) else encode_user_value(output)
-        return self._request("POST", f"/v1/tool-calls/{tool_call_id}/result", json={"output": output_str})
+    # v1→v2 cutover: cancel_run AND the tool-call worker bridge
+    # (poll_tool_calls/resolve_tool_call → /v1/tool-calls/*) retired with the
+    # v1 DROP. Those routes and the tool_calls table are gone server-side
+    # (control-pane slice 1 + migration 063); durable runs have no cancel verb
+    # (use the quarantine→discard lifecycle instead).
 
     # -- Deployments ---------------------------------------------------------
 

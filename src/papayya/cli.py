@@ -2555,26 +2555,6 @@ def rate_card_edit(ctx: click.Context) -> None:
     click.echo(f"Rate card saved ({len(edited)} models).")
 
 
-@main.command()
-@click.option("--file", required=True, help="Path to agent definition file")
-@click.option("--poll-interval", default=2.0, help="Poll interval in seconds")
-@click.pass_context
-def worker(ctx: click.Context, file: str, poll_interval: float) -> None:
-    """Run a tool worker that executes tool calls for cloud runs."""
-    from papayya.worker import run_worker
-
-    agent = _load_agent_from_file(file)
-    scope = _env_scope(ctx.obj)
-    resolved_key = _require_api_key(scope)
-    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
-    api = APIClient(config)
-
-    try:
-        run_worker(agent, api, poll_interval=poll_interval)
-    finally:
-        api.close()
-
-
 # ---------------------------------------------------------------------------
 # batch — submit / inspect / cancel / retry batches
 # ---------------------------------------------------------------------------
