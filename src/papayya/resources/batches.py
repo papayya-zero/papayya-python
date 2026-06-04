@@ -22,11 +22,14 @@ _TERMINAL_BATCH_STATUSES = frozenset({"completed", "failed", "cancelled", "pause
 class Batches:
     """Client for the /v1/batches surface.
 
-    Mirrors the Runs resource shape. A batch is a collection of runs
-    submitted together under a single concurrency + budget cap; see
-    memory/batch_primitive_design.md. The backend enforces both caps at
-    dispatch — the SDK just hands over the submission and exposes the
-    read + lifecycle endpoints.
+    v1→v2 cutover: a batch is no longer its own table row. Submitting
+    (:meth:`create` / :meth:`create_stream`) now mints N durable runs that
+    share a ``group_id`` (a minted parent_run_id) and returns
+    ``{group_id, agent_id, status, total_items, created_at}`` — not the old
+    batch shape. The read + lifecycle methods below (get/list/runs/cancel/
+    retry_failed/dlq/…) still target the v1 ``/v1/batches/*`` endpoints,
+    which retire with the v1 DROP; polling a group as durable runs filtered
+    by ``group_id`` is the follow-up that replaces them.
     """
 
     def __init__(self, api: APIClient) -> None:

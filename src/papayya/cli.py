@@ -2367,25 +2367,33 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
         click.echo(f"  Status: {result.get('status', 'unknown')}")
         click.echo(f"  Model: {reg.model}")
 
-        # Poll until complete
+        # Poll until complete. The run is a durable_run now: it starts
+        # 'queued', flips to 'running' when a worker leases it, then to a
+        # terminal state. Progress = number of checkpoints written so far.
         click.echo("Waiting for completion...")
         while True:
             time.sleep(2)
             status_resp = api.get_run(run_id)
             state = status_resp.get("status", "unknown")
-            step = status_resp.get("current_step", 0)
-            click.echo(f"  Step {step} — {state}")
+            done = len(status_resp.get("checkpoints", []) or [])
+            click.echo(f"  {done} step(s) — {state}")
 
             if state in ("completed", "failed", "cancelled", "budget_exceeded"):
                 break
 
-        # Show final result
+        # Show final result. Durable checkpoints carry {label, result};
+        # there's no v1 step_number/step_type/output shape any more.
         click.echo(f"\nFinal status: {state}")
-        steps = api.get_steps(run_id)
-        for s in steps:
-            output = s.get("output", {})
-            content = output.get("content", "") if isinstance(output, dict) else str(output)
-            click.echo(f"  Step {s['step_number']} [{s['step_type']}]: {content[:200]}")
+        checkpoints = api.get_steps(run_id)
+        for c in checkpoints:
+            label = c.get("label", "?")
+            result = c.get("result")
+            content = (
+                result.get("content", "")
+                if isinstance(result, dict)
+                else "" if result is None else str(result)
+            )
+            click.echo(f"  {label}: {str(content)[:200]}")
 
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)

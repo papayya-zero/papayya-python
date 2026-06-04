@@ -45,11 +45,17 @@ class Runs:
             body["parent_run_id"] = resolved_parent
         return self._api._request("POST", f"/v1/agents/{agent_id}/runs", json=body)
 
+    # v1→v2 cutover: a run is a durable_run. The read/poll surface below
+    # targets /v1/durable/runs/*. The lifecycle mutations further down
+    # (cancel/replay/dlq_*/quarantine/release/discard) still target the v1
+    # /v1/runs/* surface — they retire with the v1 DROP, when the durable
+    # triage lifecycle replaces them.
+
     def get(self, run_id: str) -> dict[str, Any]:
-        return self._api._request("GET", f"/v1/runs/{run_id}")
+        return self._api._request("GET", f"/v1/durable/runs/{run_id}")
 
     def list(self) -> list[dict[str, Any]]:
-        return self._api._request("GET", "/v1/runs")
+        return self._api._request("GET", "/v1/durable/runs")
 
     def cancel(self, run_id: str) -> dict[str, Any]:
         return self._api._request("POST", f"/v1/runs/{run_id}/cancel")
@@ -77,7 +83,9 @@ class Runs:
         )
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
-        return self._api._request("GET", f"/v1/runs/{run_id}/steps")
+        # Durable checkpoints — {label, result, cost_usd, ...}, not the v1
+        # {step_number, step_type, output} shape.
+        return self._api._request("GET", f"/v1/durable/runs/{run_id}/checkpoints")
 
     def stream(
         self,
@@ -124,7 +132,7 @@ class Runs:
         )
         with self._api._http.stream(
             "GET",
-            f"/v1/runs/{run_id}/events",
+            f"/v1/durable/runs/{run_id}/events",
             headers=headers,
             timeout=stream_timeout,
         ) as response:

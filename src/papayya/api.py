@@ -128,10 +128,16 @@ class APIClient:
         })
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/runs/{run_id}")
+        # v1→v2 cutover: a triggered run is now a durable_run. The v1
+        # /v1/runs/{id} surface reads the (now-unfed) runs table, so poll
+        # the durable run instead. Response carries status + checkpoints.
+        return self._request("GET", f"/v1/durable/runs/{run_id}")
 
     def get_steps(self, run_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/runs/{run_id}/steps")
+        # Steps are durable checkpoints after the cutover. Each item is
+        # {label, result, cost_usd, duration_ms, ...} — not the v1
+        # {step_number, step_type, output} shape.
+        return self._request("GET", f"/v1/durable/runs/{run_id}/checkpoints")
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/runs/{run_id}/cancel")

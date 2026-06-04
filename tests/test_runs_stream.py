@@ -114,7 +114,7 @@ class TestRunsStream:
         )
 
         def handler(request: httpx.Request) -> httpx.Response:
-            assert request.url.path == "/v1/runs/run-123/events"
+            assert request.url.path == "/v1/durable/runs/run-123/events"
             assert request.headers["Accept"] == "text/event-stream"
             return httpx.Response(
                 200,
