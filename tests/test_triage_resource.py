@@ -46,7 +46,7 @@ def test_runs_quarantine_sends_reason() -> None:
     out = runs.quarantine("r1", "schema drift")
 
     assert captured["method"] == "POST"
-    assert captured["path"] == "/v1/runs/r1/quarantine"
+    assert captured["path"] == "/v1/durable/runs/r1/quarantine"
     assert captured["body"] == {"reason": "schema drift"}
     assert out == {"id": "r1", "status": "quarantine"}
 
@@ -64,7 +64,7 @@ def test_runs_release_no_body() -> None:
     runs.release("r2")
 
     assert captured["method"] == "POST"
-    assert captured["path"] == "/v1/runs/r2/release"
+    assert captured["path"] == "/v1/durable/runs/r2/release"
     # No body is sent by the SDK on release (server treats as empty/{}).
     assert captured["body"] == ""
 
@@ -80,7 +80,7 @@ def test_runs_discard_no_body() -> None:
     runs, _, _ = _make_clients(handler)
     runs.discard("r3")
 
-    assert captured["path"] == "/v1/runs/r3/discard"
+    assert captured["path"] == "/v1/durable/runs/r3/discard"
     assert captured["body"] == ""
 
 
@@ -103,7 +103,7 @@ def test_triage_list_request_shape() -> None:
     # `kind=all` and `limit=50` are always sent; optional filters are omitted.
     assert captured["query"]["kind"] == "all"
     assert captured["query"]["limit"] == "50"
-    assert "workload" not in captured["query"]
+    assert "partition_key" not in captured["query"]
     assert "tenant" not in captured["query"]
     assert "cursor" not in captured["query"]
 
@@ -117,18 +117,17 @@ def test_triage_list_forwards_all_filters() -> None:
 
     _, triage, _ = _make_clients(handler)
     triage.list(
-        workload="ingest",
-        tenant="acme",
+        partition_key="shard-1",
         kind="quarantine",
         cursor="c0",
         limit=25,
     )
 
-    assert captured["query"]["workload"] == "ingest"
-    assert captured["query"]["tenant"] == "acme"
+    assert captured["query"]["partition_key"] == "shard-1"
     assert captured["query"]["kind"] == "quarantine"
     assert captured["query"]["cursor"] == "c0"
     assert captured["query"]["limit"] == "25"
+    assert "workload" not in captured["query"]
 
 
 # ── Triage.iter ──

@@ -21,8 +21,6 @@ class _FakeRuns:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.list_return: list[dict[str, Any]] = []
-        self.cancel_return: dict[str, Any] = {"id": "r1", "status": "cancelled"}
-        self.replay_return: dict[str, Any] = {"id": "r1-new", "status": "queued"}
         self.stream_events: list[dict[str, Any]] = []
         self.raise_on: str | None = None
 
@@ -34,18 +32,6 @@ class _FakeRuns:
         self.calls.append(("list", {}))
         self._maybe_raise("list")
         return self.list_return
-
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        self.calls.append(("cancel", {"run_id": run_id}))
-        self._maybe_raise("cancel")
-        return self.cancel_return
-
-    def replay(self, run_id: str, *, from_step: int, latest: bool = False) -> dict[str, Any]:
-        self.calls.append(
-            ("replay", {"run_id": run_id, "from_step": from_step, "latest": latest})
-        )
-        self._maybe_raise("replay")
-        return self.replay_return
 
     def stream(self, run_id: str, *, from_step: int | None = None):
         self.calls.append(("stream", {"run_id": run_id, "from_step": from_step}))
@@ -82,14 +68,6 @@ def test_runs_list_outputs_ndjson(fake_client: _FakeClient) -> None:
     assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
 
 
-def test_runs_cancel_calls_sdk_and_prints_run(fake_client: _FakeClient) -> None:
-    result = _run(["runs", "cancel", "r1"])
-    assert result.exit_code == 0, result.output
-    assert ("cancel", {"run_id": "r1"}) in fake_client.runs.calls
-    payload = json.loads(result.output)
-    assert payload["status"] == "cancelled"
-
-
 def test_runs_stream_emits_one_event_per_line(fake_client: _FakeClient) -> None:
     fake_client.runs.stream_events = [
         {"event": "step", "data": {"step_type": "llm"}, "id": 1},
@@ -100,22 +78,3 @@ def test_runs_stream_emits_one_event_per_line(fake_client: _FakeClient) -> None:
     assert ("stream", {"run_id": "r1", "from_step": 5}) in fake_client.runs.calls
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     assert [json.loads(ln)["event"] for ln in lines] == ["step", "terminal"]
-
-
-def test_runs_replay_requires_from_step_and_forwards_latest(
-    fake_client: _FakeClient,
-) -> None:
-    result = _run(["runs", "replay", "r1", "--from-step", "3", "--latest"])
-    assert result.exit_code == 0, result.output
-    assert (
-        "replay",
-        {"run_id": "r1", "from_step": 3, "latest": True},
-    ) in fake_client.runs.calls
-    payload = json.loads(result.output)
-    assert payload["status"] == "queued"
-
-
-def test_runs_replay_errors_without_from_step(fake_client: _FakeClient) -> None:
-    result = CliRunner().invoke(cli_module.main, ["runs", "replay", "r1"])
-    assert result.exit_code != 0
-    assert "--from-step" in result.output

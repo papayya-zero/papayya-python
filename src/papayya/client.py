@@ -148,8 +148,5 @@ class Client:
 
         raise TimeoutError(f"Run {run_id} did not complete within {timeout}s")
 
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        return self._api.cancel_run(run_id)
-
     def close(self) -> None:
         self._api.close()

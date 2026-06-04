@@ -46,41 +46,17 @@ class Runs:
         return self._api._request("POST", f"/v1/agents/{agent_id}/runs", json=body)
 
     # v1→v2 cutover: a run is a durable_run. The read/poll surface below
-    # targets /v1/durable/runs/*. The lifecycle mutations further down
-    # (cancel/replay/dlq_*/quarantine/release/discard) still target the v1
-    # /v1/runs/* surface — they retire with the v1 DROP, when the durable
-    # triage lifecycle replaces them.
+    # targets /v1/durable/runs/*. The quarantine lifecycle (quarantine/
+    # release/discard) targets the durable endpoints too. The v1 lifecycle
+    # mutations (cancel / replay-from-step / dlq_*) retired with the v1 DROP
+    # — their endpoints are gone and the durable triage-action lifecycle
+    # (dlq_disposition) is a deferred follow-up.
 
     def get(self, run_id: str) -> dict[str, Any]:
         return self._api._request("GET", f"/v1/durable/runs/{run_id}")
 
     def list(self) -> list[dict[str, Any]]:
         return self._api._request("GET", "/v1/durable/runs")
-
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        return self._api._request("POST", f"/v1/runs/{run_id}/cancel")
-
-    def replay(
-        self,
-        run_id: str,
-        *,
-        from_step: int,
-        latest: bool = False,
-    ) -> dict[str, Any]:
-        """Replay a durable run from a step.
-
-        ``latest=False`` (the default) is the safe option: when the hosted
-        version-mismatch gate (ADR-0002 #7) lands, the server will reject a
-        replay whose registration's ``agent_version`` differs from the
-        captured one. Pass ``latest=True`` to opt into running the current
-        code anyway. Until the hosted gate is live the server ignores the
-        flag — we ship the wire contract now so the SDK is forward-compatible.
-        """
-        return self._api._request(
-            "POST",
-            f"/v1/runs/{run_id}/replay",
-            json={"from_step": from_step, "allow_version_mismatch": latest},
-        )
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         # Durable checkpoints — {label, result, cost_usd, ...}, not the v1
@@ -143,42 +119,14 @@ class Runs:
                 raise PapayyaAPIError(response.status_code, body)
             yield from _parse_sse(response.iter_lines())
 
-    # ── Dead Letter Queue ──────────────────────────────────────────────────
-    # A failed/budget_exceeded run that belongs to a batch lands in the DLQ
-    # until the operator triages it. Use one of:
-    #   - dlq_skip       — accept the failure, don't replay
-    #   - dlq_acknowledge — record review, don't replay
-    #   - dlq_replay     — re-issue the run from input_snapshot
-    # Once every failure in a batch has a disposition, the batch promotes
-    # from 'partial' to 'completed'. See Batches.dlq() for the list endpoint.
-
-    def dlq_skip(self, run_id: str) -> dict[str, Any]:
-        """Mark a failed run as 'skipped' — accept the failure as terminal.
-        Returns the updated run with dlq_disposition set."""
-        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/skip")
-
-    def dlq_acknowledge(self, run_id: str) -> dict[str, Any]:
-        """Mark a failed run as 'acknowledged' — record that the operator
-        has reviewed the failure but is choosing to leave it. Functionally
-        equivalent to skip; semantically distinct (skip ≈ "not worth
-        looking at"; acknowledge ≈ "I've looked at this")."""
-        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/acknowledge")
-
-    def dlq_replay(self, run_id: str) -> dict[str, Any]:
-        """Re-issue the failed run from its input_snapshot as a new queued
-        run. Marks the source as 'replayed' and links the new run via
-        replayed_from. Returns the new run (HTTP 202)."""
-        return self._api._request("POST", f"/v1/runs/{run_id}/dlq/replay")
-
     # ── Quarantine ─────────────────────────────────────────────────────────
     # Quarantine is the non-terminal soft-pause lane (Plan 08/09): a run
     # paused mid-stream, in-flight state preserved, awaiting an operator
     # decision. Transitions: running ↔ quarantine, quarantine → cancelled.
-    # Distinct from DLQ above (DLQ handles terminal failed/budget_exceeded
-    # rows). Use Triage.list() to see both lanes through one feed.
+    # Durable surface (/v1/durable/runs/*); Triage.list() surfaces the lane.
 
     def quarantine(self, run_id: str, reason: str) -> dict[str, Any]:
-        """Move a run into the non-terminal quarantine lane.
+        """Move a durable run into the non-terminal quarantine lane.
 
         Reason is required; the server rejects an empty string. The run
         keeps its in-flight state — call ``release(run_id)`` to resume or
@@ -186,7 +134,7 @@ class Runs:
         """
         return self._api._request(
             "POST",
-            f"/v1/runs/{run_id}/quarantine",
+            f"/v1/durable/runs/{run_id}/quarantine",
             json={"reason": reason},
         )
 
@@ -194,13 +142,13 @@ class Runs:
         """Exit quarantine by resuming the run in-place. Returns the
         updated run with ``quarantine_disposition='released'``. 409 if
         the run is not currently in quarantine."""
-        return self._api._request("POST", f"/v1/runs/{run_id}/release")
+        return self._api._request("POST", f"/v1/durable/runs/{run_id}/release")
 
     def discard(self, run_id: str) -> dict[str, Any]:
         """Exit quarantine by abandoning the run. Returns the updated
         run with ``quarantine_disposition='discarded'`` and status
         ``cancelled``. 409 if the run is not currently in quarantine."""
-        return self._api._request("POST", f"/v1/runs/{run_id}/discard")
+        return self._api._request("POST", f"/v1/durable/runs/{run_id}/discard")
 
 
 def _parse_sse(lines: Iterator[str]) -> Iterator[dict[str, Any]]:

@@ -1025,66 +1025,13 @@ def dev(port: int, host: str, db: str) -> None:
     serve(host=host, port=port, db_path=db)
 
 
-@main.group()
-def dlq() -> None:
-    """Dead letter queue — triage failed runs from a hosted batch."""
-
-
-@dlq.command("skip")
-@click.argument("run_id")
-@click.pass_context
-def dlq_skip(ctx: click.Context, run_id: str) -> None:
-    """Mark a failed run as 'skipped' — accept the failure as terminal.
-
-    Once every failure in the batch has a disposition (skip / acknowledge /
-    replay), the batch promotes from 'partial' to 'completed'.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.dlq_skip(run_id)
-    finally:
-        client.close()
-    click.echo(json.dumps(run, indent=2))
-
-
-@dlq.command("acknowledge")
-@click.argument("run_id")
-@click.pass_context
-def dlq_acknowledge(ctx: click.Context, run_id: str) -> None:
-    """Mark a failed run as 'acknowledged'.
-
-    Records that an operator has reviewed the failure but is choosing to
-    leave it. Functionally equivalent to skip; semantically distinct
-    (skip ≈ "not worth looking at"; acknowledge ≈ "I've looked at this").
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.dlq_acknowledge(run_id)
-    finally:
-        client.close()
-    click.echo(json.dumps(run, indent=2))
-
-
-@dlq.command("replay")
-@click.argument("run_id")
-@click.pass_context
-def dlq_replay(ctx: click.Context, run_id: str) -> None:
-    """Re-issue a failed run from its captured input_snapshot.
-
-    Returns the newly-queued run; the source run is marked 'replayed' and
-    linked via ``replayed_from``. For local dev-loop replays (against
-    ``.papayya/local.db``) use ``papayya replay --run <id>``.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.dlq_replay(run_id)
-    finally:
-        client.close()
-    click.echo(json.dumps(run, indent=2))
-
-
 # ---------------------------------------------------------------------------
 # triage — unified Needs Attention feed across DLQ + quarantine
+#
+# v1→v2 cutover: the read feed is durable-backed. Quarantine-lane actions
+# (release/discard) are live; the DLQ-lane disposition actions
+# (skip/acknowledge/replay) retired with the v1 DROP and their durable
+# replacement (dlq_disposition) is a deferred follow-up.
 # ---------------------------------------------------------------------------
 
 @main.group()
@@ -1094,8 +1041,9 @@ def triage() -> None:
 
 
 @triage.command("list")
-@click.option("--workload", default=None, help="Filter by workload name")
-@click.option("--tenant", default=None, help="Filter by tenant (metadata.tenant)")
+@click.option("--partition-key", "partition_key", default=None,
+              help="Filter by the durable run's partition key")
+@click.option("--tenant", default=None, help="Alias for --partition-key")
 @click.option(
     "--kind",
     type=click.Choice(["all", "dlq", "quarantine"]),
@@ -1112,7 +1060,7 @@ def triage() -> None:
 @click.pass_context
 def triage_list(
     ctx: click.Context,
-    workload: str | None,
+    partition_key: str | None,
     tenant: str | None,
     kind: str,
     limit: int,
@@ -1121,7 +1069,7 @@ def triage_list(
     client = _make_papayya_client(ctx)
     try:
         for row in client.triage.iter(
-            workload=workload,
+            partition_key=partition_key,
             tenant=tenant,
             kind=kind,
             page_size=limit,
@@ -1134,15 +1082,25 @@ def triage_list(
         client.close()
 
 
+# DLQ-lane disposition (skip/acknowledge/replay) retired with the v1 DROP;
+# the durable replacement (dlq_disposition) is a deferred follow-up, so retry
+# and dismiss act on the quarantine lane only. Failed/degraded rows surface in
+# `triage list` but have no resolve action yet.
+_DLQ_DEFERRED_MSG = (
+    "DLQ disposition actions (retry/dismiss for failed/degraded runs) are not "
+    "yet available on durable runs — pending the dlq_disposition follow-up. "
+    "Only quarantined runs can be retried or dismissed today."
+)
+
+
 @triage.command("retry")
 @click.argument("run_id")
 @click.pass_context
 def triage_retry(ctx: click.Context, run_id: str) -> None:
     """Retry a triage row.
 
-    Client-side dispatch: GETs the run, inspects status, calls /release
-    (quarantine) or /dlq/replay (failed / budget_exceeded). Exits with
-    code 2 on any other status.
+    Resumes a quarantined run in-place (``/release``). Exits with code 2 on
+    any other status — DLQ-lane retry is a deferred follow-up.
     """
     client = _make_papayya_client(ctx)
     try:
@@ -1150,14 +1108,8 @@ def triage_retry(ctx: click.Context, run_id: str) -> None:
         status = run.get("status")
         if status == "quarantine":
             out = client.runs.release(run_id)
-        elif status in ("failed", "budget_exceeded"):
-            out = client.runs.dlq_replay(run_id)
         else:
-            click.echo(
-                f"Error: run {run_id} is status={status!r}; retry only "
-                "applies to quarantine / failed / budget_exceeded runs",
-                err=True,
-            )
+            click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
             sys.exit(2)
         click.echo(json.dumps(out, indent=2))
     except PapayyaAPIError as e:
@@ -1173,8 +1125,8 @@ def triage_retry(ctx: click.Context, run_id: str) -> None:
 def triage_dismiss(ctx: click.Context, run_id: str) -> None:
     """Dismiss a triage row.
 
-    Client-side dispatch: GETs the run, inspects status, calls /discard
-    (quarantine) or /dlq/skip (failed / budget_exceeded).
+    Abandons a quarantined run (``/discard``). Exits with code 2 on any
+    other status — DLQ-lane dismiss is a deferred follow-up.
     """
     client = _make_papayya_client(ctx)
     try:
@@ -1182,52 +1134,8 @@ def triage_dismiss(ctx: click.Context, run_id: str) -> None:
         status = run.get("status")
         if status == "quarantine":
             out = client.runs.discard(run_id)
-        elif status in ("failed", "budget_exceeded"):
-            out = client.runs.dlq_skip(run_id)
         else:
-            click.echo(
-                f"Error: run {run_id} is status={status!r}; dismiss only "
-                "applies to quarantine / failed / budget_exceeded runs",
-                err=True,
-            )
-            sys.exit(2)
-        click.echo(json.dumps(out, indent=2))
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-
-@triage.command("acknowledge")
-@click.argument("run_id")
-@click.pass_context
-def triage_acknowledge(ctx: click.Context, run_id: str) -> None:
-    """Acknowledge a triage row without resolving it.
-
-    DLQ rows: marks ``dlq_disposition='acknowledged'``. Quarantine rows
-    are not currently supported (Plan 09 amendment #3 — quarantine
-    acknowledge is not exposed in v1); use ``dismiss`` or ``retry``.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.get(run_id)
-        status = run.get("status")
-        if status in ("failed", "budget_exceeded"):
-            out = client.runs.dlq_acknowledge(run_id)
-        elif status == "quarantine":
-            click.echo(
-                "Error: acknowledge is not supported for quarantine rows; "
-                "use `papayya triage dismiss` or `papayya triage retry`",
-                err=True,
-            )
-            sys.exit(2)
-        else:
-            click.echo(
-                f"Error: run {run_id} is status={status!r}; acknowledge "
-                "only applies to failed / budget_exceeded runs",
-                err=True,
-            )
+            click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
             sys.exit(2)
         click.echo(json.dumps(out, indent=2))
     except PapayyaAPIError as e:
@@ -1331,16 +1239,17 @@ def replay_cmd(
 
 
 # ---------------------------------------------------------------------------
-# runs — hosted run ops (list, cancel, stream, replay-from-step)
+# runs — hosted run ops (list, stream)
 #
 # Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
-# stays unchanged. `runs` is the resource group for read/lifecycle verbs
-# that mirror client.runs.* one-for-one.
+# stays unchanged. `runs` is the resource group for read verbs that mirror
+# client.runs.* one-for-one. v1→v2 cutover: cancel and replay-from-step
+# retired with the v1 DROP (their durable endpoints are gone).
 # ---------------------------------------------------------------------------
 
 @main.group()
 def runs() -> None:
-    """Operate on hosted runs (list, cancel, stream, replay)."""
+    """Operate on hosted runs (list, stream)."""
 
 
 @runs.command("list")
@@ -1358,23 +1267,6 @@ def runs_list(ctx: click.Context) -> None:
 
     for run in items:
         click.echo(json.dumps(run))
-
-
-@runs.command("cancel")
-@click.argument("run_id")
-@click.pass_context
-def runs_cancel(ctx: click.Context, run_id: str) -> None:
-    """Cancel an in-flight hosted run."""
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.cancel(run_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(json.dumps(run, indent=2))
 
 
 @runs.command("stream")
@@ -1403,43 +1295,6 @@ def runs_stream(ctx: click.Context, run_id: str, from_step: int | None) -> None:
         sys.exit(1)
     finally:
         client.close()
-
-
-@runs.command("replay")
-@click.argument("run_id")
-@click.option(
-    "--from-step",
-    type=int,
-    required=True,
-    help="Rewind to this step (1-indexed) and re-execute from there",
-)
-@click.option(
-    "--latest",
-    is_flag=True,
-    default=False,
-    help="Replay against the registration's current agent_version even if it differs from the captured one",
-)
-@click.pass_context
-def runs_replay(
-    ctx: click.Context, run_id: str, from_step: int, latest: bool
-) -> None:
-    """Rewind a hosted durable run to a step and re-execute from there.
-
-    Distinct from ``papayya dlq replay`` (which re-issues a failed run
-    from its input_snapshot as a brand-new run) and from ``papayya replay``
-    (local SQLite dev-loop). This is the SDK's
-    ``client.runs.replay(run_id, from_step=N)`` path.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        run = client.runs.replay(run_id, from_step=from_step, latest=latest)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(json.dumps(run, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -2814,265 +2669,3 @@ def batch_submit(
     total = result.get("total_items")
     if total is not None:
         click.echo(f"  Items:  {total}")
-
-
-@batch.command("status")
-@click.argument("batch_id")
-@click.pass_context
-def batch_status(ctx: click.Context, batch_id: str) -> None:
-    """Show aggregate status of a batch."""
-    client = _make_papayya_client(ctx)
-    try:
-        b = client.batches.get(batch_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(f"Batch:     {b.get('id', batch_id)}")
-    if b.get("name"):
-        click.echo(f"Name:      {b['name']}")
-    click.echo(f"Status:    {b.get('status', '?')}")
-    click.echo(f"Agent:     {b.get('agent_id', '?')}")
-
-    total = b.get("total_items", 0) or 0
-    completed = b.get("completed", 0) or 0
-    failed = b.get("failed", 0) or 0
-    paused = b.get("paused", 0) or 0
-    click.echo(f"Items:     {completed}/{total} completed, {failed} failed, {paused} paused")
-
-    cost = b.get("aggregate_cost_cents", 0) or 0
-    cap = b.get("budget_cents_cap")
-    if cap:
-        click.echo(f"Cost:      {cost}¢ / {cap}¢")
-    else:
-        click.echo(f"Cost:      {cost}¢ (no cap)")
-
-    if b.get("created_at"):
-        click.echo(f"Created:   {b['created_at']}")
-
-
-@batch.command("results")
-@click.argument("batch_id")
-@click.option("-o", "--output", "output_path", default=None, help="Output JSONL path (default: stdout)")
-@click.option("--include-failed", is_flag=True, default=False, help="Also include failed/cancelled/budget_exceeded runs (default: completed only)")
-@click.option("--poll-interval", type=float, default=2.0, help="How often to poll batch status while waiting for terminal (seconds)")
-@click.pass_context
-def batch_results(
-    ctx: click.Context,
-    batch_id: str,
-    output_path: str | None,
-    include_failed: bool,
-    poll_interval: float,
-) -> None:
-    """Stream completed child runs of a batch as JSON lines.
-
-    Blocks until the batch reaches a terminal status, then streams every
-    terminal child in one server-side response (NDJSON over
-    ``GET /v1/batches/{id}/results``). One round-trip instead of the
-    paged polling earlier versions did — fast even on 10k-item batches.
-    """
-    client = _make_papayya_client(ctx)
-
-    # stdout or file, opened the same way so the write loop is identical.
-    if output_path is None:
-        sink = sys.stdout
-        close_sink = False
-    else:
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        sink = out.open("w", encoding="utf-8")
-        close_sink = True
-
-    count = 0
-    try:
-        # Preserve the historical "block until done, then dump" behaviour
-        # by waiting on batch status before opening the bulk stream.
-        client.batches.wait(batch_id, poll_interval=poll_interval)
-        for run in client.batches.results(batch_id):
-            if not include_failed and run.get("status") != "completed":
-                continue
-            sink.write(json.dumps(run) + "\n")
-            sink.flush()
-            count += 1
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        if close_sink:
-            sink.close()
-        client.close()
-
-    if output_path is not None:
-        click.echo(f"Wrote {count} run(s) to {output_path}")
-
-
-@batch.command("cancel")
-@click.argument("batch_id")
-@click.pass_context
-def batch_cancel(ctx: click.Context, batch_id: str) -> None:
-    """Cancel a batch. Fan-out happens server-side; this returns 202."""
-    client = _make_papayya_client(ctx)
-    try:
-        b = client.batches.cancel(batch_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(f"Batch {b.get('id', batch_id)} cancellation accepted (status: {b.get('status', '?')})")
-
-
-@batch.command("retry")
-@click.argument("batch_id")
-@click.option("--failed", "retry_failed_flag", is_flag=True, required=True, help="Re-enqueue every failed child (currently the only retry mode)")
-@click.pass_context
-def batch_retry(ctx: click.Context, batch_id: str, retry_failed_flag: bool) -> None:
-    """Re-enqueue failed children of a batch as new runs."""
-    del retry_failed_flag  # --failed is required; no other mode exists yet
-
-    client = _make_papayya_client(ctx)
-    try:
-        b = client.batches.retry_failed(batch_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(f"Batch {b.get('id', batch_id)} re-enqueued (total_items now {b.get('total_items', '?')})")
-
-
-@batch.command("dlq")
-@click.argument("batch_id")
-@click.pass_context
-def batch_dlq(ctx: click.Context, batch_id: str) -> None:
-    """List failed runs in a batch awaiting triage.
-
-    Prints one JSON object per line (NDJSON), each a failed/budget_exceeded
-    run that has no dlq_disposition yet. Pipe into a tool, or pluck IDs and
-    feed them into ``papayya dlq skip`` / ``papayya dlq acknowledge`` /
-    ``papayya dlq replay``.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        runs = client.batches.dlq(batch_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    for run in runs:
-        click.echo(json.dumps(run))
-
-
-@batch.command("list")
-@click.option("--status", default=None, help="Filter by status (queued/running/completed/...)")
-@click.option("--limit", type=int, default=None, help="Maximum rows to return")
-@click.option("--offset", type=int, default=None, help="Skip the first N rows")
-@click.pass_context
-def batch_list(
-    ctx: click.Context,
-    status: str | None,
-    limit: int | None,
-    offset: int | None,
-) -> None:
-    """List batches (NDJSON, one batch per line)."""
-    client = _make_papayya_client(ctx)
-    try:
-        batches = client.batches.list(status=status, limit=limit, offset=offset)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    for b in batches:
-        click.echo(json.dumps(b))
-
-
-@batch.command("runs")
-@click.argument("batch_id")
-@click.option("--status", default=None, help="Filter children by status")
-@click.option("--page", type=int, default=None, help="Page index (paginated)")
-@click.option("--limit", type=int, default=None, help="Page size")
-@click.pass_context
-def batch_runs(
-    ctx: click.Context,
-    batch_id: str,
-    status: str | None,
-    page: int | None,
-    limit: int | None,
-) -> None:
-    """List the child runs of a batch (NDJSON, paginated)."""
-    client = _make_papayya_client(ctx)
-    try:
-        runs = client.batches.runs(batch_id, status=status, page=page, limit=limit)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    for run in runs:
-        click.echo(json.dumps(run))
-
-
-@batch.command("dlq-cost-preview")
-@click.argument("batch_id")
-@click.pass_context
-def batch_dlq_cost_preview(ctx: click.Context, batch_id: str) -> None:
-    """Predict the cost of replaying every unresolved DLQ entry.
-
-    Returns ``{run_count, estimated_sum_cents, estimated_p50_cents,
-    estimated_p95_cents, methodology}``. Run before a bulk
-    ``papayya dlq replay`` so an operator doesn't accidentally re-spend
-    on a large failed batch.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        preview = client.batches.dlq_cost_preview(batch_id)
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()
-
-    click.echo(json.dumps(preview, indent=2))
-
-
-@batch.command("stream-results")
-@click.argument("batch_id")
-@click.option("--include-failed", is_flag=True, default=False,
-              help="Also yield failed/cancelled/budget_exceeded children")
-@click.option("--poll-interval", type=float, default=2.0,
-              help="Seconds between polls of the runs endpoint")
-@click.pass_context
-def batch_stream_results(
-    ctx: click.Context,
-    batch_id: str,
-    include_failed: bool,
-    poll_interval: float,
-) -> None:
-    """Live-tail child runs as they reach terminal status (NDJSON).
-
-    Polls the batch's runs endpoint and emits each newly-terminal run on
-    its own line. Exits when the parent batch itself reaches terminal.
-    Use ``papayya batch results`` for one-shot bulk export of an
-    already-finished batch.
-    """
-    client = _make_papayya_client(ctx)
-    try:
-        for run in client.batches.stream_results(
-            batch_id, poll_interval=poll_interval, include_failed=include_failed
-        ):
-            click.echo(json.dumps(run))
-            sys.stdout.flush()
-    except PapayyaAPIError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-    finally:
-        client.close()

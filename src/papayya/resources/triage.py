@@ -1,12 +1,17 @@
-"""Unified `Needs Attention` feed across DLQ + quarantine.
+"""Unified `Needs Attention` feed across the durable DLQ + quarantine lanes.
 
-Plan 09's `GET /v1/triage` aggregates failed/budget_exceeded DLQ rows and
-quarantine rows into one tenant-scoped, keyset-paginated stream. The dashboard
-fork (Plan 18) and the ``papayya triage`` CLI read from this endpoint.
-Per-row state-machine actions stay on the existing endpoints
-(``runs.release`` / ``runs.discard`` / ``runs.dlq_replay`` / ``runs.dlq_skip``
-/ ``runs.dlq_acknowledge``); this resource only exposes the read surface and
-the auto-paging iterator the CLI uses.
+``GET /v1/triage`` (v1→v2 cutover: now backed by ``durable_runs``) aggregates
+degraded/failed runs and quarantined runs into one tenant-scoped,
+keyset-paginated stream. Each row is
+``{kind, run_id, group_id?, agent, partition_key?, status, reason?,
+available_actions, occurred_at}``. The dashboard's "Needs attention" lane and
+the ``papayya triage`` CLI read from this endpoint.
+
+Quarantine-lane actions (``runs.release`` / ``runs.discard``) are live on the
+durable surface. The DLQ-lane disposition actions (skip/acknowledge/replay)
+are a deferred follow-up — the durable model has no ``dlq_disposition`` column
+yet — so this resource exposes only the read surface and the auto-paging
+iterator the CLI uses.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ class Triage:
     def list(
         self,
         *,
-        workload: str | None = None,
+        partition_key: str | None = None,
         tenant: str | None = None,
         kind: str = "all",
         cursor: str | None = None,
@@ -34,24 +39,18 @@ class Triage:
 
         ``kind``: ``"all"`` (default), ``"dlq"``, or ``"quarantine"``.
 
-        ``workload`` is accepted but currently ignored by the server (a
-        ``Warning: 299 - "workload filter not yet supported"`` response
-        header is emitted). The column lands with Plans 10/11/12 — the
-        parameter is wired today so the CLI and the dashboard need no
-        change when it does.
+        ``partition_key`` filters on the durable run's per-tenant partition
+        axis. ``tenant`` is a back-compat alias for the same filter (the
+        server accepts either; ``partition_key`` wins when both are given).
 
-        ``tenant`` filters on the user-supplied ``metadata.tenant`` value
-        on the run's input payload. Placeholder until the first-class
-        tenant column lands.
-
-        ``limit=0`` is the count-only mode used by Plan 18's sidebar
+        ``limit=0`` is the count-only mode used by the dashboard sidebar
         badge — the server skips the row fetch entirely and just returns
         ``{"items": [], "total": N}``.
         """
         params: dict[str, Any] = {"kind": kind, "limit": limit}
-        if workload:
-            params["workload"] = workload
-        if tenant:
+        if partition_key:
+            params["partition_key"] = partition_key
+        elif tenant:
             params["tenant"] = tenant
         if cursor:
             params["cursor"] = cursor
@@ -60,7 +59,7 @@ class Triage:
     def iter(
         self,
         *,
-        workload: str | None = None,
+        partition_key: str | None = None,
         tenant: str | None = None,
         kind: str = "all",
         page_size: int = 50,
@@ -73,7 +72,7 @@ class Triage:
         cursor: str | None = None
         while True:
             page = self.list(
-                workload=workload,
+                partition_key=partition_key,
                 tenant=tenant,
                 kind=kind,
                 cursor=cursor,

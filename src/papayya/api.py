@@ -139,8 +139,9 @@ class APIClient:
         # {step_number, step_type, output} shape.
         return self._request("GET", f"/v1/durable/runs/{run_id}/checkpoints")
 
-    def cancel_run(self, run_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/v1/runs/{run_id}/cancel")
+    # v1→v2 cutover: cancel_run retired with the v1 DROP — its
+    # POST /v1/runs/{id}/cancel endpoint is gone and durable runs have no
+    # cancel verb (use the quarantine→discard lifecycle instead).
 
     # -- Tool Calls (worker bridge) ------------------------------------------
 

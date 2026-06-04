@@ -3,8 +3,10 @@
 The CLI is thin — it resolves auth, translates flags, then delegates to
 the Batches SDK resource. These tests swap the Papayya client with a
 recording fake so we can assert the CLI's translation layer in isolation
-(dollar→cents, file→stream, --failed required, etc.) without needing a
-running backend or even a real httpx transport.
+(dollar→cents, file→stream, etc.) without needing a running backend.
+
+v1→v2 cutover: only `batch submit` (→ create_stream → POST /v1/batches)
+survives; the v1 batch read + lifecycle commands retired with the v1 DROP.
 """
 
 from __future__ import annotations
@@ -25,40 +27,10 @@ class _FakeBatches:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        # Swappable return values / side effects per method.
         self.create_stream_return: dict[str, Any] = {
             "id": "batch-xyz",
             "status": "queued",
             "total_items": 3,
-        }
-        self.get_return: dict[str, Any] = {
-            "id": "batch-xyz",
-            "status": "running",
-            "agent_id": "agent-1",
-            "total_items": 10,
-            "completed": 4,
-            "failed": 1,
-            "paused": 0,
-            "aggregate_cost_cents": 250,
-            "budget_cents_cap": 2000,
-            "name": "lead enrichment",
-            "created_at": "2026-04-17T00:00:00Z",
-        }
-        self.cancel_return: dict[str, Any] = {"id": "batch-xyz", "status": "cancelled"}
-        self.retry_failed_return: dict[str, Any] = {"id": "batch-xyz", "total_items": 12}
-        self.stream_results_items: list[dict[str, Any]] = []
-        # Used by the rewired `batch results` CLI command (NDJSON server stream).
-        self.results_items: list[dict[str, Any]] = []
-        self.wait_return: dict[str, Any] = {"id": "batch-xyz", "status": "completed"}
-        self.dlq_return: list[dict[str, Any]] = []
-        self.list_return: list[dict[str, Any]] = []
-        self.runs_return: list[dict[str, Any]] = []
-        self.dlq_cost_preview_return: dict[str, Any] = {
-            "run_count": 0,
-            "estimated_sum_cents": 0,
-            "estimated_p50_cents": 0,
-            "estimated_p95_cents": 0,
-            "methodology": "sum-of-failed-total-cost-cents",
         }
         self.raise_on: str | None = None
 
@@ -74,92 +46,6 @@ class _FakeBatches:
         self.calls.append(("create_stream", {"items": items, **kwargs}))
         self._maybe_raise("create_stream")
         return self.create_stream_return
-
-    def get(self, batch_id: str) -> dict[str, Any]:
-        self.calls.append(("get", {"batch_id": batch_id}))
-        self._maybe_raise("get")
-        return self.get_return
-
-    def cancel(self, batch_id: str) -> dict[str, Any]:
-        self.calls.append(("cancel", {"batch_id": batch_id}))
-        self._maybe_raise("cancel")
-        return self.cancel_return
-
-    def retry_failed(self, batch_id: str) -> dict[str, Any]:
-        self.calls.append(("retry_failed", {"batch_id": batch_id}))
-        self._maybe_raise("retry_failed")
-        return self.retry_failed_return
-
-    def stream_results(
-        self, batch_id: str, *, poll_interval: float = 2.0, include_failed: bool = False
-    ):
-        self.calls.append(
-            (
-                "stream_results",
-                {
-                    "batch_id": batch_id,
-                    "poll_interval": poll_interval,
-                    "include_failed": include_failed,
-                },
-            )
-        )
-        self._maybe_raise("stream_results")
-        yield from self.stream_results_items
-
-    def wait(self, batch_id: str, *, timeout: float = 3600, poll_interval: float = 5.0) -> dict[str, Any]:
-        self.calls.append(
-            (
-                "wait",
-                {"batch_id": batch_id, "timeout": timeout, "poll_interval": poll_interval},
-            )
-        )
-        self._maybe_raise("wait")
-        return self.wait_return
-
-    def results(self, batch_id: str):
-        self.calls.append(("results", {"batch_id": batch_id}))
-        self._maybe_raise("results")
-        yield from self.results_items
-
-    def dlq(self, batch_id: str) -> list[dict[str, Any]]:
-        self.calls.append(("dlq", {"batch_id": batch_id}))
-        self._maybe_raise("dlq")
-        return self.dlq_return
-
-    def list(
-        self,
-        *,
-        status: str | None = None,
-        limit: int | None = None,
-        offset: int | None = None,
-    ) -> list[dict[str, Any]]:
-        self.calls.append(
-            ("list", {"status": status, "limit": limit, "offset": offset})
-        )
-        self._maybe_raise("list")
-        return self.list_return
-
-    def runs(
-        self,
-        batch_id: str,
-        *,
-        status: str | None = None,
-        page: int | None = None,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        self.calls.append(
-            (
-                "runs",
-                {"batch_id": batch_id, "status": status, "page": page, "limit": limit},
-            )
-        )
-        self._maybe_raise("runs")
-        return self.runs_return
-
-    def dlq_cost_preview(self, batch_id: str) -> dict[str, Any]:
-        self.calls.append(("dlq_cost_preview", {"batch_id": batch_id}))
-        self._maybe_raise("dlq_cost_preview")
-        return self.dlq_cost_preview_return
 
 
 class _FakeClient:
@@ -236,8 +122,7 @@ def test_submit_without_optional_flags_passes_none(
 def test_submit_rounds_fractional_dollars_to_nearest_cent(
     fake_client: _FakeClient, tmp_path: Path
 ) -> None:
-    """$0.015 → 2¢ (banker's-rounded via round()); makes sure we don't
-    silently truncate fractional budgets."""
+    """$0.5 → 50¢; makes sure we don't silently truncate fractional budgets."""
     file_ = _write_jsonl(tmp_path, [{"input": "a"}])
     result = _run([
         "batch", "submit",
@@ -290,229 +175,3 @@ def test_submit_surfaces_api_error(
     result = _run(["batch", "submit", "--agent", "a", "--file", str(file_)])
     assert result.exit_code == 1
     assert "HTTP 500" in result.output
-
-
-# ---------------------------------------------------------------------------
-# status
-# ---------------------------------------------------------------------------
-
-def test_status_prints_aggregate(fake_client: _FakeClient) -> None:
-    result = _run(["batch", "status", "batch-xyz"])
-    assert result.exit_code == 0, result.output
-    assert ("get", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
-    assert "Batch:" in result.output
-    assert "running" in result.output
-    assert "4/10 completed" in result.output
-    assert "1 failed" in result.output
-    assert "250¢ / 2000¢" in result.output
-
-
-def test_status_handles_no_budget_cap(fake_client: _FakeClient) -> None:
-    fake_client.batches.get_return = {
-        "id": "b", "status": "completed", "agent_id": "a",
-        "total_items": 1, "completed_items": 1, "failed_items": 0, "paused_items": 0,
-        "aggregate_cost_cents": 42, "budget_cents_cap": None,
-    }
-    result = _run(["batch", "status", "b"])
-    assert result.exit_code == 0
-    assert "42¢ (no cap)" in result.output
-
-
-# ---------------------------------------------------------------------------
-# results
-# ---------------------------------------------------------------------------
-
-def test_results_writes_jsonl_file(
-    fake_client: _FakeClient, tmp_path: Path
-) -> None:
-    """CLI: wait until batch terminal, then dump every completed child via
-    the new server-streamed /results endpoint into a JSONL file."""
-    fake_client.batches.results_items = [
-        {"id": "run-1", "status": "completed"},
-        {"id": "run-2", "status": "completed"},
-    ]
-    out = tmp_path / "out.jsonl"
-    result = _run([
-        "batch", "results", "batch-xyz",
-        "-o", str(out),
-        "--poll-interval", "0.01",
-    ])
-    assert result.exit_code == 0, result.output
-
-    methods = [c[0] for c in fake_client.batches.calls]
-    assert methods == ["wait", "results"]
-    wait_call = fake_client.batches.calls[0][1]
-    assert wait_call["batch_id"] == "batch-xyz"
-    assert wait_call["poll_interval"] == 0.01
-
-    lines = out.read_text().splitlines()
-    assert [json.loads(x) for x in lines] == [
-        {"id": "run-1", "status": "completed"},
-        {"id": "run-2", "status": "completed"},
-    ]
-    assert "Wrote 2 run(s)" in result.output
-
-
-def test_results_streams_to_stdout_without_output_flag(
-    fake_client: _FakeClient,
-) -> None:
-    fake_client.batches.results_items = [
-        {"id": "run-1", "status": "completed"},
-    ]
-    result = _run(["batch", "results", "batch-xyz", "--poll-interval", "0.01"])
-    assert result.exit_code == 0
-    # The CLI streams JSON to stdout; no trailing summary in the non-file path.
-    assert '"id": "run-1"' in result.output
-    assert "Wrote" not in result.output
-
-
-def test_results_include_failed_flag_filters_client_side(
-    fake_client: _FakeClient,
-) -> None:
-    """The /results endpoint streams ALL terminal children (completed,
-    failed, cancelled, budget_exceeded). The --include-failed flag is now
-    a client-side filter: default = completed only, flag set = pass through."""
-    fake_client.batches.results_items = [
-        {"id": "ok", "status": "completed"},
-        {"id": "bad", "status": "failed"},
-        {"id": "cnx", "status": "cancelled"},
-    ]
-
-    # Default: failed/cancelled rows are dropped.
-    result = _run(["batch", "results", "batch-xyz", "--poll-interval", "0.01"])
-    assert result.exit_code == 0
-    assert '"id": "ok"' in result.output
-    assert '"id": "bad"' not in result.output
-    assert '"id": "cnx"' not in result.output
-
-    # With --include-failed, every terminal row passes through.
-    fake_client.batches.calls.clear()
-    result = _run([
-        "batch", "results", "batch-xyz",
-        "--include-failed", "--poll-interval", "0.01",
-    ])
-    assert result.exit_code == 0
-    assert '"id": "ok"' in result.output
-    assert '"id": "bad"' in result.output
-    assert '"id": "cnx"' in result.output
-
-
-# ---------------------------------------------------------------------------
-# cancel
-# ---------------------------------------------------------------------------
-
-def test_cancel_invokes_sdk_and_prints(fake_client: _FakeClient) -> None:
-    result = _run(["batch", "cancel", "batch-xyz"])
-    assert result.exit_code == 0, result.output
-    assert ("cancel", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
-    assert "cancellation accepted" in result.output
-    assert "cancelled" in result.output
-
-
-# ---------------------------------------------------------------------------
-# retry
-# ---------------------------------------------------------------------------
-
-def test_retry_requires_failed_flag(fake_client: _FakeClient) -> None:
-    # --failed is the only retry mode today, but marking it required now
-    # prevents an ambiguous `papayya batch retry <id>` from meaning "retry
-    # all" in the future. Assert click rejects the call without it.
-    result = _run(["batch", "retry", "batch-xyz"])
-    assert result.exit_code != 0
-    assert "failed" in result.output.lower()
-    assert fake_client.batches.calls == []
-
-
-def test_retry_with_failed_flag_calls_retry_failed(
-    fake_client: _FakeClient,
-) -> None:
-    result = _run(["batch", "retry", "batch-xyz", "--failed"])
-    assert result.exit_code == 0, result.output
-    assert ("retry_failed", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
-    assert "re-enqueued" in result.output
-    assert "total_items now 12" in result.output
-
-
-# ---------------------------------------------------------------------------
-# dlq
-# ---------------------------------------------------------------------------
-
-def test_dlq_lists_failed_runs_as_ndjson(fake_client: _FakeClient) -> None:
-    fake_client.batches.dlq_return = [
-        {"id": "run-a", "status": "failed", "error_message": "rate limited"},
-        {"id": "run-b", "status": "budget_exceeded", "error_message": "over budget"},
-    ]
-    result = _run(["batch", "dlq", "batch-xyz"])
-    assert result.exit_code == 0, result.output
-    assert ("dlq", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
-
-    # NDJSON: one JSON object per line, both run IDs surface in order.
-    lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    assert len(lines) == 2
-    assert json.loads(lines[0])["id"] == "run-a"
-    assert json.loads(lines[1])["id"] == "run-b"
-
-
-# ---------------------------------------------------------------------------
-# list / runs / dlq-cost-preview / stream-results
-# ---------------------------------------------------------------------------
-
-def test_list_outputs_ndjson_and_forwards_filters(fake_client: _FakeClient) -> None:
-    fake_client.batches.list_return = [
-        {"id": "b1", "status": "completed"},
-        {"id": "b2", "status": "completed"},
-    ]
-    result = _run(["batch", "list", "--status", "completed", "--limit", "10", "--offset", "5"])
-    assert result.exit_code == 0, result.output
-    assert ("list", {"status": "completed", "limit": 10, "offset": 5}) in fake_client.batches.calls
-    lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    assert [json.loads(ln)["id"] for ln in lines] == ["b1", "b2"]
-
-
-def test_runs_outputs_ndjson_and_forwards_pagination(fake_client: _FakeClient) -> None:
-    fake_client.batches.runs_return = [{"id": "r1"}, {"id": "r2"}]
-    result = _run([
-        "batch", "runs", "batch-xyz",
-        "--status", "completed", "--page", "2", "--limit", "200",
-    ])
-    assert result.exit_code == 0, result.output
-    assert (
-        "runs",
-        {"batch_id": "batch-xyz", "status": "completed", "page": 2, "limit": 200},
-    ) in fake_client.batches.calls
-    lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
-
-
-def test_dlq_cost_preview_prints_prediction(fake_client: _FakeClient) -> None:
-    fake_client.batches.dlq_cost_preview_return = {
-        "run_count": 47,
-        "estimated_sum_cents": 7340,
-        "estimated_p50_cents": 120,
-        "estimated_p95_cents": 410,
-        "methodology": "sum-of-failed-total-cost-cents",
-    }
-    result = _run(["batch", "dlq-cost-preview", "batch-xyz"])
-    assert result.exit_code == 0, result.output
-    assert ("dlq_cost_preview", {"batch_id": "batch-xyz"}) in fake_client.batches.calls
-    payload = json.loads(result.output)
-    assert payload["run_count"] == 47
-    assert payload["estimated_sum_cents"] == 7340
-
-
-def test_stream_results_emits_each_run_as_ndjson(fake_client: _FakeClient) -> None:
-    fake_client.batches.stream_results_items = [
-        {"id": "r1", "status": "completed"},
-        {"id": "r2", "status": "completed"},
-    ]
-    result = _run([
-        "batch", "stream-results", "batch-xyz",
-        "--include-failed", "--poll-interval", "0.5",
-    ])
-    assert result.exit_code == 0, result.output
-    assert (
-        "stream_results",
-        {"batch_id": "batch-xyz", "poll_interval": 0.5, "include_failed": True},
-    ) in fake_client.batches.calls
-    lines = [ln for ln in result.output.splitlines() if ln.strip()]
-    assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]

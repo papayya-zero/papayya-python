@@ -235,10 +235,10 @@ class _SpyPapayya:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, tuple, dict]] = []
 
-            def get(self, batch_id: str) -> dict[str, Any]:
-                self.calls.append(("get", (batch_id,), {}))
-                return {"id": batch_id, "status": "completed",
-                        "counts": {"total": 0, "completed": 0, "failed": 0, "canceled": 0}}
+            def create_stream(self, **kwargs: Any) -> dict[str, Any]:
+                list(kwargs.pop("items", []))  # drain the lazy iterator
+                self.calls.append(("create_stream", (), kwargs))
+                return {"id": "b-1", "status": "queued", "total_items": 1}
 
         self.batches = _Batches()
 
@@ -246,8 +246,8 @@ class _SpyPapayya:
         self.closed = True
 
 
-def test_batch_status_uses_env_credentials(
-    two_env_config: None, monkeypatch: pytest.MonkeyPatch
+def test_batch_submit_uses_env_credentials(
+    two_env_config: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _SpyPapayya.instances.clear()
     # _make_papayya_client imports Papayya locally — patch the module the CLI imports from.
@@ -255,7 +255,12 @@ def test_batch_status_uses_env_credentials(
 
     monkeypatch.setattr(papayya, "Papayya", _SpyPapayya)
 
-    code, out = _invoke("--env", "staging", "batch", "status", "b-1")
+    items = tmp_path / "items.jsonl"
+    items.write_text('{"input": "x"}\n', encoding="utf-8")
+
+    code, out = _invoke(
+        "--env", "staging", "batch", "submit", "--agent", "a", "--file", str(items)
+    )
     assert code == 0, out
     assert _SpyPapayya.instances, "Papayya client was not instantiated"
     spy = _SpyPapayya.instances[-1]
