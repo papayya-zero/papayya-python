@@ -107,6 +107,45 @@ def get_active_run_id() -> str | None:
     return _ACTIVE_RUN_ID.get()
 
 
+# v1→v2 execution cutover (Workstream C). The hosted worker pre-creates
+# the durable run on submission (durable_run(queued)) and carries its
+# run_id on the lease. Before invoking the @agent fn, the worker sets
+# this contextvar to that run_id so the FIRST Papayya.run() inside the
+# fn body adopts it — tying the SDK's checkpoints to the exact run the
+# submission created (rather than minting a fresh, orphaned run_id).
+#
+# One-shot, exactly like _REPLAY_HYDRATION: consume_bootstrap_run_id()
+# clears it on read so only the outer @agent run links to the lease;
+# any sub-runs the body spawns get fresh ids. Unset (the default) on the
+# local-dev path (LocalDispatcher leases carry no run_id), so local runs
+# mint their own id as before — the guardrail stays green.
+_BOOTSTRAP_RUN_ID: ContextVar[str | None] = ContextVar(
+    "papayya_bootstrap_run_id", default=None
+)
+
+
+def set_bootstrap_run_id(run_id: str | None):
+    """Set the lease's run_id for the next Papayya.run() to adopt.
+    Returns the contextvar token; the worker resets it in a finally."""
+    return _BOOTSTRAP_RUN_ID.set(run_id)
+
+
+def reset_bootstrap_run_id(token) -> None:
+    """Restore the bootstrap-run-id contextvar to its prior value."""
+    _BOOTSTRAP_RUN_ID.reset(token)
+
+
+def consume_bootstrap_run_id() -> str | None:
+    """One-shot read of the worker-injected run_id. Returns the lease's
+    run_id when a worker set it for this invocation, None otherwise.
+    Clears on read so only the first Papayya.run() in the @agent body
+    adopts it (sub-runs mint fresh ids)."""
+    value = _BOOTSTRAP_RUN_ID.get()
+    if value is not None:
+        _BOOTSTRAP_RUN_ID.set(None)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Module-level registry — maps function name → AgentRegistration
 # ---------------------------------------------------------------------------

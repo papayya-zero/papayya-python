@@ -257,6 +257,15 @@ class Worker:
         # misconfiguration — the lease handler emits error_category=
         # "no_agent_module" so the failure is loud. ADR-0003 § Worker #5.
         self._bootstrap_mode = agent_module_path is None
+        # v1→v2 cutover: durable-run base for the queued→running flip.
+        # The hosted dispatcher_url carries the ``/v1/runtime`` prefix, so
+        # the sibling durable surface is ``/v1/durable``. Local-dev
+        # (LocalDispatcher, no ``/runtime`` suffix) leaves this None — and
+        # local leases carry no run_id, so the flip is skipped entirely.
+        if self.dispatcher_url.endswith("/runtime"):
+            self._durable_api_base = self.dispatcher_url[: -len("/runtime")] + "/durable"
+        else:
+            self._durable_api_base = None
         # Sent as X-Api-Key on lease/complete/heartbeat. Matches the
         # dispatcher's API-key middleware (control-pane auth.go) which
         # requires a project-scoped key — JWT Bearer tokens are rejected
@@ -837,6 +846,28 @@ class Worker:
                 time.sleep(wait)
                 wait = min(wait * 2.0, 2.0)
 
+    def _mark_run_running(self, run_id: str) -> None:
+        """Best-effort flip the durable run queued→running on lease pickup
+        (v1→v2 cutover). PATCH /v1/durable/runs/{run_id} {status:running};
+        the server guards the transition (only 'queued' rows move, output
+        untouched). Never raises: a transient failure just leaves the run
+        'queued' until the SDK writes its terminal status, so it must not
+        block execution. No-op when there's no durable base (local dev)."""
+        if not self._durable_api_base:
+            return
+        data = json.dumps({"status": "running"}).encode("utf-8")
+        req = urllib_request.Request(
+            f"{self._durable_api_base}/runs/{run_id}",
+            data=data,
+            headers={"Content-Type": "application/json", **self._auth_headers()},
+            method="PATCH",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=2.0):
+                return
+        except urllib_error.URLError as exc:
+            log.warning("failed to mark run %s running: %s", run_id, exc)
+
     # --- lease handling ------------------------------------------------ #
 
     def _handle_lease(self, lease: Lease) -> None:
@@ -844,7 +875,11 @@ class Worker:
         # Late import: the customer module's @agent decorations registered
         # into this same module-level dict, so a top-level import here
         # would create a cycle / shadow.
-        from papayya.agent import get_agent
+        from papayya.agent import (
+            get_agent,
+            reset_bootstrap_run_id,
+            set_bootstrap_run_id,
+        )
 
         short = lease.lease_id[:8]
         log.info(
@@ -853,6 +888,20 @@ class Worker:
         )
         started_at = time.monotonic()
         self._last_activity_at = started_at
+
+        # v1→v2 cutover: the hosted submission pre-created a durable_run
+        # and put its id on the lease payload. Adopt it so the @agent's
+        # first Papayya.run() links its checkpoints to that exact run, and
+        # flip the run queued→running now that a worker owns it. Both are
+        # no-ops on the local-dev path (LocalDispatcher leases carry no
+        # run_id), keeping the SQLite guardrail green.
+        run_id = None
+        if isinstance(lease.payload, dict):
+            run_id = lease.payload.get("run_id")
+        bootstrap_token = set_bootstrap_run_id(run_id)
+        if run_id:
+            self._mark_run_running(run_id)
+
         # Publish the lease so the heartbeat thread starts pinging
         # /heartbeat for it. Cleared in the finally block.
         with self._hb_lock:
@@ -954,6 +1003,7 @@ class Worker:
                 short=short,
             )
         finally:
+            reset_bootstrap_run_id(bootstrap_token)
             with self._hb_lock:
                 self._in_flight_lease = None
             self._last_activity_at = time.monotonic()

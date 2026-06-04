@@ -240,7 +240,7 @@ class Papayya:
                 stacklevel=2,
             )
 
-        from papayya.agent import get_active_run_id
+        from papayya.agent import consume_bootstrap_run_id, get_active_run_id
         from papayya.durable._replay import consume_replay_hydration
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
@@ -285,10 +285,17 @@ class Papayya:
                 )
             )
 
+        # v1→v2 cutover: when a hosted worker injected the lease's run_id
+        # (one-shot), adopt it so this run's checkpoints link to the
+        # durable_run the submission pre-created. An explicit run_id=
+        # still wins; outside a worker (local dev) this is None and the
+        # run mints its own id as before.
+        effective_run_id = run_id if run_id is not None else consume_bootstrap_run_id()
+
         return PapayyaRun(
             DurableRunConfig(
                 agent=agent,
-                run_id=run_id,
+                run_id=effective_run_id,
                 metadata=metadata,
                 item_id=item_id,
                 store=resolved_store,
