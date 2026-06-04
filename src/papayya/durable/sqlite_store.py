@@ -418,10 +418,10 @@ def _backup_db(db_path: Path, from_version: str) -> Path | None:
     Returns the backup path on success, None if the DB doesn't exist yet
     (fresh install) or if the backup already exists (don't overwrite).
 
-    The caller has already opened the connection (and so flipped the
-    journal_mode=WAL header) by the time we run, so the backup is not
-    byte-identical to the pre-open file. Row data is preserved exactly;
-    only the SQLite header differs. SDK init is synchronous, so no
+    The caller has already opened the connection (and so may have rewritten
+    the journal_mode header) by the time we run, so the backup is not
+    necessarily byte-identical to the pre-open file. Row data is preserved
+    exactly; only the SQLite header may differ. SDK init is synchronous, so no
     concurrent writer can have touched the DB between open and backup.
     """
     if not db_path.exists():
@@ -445,7 +445,11 @@ def ensure_migrated(db_path: str | Path) -> None:
     file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(file))
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout before any lock-taking pragma: flipping a previously-WAL
+        # database back to DELETE needs an exclusive checkpoint, so wait out a
+        # concurrent reader/writer instead of erroring with SQLITE_BUSY.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.executescript(_SCHEMA_SQL)
         _migrate(conn, file)
     finally:
@@ -669,7 +673,15 @@ class SQLiteStore:
         db_file.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode=DELETE (not WAL): the worker mints one short-lived store
+        # connection per item, while `papayya dev`/the test harness keeps a
+        # long-lived reader open. Under WAL that reader blocks checkpointing, so
+        # committed frames strand in the -wal file and never reach main.db —
+        # rows silently vanish on worker shutdown. DELETE checkpoints on each
+        # commit; busy_timeout serializes the now-exclusive writer against
+        # concurrent readers instead of failing them with SQLITE_BUSY.
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA journal_mode=DELETE")
         self._conn.executescript(_SCHEMA_SQL)
         _migrate(self._conn, db_file)
 
