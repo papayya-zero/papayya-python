@@ -734,6 +734,18 @@ class SQLiteStore:
         input_snapshot_json = _encode_snapshot(entry.input_snapshot)
         output_snapshot_json = _encode_snapshot(entry.output_snapshot)
         with self._conn:
+            # Idempotency guard (parity with the control-plane SaveCheckpoint
+            # xmax=0 fix): a re-delivery of the same (run_id, label) must not
+            # insert a duplicate task row or double-count the run aggregates
+            # below. The local step cache normally prevents re-execution, so
+            # this is defensive; first-writer-wins matches the cloud path's
+            # ON CONFLICT (run_id, label) semantics.
+            already = self._conn.execute(
+                "SELECT 1 FROM tasks WHERE run_id = ? AND label = ? LIMIT 1",
+                (run_id, entry.label),
+            ).fetchone()
+            if already is not None:
+                return
             self._conn.execute(
                 f"""INSERT INTO tasks (run_id, label, result, duration_ms, completed_at,
                    {_schema.COL_TASK_ITEM_ID},

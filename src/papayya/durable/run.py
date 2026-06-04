@@ -304,6 +304,27 @@ class PapayyaRun:
     # as an alias so existing user code keeps working unchanged.
     step = task
 
+    def idempotency_key(self, label: str) -> str:
+        """Return a stable per-step idempotency token for this run.
+
+        The durable runtime is **at-least-once**: if a worker crashes
+        between executing a step's side effect and persisting its
+        checkpoint, the step re-executes on resume (see the class
+        docstring). For a non-idempotent side effect — most importantly a
+        billed LLM call — pass this token to your provider's own
+        idempotency mechanism so the *provider* dedupes the retry::
+
+            key = run.idempotency_key("draft")
+            resp = run.llm_step("draft", lambda: client.messages.create(
+                ..., extra_headers={"Idempotency-Key": key}))
+
+        The token is deterministic in ``(run_id, label)`` so the same
+        logical step yields the same key across re-executions. This is a
+        seam, not exactly-once: Papayya cannot dedupe a side effect it
+        does not own.
+        """
+        return f"{self.run_id}:{label}"
+
     def llm_step(
         self,
         label: str,
