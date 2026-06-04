@@ -38,3 +38,19 @@ class FakeDispatcher(LocalDispatcher):
                 for lease_id, record in self._completed.items()  # type: ignore[attr-defined]
                 if record.get("status") != "completed"
             ]
+
+    def completed_leases(self) -> list[str]:
+        """Lease IDs the worker reported as successfully completed.
+
+        A ``/complete`` with status='completed' is posted only after
+        ``run.complete()``'s SQLite commit returned, so each lease here is a
+        commit the SDK promised was durable. The crash-durability test maps
+        these back to item_ids and asserts every one survives a hard kill.
+        Snapshotted under the lock so the caller doesn't see torn rows.
+        """
+        with self._lock:  # type: ignore[attr-defined]
+            return [
+                lease_id
+                for lease_id, record in self._completed.items()  # type: ignore[attr-defined]
+                if record.get("status") == "completed"
+            ]

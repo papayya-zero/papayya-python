@@ -110,6 +110,28 @@ class WorkerSubprocess:
             self._proc.kill()
             self._proc.wait(timeout=2)
 
+    def kill(self) -> None:
+        """Hard SIGKILL — simulate a crash with no graceful shutdown.
+
+        Unlike ``stop`` (SIGTERM, then SIGKILL on timeout), this gives the
+        worker no chance to flush, checkpoint, or close its store
+        connections. The crash-durability test relies on that: a run the
+        worker already reported complete must be on disk regardless.
+        """
+        if self._proc.poll() is not None:
+            return
+        self._proc.kill()
+
+    def wait(self, timeout: float = 5.0) -> int | None:
+        """Block until the process exits; return its exit code (None on timeout).
+
+        After ``kill`` the code is the negative signal number (-9) on POSIX.
+        """
+        try:
+            return self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
     def stderr_tail(self, n_bytes: int = 4096) -> str:
         """Best-effort tail of the worker's combined stdout+stderr log.
 

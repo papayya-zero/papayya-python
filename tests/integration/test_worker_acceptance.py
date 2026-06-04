@@ -32,6 +32,7 @@ import time as _t
 import pytest
 
 from .conftest import write_test_agent
+from ._store import SharedSQLiteStore
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +306,95 @@ def test_worker_processes_batch_with_async_agent_lineage(
     worker.stop(timeout=5.0)
     assert worker.exit_code == 0, (
         f"worker exited with code {worker.exit_code}; expected clean shutdown"
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  Crash durability — committed runs survive a hard worker kill.               #
+#                                                                              #
+#  Regression guard for the local-store WAL frame-loss bug (fixed by           #
+#  journal_mode=DELETE + busy_timeout in sqlite_store.py). Under WAL the        #
+#  worker minted one short-lived store connection per item while the           #
+#  long-lived dev/test reader blocked checkpointing, so committed frames       #
+#  stranded in the -wal file and never reached main.db — runs the SDK had      #
+#  already reported complete silently vanished on shutdown. That is the        #
+#  product's own wedge failure mode (silent, non-raising data loss) firing     #
+#  inside the durable substrate.                                               #
+#                                                                              #
+#  The invariant under test, stated independently of journal mode:             #
+#    a run whose /complete the worker reported MUST be durable — readable       #
+#    through a freshly opened store after the worker is SIGKILLed with no       #
+#    chance to flush, checkpoint, or close cleanly.                            #
+#                                                                              #
+#  The acceptance test caught the old bug only by luck (slice-10's             #
+#  import-graph timing shifted GC enough to expose it). This asserts the       #
+#  guarantee directly, so any regression fails loudly instead of latently.     #
+# --------------------------------------------------------------------------- #
+
+def test_committed_runs_survive_worker_sigkill(
+    tmp_path,
+    fake_dispatcher,
+    in_memory_store,
+    worker_subprocess,
+):
+    """Every run the worker reported complete is on disk after a hard kill.
+
+    Enqueue more items than the worker drains in an instant, let it commit
+    a few, then SIGKILL it mid-batch. Reopen the store from scratch and
+    assert no reported completion was lost. Under the old WAL code these
+    committed-but-stranded frames disappeared; under journal_mode=DELETE
+    every commit reaches main.db before /complete is posted.
+    """
+    agent_path = write_test_agent(tmp_path, _AGENT_SOURCE)
+
+    # Larger than the worker can finish before we kill it, so the kill lands
+    # mid-batch: some runs committed, some never started.
+    items = [f"co_{i:02d}" for i in range(50)]
+    item_for_lease = {
+        fake_dispatcher.enqueue(agent="enrich", item_id=item_id): item_id
+        for item_id in items
+    }
+
+    worker = worker_subprocess(
+        agent_module=agent_path,
+        dispatcher=fake_dispatcher,
+        store=in_memory_store,
+    )
+
+    # Wait until the worker has reported a few completions, then crash it.
+    # A reported /complete means run.complete()'s commit already returned —
+    # these are commits the SDK promised were durable.
+    deadline = _t.monotonic() + 10.0
+    while fake_dispatcher.completed_count() < 3 and _t.monotonic() < deadline:
+        _t.sleep(0.01)
+
+    worker.kill()
+    exit_code = worker.wait(timeout=5.0)
+    assert exit_code is not None, "worker did not die after SIGKILL"
+
+    # The process is dead, so this set can no longer change. Each lease here
+    # is a run the SDK acknowledged as complete.
+    reported = fake_dispatcher.completed_leases()
+    assert reported, (
+        "worker reported zero completions before the kill, so the durability "
+        "path was never exercised — raise the wait deadline and retry"
+    )
+
+    # Reopen the store from a clean connection: this proves the rows are on
+    # disk, not lingering in a connection that happened to be alive during
+    # the run. (run_for_item opens a fresh connection per lookup.)
+    reopened = SharedSQLiteStore(in_memory_store.db_path)
+    lost = sorted(
+        item_for_lease[lease_id]
+        for lease_id in reported
+        if reopened.run_for_item(item_for_lease[lease_id]) is None
+    )
+    assert not lost, (
+        f"{len(lost)}/{len(reported)} runs the worker reported complete were "
+        f"missing after SIGKILL: {lost}. A committed run the SDK acknowledged "
+        "must survive a crash — silent loss here is the exact failure mode "
+        "Papayya exists to detect.\n"
+        f"worker log tail:\n{worker.stderr_tail()}"
     )
 
 
