@@ -17,14 +17,23 @@ from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 # level name is ``papayya.iter``.
 
 def __getattr__(name: str):
-    if name in ("iter", "mark_degraded", "mark_outcome"):
-        from papayya.iterators import iter as _iter, mark_degraded as _mark_degraded, mark_outcome as _mark_outcome
-        if name == "iter":
-            return _iter
-        if name == "mark_degraded":
-            return _mark_degraded
-        if name == "mark_outcome":
-            return _mark_outcome
+    if name in ("iter", "mark_degraded", "mark_outcome", "llm", "step", "active_run_id"):
+        from papayya.iterators import (
+            iter as _iter,
+            mark_degraded as _mark_degraded,
+            mark_outcome as _mark_outcome,
+            llm as _llm,
+            step as _step,
+            active_run_id as _active_run_id,
+        )
+        return {
+            "iter": _iter,
+            "mark_degraded": _mark_degraded,
+            "mark_outcome": _mark_outcome,
+            "llm": _llm,
+            "step": _step,
+            "active_run_id": _active_run_id,
+        }[name]
     if name in ("schedule", "trigger"):
         # Plan 11 decorators. Deferred for the same reason as Plan 10's
         # iter/mark_* — pulling papayya.decorators (which transitively
@@ -43,4 +52,5 @@ __all__ = [
     "CreditExhausted", "BudgetExceeded",
     "is_credit_exhaustion_error", "classify_provider_error",
     "iter", "mark_degraded", "mark_outcome",
+    "llm", "step", "active_run_id",
 ]

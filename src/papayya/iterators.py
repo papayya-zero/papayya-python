@@ -16,6 +16,8 @@ coexist.
 from __future__ import annotations
 
 import builtins
+import functools
+import inspect
 import logging
 import uuid
 from contextvars import ContextVar
@@ -47,6 +49,7 @@ def iter(
     workload: str,
     item_id: Callable[[T], str],
     partition_key: Callable[[T], str],
+    store: Any | None = None,
 ) -> Iterator[T]:
     """Wrap an iterable so each yielded item runs inside its own PapayyaRun.
 
@@ -58,6 +61,11 @@ def iter(
         Required; explicit attribution is the whole point.
       ``partition_key`` — callable extracting the per-item partition key
         (typically tenant id). Required for multi-tenant visibility.
+      ``store`` — optional checkpoint store. When omitted, the same store
+        the ``@agent`` / client path uses is resolved automatically
+        (SQLiteStore locally, CloudStore when an API key is present), so
+        iter-runs persist and show up in ``papayya dev`` like any other run.
+        Pass an explicit store to point a batch at a specific database.
 
     Behavior:
 
@@ -70,7 +78,24 @@ def iter(
     * The active-run contextvar is :func:`mark_degraded` /
       :func:`mark_outcome`'s source of truth.
     """
-    return _iter_gen(items, workload, item_id, partition_key)
+    return _iter_gen(items, workload, item_id, partition_key, store)
+
+
+def _resolve_default_store() -> Any:
+    """Resolve the same store the @agent/client path uses (SQLite or Cloud).
+
+    Lazy import keeps package-init ordering intact (see the note in
+    ``papayya/__init__.py``); resolution failures fall back to ``None`` so a
+    misconfigured environment degrades to the in-memory default rather than
+    crashing the loop.
+    """
+    try:
+        from papayya.papayya import Papayya
+
+        return Papayya()._auto_store()
+    except Exception:
+        log.exception("papayya.iter: could not resolve default store; using in-memory")
+        return None
 
 
 def _iter_gen(
@@ -78,7 +103,9 @@ def _iter_gen(
     workload: str,
     item_id_fn: Callable[[T], str],
     partition_key_fn: Callable[[T], str],
+    store: Any | None = None,
 ) -> Iterator[T]:
+    resolved_store = store if store is not None else _resolve_default_store()
     # Use builtins.iter inside this module so the public name doesn't
     # shadow it for our own implementation. The for-loop below already
     # uses iteration protocol, so this is defense-in-depth — anything
@@ -89,6 +116,7 @@ def _iter_gen(
                 agent=workload,
                 item_id=str(item_id_fn(item)),
                 partition_key=str(partition_key_fn(item)),
+                store=resolved_store,
             )
         )
         run.init()
@@ -166,6 +194,124 @@ def mark_outcome(status: str, reason: str | None = None) -> None:
     _mark(OutcomeVerdict(status, reason))
 
 
+# --------------------------------------------------------------------------- #
+#  Leaf-level adoption (L1): decorate the function that calls your model, not   #
+#  your orchestration code. The wrap sits on the unit that owns execution —     #
+#  the provider call — and reads the active run from the contextvar that        #
+#  ``papayya.iter`` already sets per item. Your business functions never see a  #
+#  ``run`` object and never gain a ``partition_key`` parameter.                 #
+# --------------------------------------------------------------------------- #
+
+
+def llm(fn: Callable | None = None, *, label: str | None = None):
+    """Record each call to a provider-calling leaf function as an LLM step.
+
+    Apply it to the function that actually calls your model::
+
+        @papayya.llm
+        def call_model(prompt: str) -> dict:
+            return client.messages.create(...)
+
+    Then drive items with :func:`iter` — your orchestration stays unchanged
+    and Papayya-unaware::
+
+        for item in papayya.iter(items, workload="triage",
+                                 item_id=lambda i: i["id"],
+                                 partition_key=lambda i: i["tenant"]):
+            triage(item)        # call_model is recorded + outcome-inspected
+
+    Every call inside an active ``papayya.iter`` run is captured with automatic
+    ran-vs-worked detection (refusal / empty / degenerate stop-reason) and
+    tagged with the item's ``partition_key``. Called **outside** an active run,
+    the function runs bare with no recording — adoption is rewarded, never
+    required (so the same code still works in tests and standalone scripts).
+    """
+    return _leaf_decorator(fn, label=label, kind="llm")
+
+
+def step(fn: Callable | None = None, *, label: str | None = None):
+    """Leaf decorator for a non-LLM step (retrieval, a tool call, a parse).
+
+    Same contract as :func:`llm` — records the call against the active
+    ``papayya.iter`` run and runs the empty/degenerate-result inspectors —
+    but skips LLM usage/stop-reason extraction.
+    """
+    return _leaf_decorator(fn, label=label, kind="step")
+
+
+def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
+    def decorate(f: Callable) -> Callable:
+        base_label = label or getattr(f, "__name__", None) or "step"
+
+        def _record(run: "PapayyaRun") -> Callable:
+            # run.step / run.llm_step return an async wrapper iff f is a
+            # coroutine function, so the sync/async split below lines up.
+            effective_label = _next_label(run, base_label)
+            return (
+                run.llm_step(effective_label, f)
+                if kind == "llm"
+                else run.step(effective_label, f)
+            )
+
+        if inspect.iscoroutinefunction(f):
+            # Keep the wrapper a coroutine function too, so callers (and any
+            # framework that introspects with iscoroutinefunction) still see
+            # an awaitable.
+            @functools.wraps(f)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                run = _ACTIVE_RUN.get()
+                if run is None:
+                    return await f(*args, **kwargs)
+                return await _record(run)(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(f)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            run = _ACTIVE_RUN.get()
+            if run is None:
+                # No ambient papayya.iter run — run the function unchanged.
+                return f(*args, **kwargs)
+            return _record(run)(*args, **kwargs)
+
+        return wrapper
+
+    # Support both bare ``@papayya.llm`` and parameterized ``@papayya.llm(label=…)``.
+    return decorate(fn) if fn is not None else decorate
+
+
+def _next_label(run: "PapayyaRun", base_label: str) -> str:
+    """Give each call its own step label within a run.
+
+    Durable steps are keyed by ``(run_id, label)``; a leaf decorated function
+    called more than once per item would otherwise collide on one label and
+    only execute once. The first call keeps the clean name; later calls in the
+    same run get a ``#n`` suffix so each is its own step.
+    """
+    counts = getattr(run, "_leaf_step_counts", None)
+    if counts is None:
+        counts = {}
+        try:
+            run._leaf_step_counts = counts  # type: ignore[attr-defined]
+        except Exception:
+            # Run forbids attribute assignment — fall back to the bare label
+            # (multiple same-label calls per item will dedupe, acceptable).
+            return base_label
+    n = counts.get(base_label, 0)
+    counts[base_label] = n + 1
+    return base_label if n == 0 else f"{base_label}#{n}"
+
+
+def active_run_id() -> str | None:
+    """Return the id of the active ``papayya.iter`` run, or ``None`` outside one.
+
+    Useful for correlating an item with the outcome Papayya recorded for it
+    (e.g. ``store.load(papayya.active_run_id()).worst_outcome_status``).
+    """
+    run = _ACTIVE_RUN.get()
+    return run.run_id if run is not None else None
+
+
 def _mark(verdict: OutcomeVerdict) -> None:
     run = _ACTIVE_RUN.get()
     if run is None:
@@ -210,4 +356,4 @@ def _write_synthetic_entry(run: "PapayyaRun", verdict: OutcomeVerdict) -> None:
 # the builtin in any callsite using ``from papayya.iterators import *``,
 # which is a surprise the customer should opt into via the qualified
 # ``papayya.iter`` form.
-__all__ = ["mark_degraded", "mark_outcome"]
+__all__ = ["mark_degraded", "mark_outcome", "llm", "step", "active_run_id"]
