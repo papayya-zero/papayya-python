@@ -20,6 +20,7 @@ from papayya.runtime_context import get_current_reporter
 
 from .store import MemoryStore
 from .types import (
+    _UNSET,
     CheckpointStore,
     DurableRunConfig,
     DurableRunResult,
@@ -129,6 +130,11 @@ class PapayyaRun:
         # Pinned at create time; on replay it's read from the loaded
         # checkpoint, not re-derived.
         self._parent_run_id: str | None = config.parent_run_id
+        # Replay snapshot supplied by the caller (the iter() wrapper passes
+        # the per-item payload). Left as the _UNSET sentinel by the @agent
+        # path, in which case init() falls back to the call args captured
+        # on the contextvar. Held verbatim so an explicit None is preserved.
+        self._config_input_snapshot: Any = config.input_snapshot
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
@@ -189,6 +195,16 @@ class PapayyaRun:
                     self._cache[entry.label] = entry
                     self._task_call_order.append(entry.label)
 
+            # Caller-supplied snapshot (iter() passes the item) wins; the
+            # @agent path leaves it _UNSET and we read the captured call
+            # args. This is what makes iter-runs replayable — without it
+            # iter rows are created with input_snapshot=NULL because there's
+            # no decorator above them to populate the contextvar.
+            if self._config_input_snapshot is not _UNSET:
+                input_snapshot = self._config_input_snapshot
+            else:
+                input_snapshot = consume_agent_input_snapshot()
+
             now = datetime.now(timezone.utc).isoformat()
             checkpoint = RunCheckpoint(
                 run_id=self.run_id,
@@ -198,7 +214,7 @@ class PapayyaRun:
                 created_at=now,
                 updated_at=now,
                 item_id=self._run_item_id,
-                input_snapshot=consume_agent_input_snapshot(),
+                input_snapshot=input_snapshot,
                 agent_version=self._agent_version,
                 metadata=self._metadata,
                 partition_key=self._partition_key,

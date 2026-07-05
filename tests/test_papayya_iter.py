@@ -229,6 +229,78 @@ def test_iter_failed_body_writes_synthetic_failed_entry(tmp_path):
         db.close()
 
 
+# ── 7b. Item captured as the run's input_snapshot (item-replay) ───────────
+
+def test_iter_passes_item_as_input_snapshot_to_config():
+    """The iterator hands each item to DurableRunConfig.input_snapshot so the
+    run row carries the payload that produced it (the data foundation for
+    replay). Without a decorator above it, iter has no other way to capture
+    the input."""
+    items = [{"id": "a", "t": "T1"}, {"id": "b", "t": "T2"}]
+    for _ in papayya.iter(
+        items,
+        workload="w",
+        item_id=lambda i: i["id"],
+        partition_key=lambda i: i["t"],
+    ):
+        pass
+
+    cfg1, cfg2 = _CapturingRun.captured_configs
+    assert cfg1.input_snapshot == {"id": "a", "t": "T1"}
+    assert cfg2.input_snapshot == {"id": "b", "t": "T2"}
+    # Identity: the exact item object is captured, not a copy.
+    assert cfg1.input_snapshot is items[0]
+
+
+def test_iter_persists_item_snapshot_through_store(tmp_path):
+    """End-to-end: a completed iter-run's row carries the item as
+    input_snapshot after a real SQLite round-trip — the column that was NULL
+    before this change."""
+    db = SQLiteStore(str(tmp_path / "snap.db"))
+    try:
+        _CapturingRun.shared_store = db
+        for _ in papayya.iter(
+            [{"id": "only", "t": "T", "text": "hello"}],
+            workload="w",
+            item_id=lambda i: i["id"],
+            partition_key=lambda i: i["t"],
+        ):
+            pass
+
+        (run,) = _CapturingRun.captured_runs
+        loaded = db.load(run.run_id)
+        assert loaded is not None
+        assert loaded.input_snapshot == {"id": "only", "t": "T", "text": "hello"}
+    finally:
+        db.close()
+
+
+def test_iter_failed_run_carries_snapshot_for_replay(tmp_path):
+    """The replay-relevant case: when the loop body raises, the failed run
+    still carries its input_snapshot, so the run is re-drivable from its id
+    (status='failed' + non-NULL snapshot are the two preconditions the replay
+    path checks)."""
+    db = SQLiteStore(str(tmp_path / "fail_snap.db"))
+    try:
+        _CapturingRun.shared_store = db
+        with pytest.raises(ValueError):
+            for x in papayya.iter(
+                [{"id": "boom", "t": "T"}],
+                workload="w",
+                item_id=lambda i: i["id"],
+                partition_key=lambda i: i["t"],
+            ):
+                raise ValueError("schema mismatch")
+
+        (run,) = _CapturingRun.captured_runs
+        loaded = db.load(run.run_id)
+        assert loaded is not None
+        assert loaded.status == "failed"
+        assert loaded.input_snapshot == {"id": "boom", "t": "T"}
+    finally:
+        db.close()
+
+
 # ── 8. Contextvar always reset, even when complete() raises ───────────────
 
 def test_iter_resets_contextvar_when_complete_raises(caplog):

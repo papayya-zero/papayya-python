@@ -29,7 +29,7 @@ import sqlite3
 import uuid
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from papayya.durable import _schema
 from papayya.durable.sqlite_store import SQLiteStore
@@ -164,9 +164,82 @@ def _replay_invoke(fn: Any, snapshot: Any) -> Any:
     return fn(snapshot)
 
 
+def _replay_with_handler(
+    run_id: str,
+    handler: Callable[[Any], Any],
+    snapshot: Any,
+    workload: str,
+    db_path: Path,
+) -> Any:
+    """Re-drive a run's captured item through a caller-supplied callable.
+
+    iter-runs carry no registration, so the customer supplies the same
+    callable their loop drives. We feed the snapshot through
+    ``papayya.iter`` once — reusing its per-item run lifecycle — so the
+    replay is itself a fully-recorded run (new ``run_id``, leaf-decorator
+    capture, outcome inspection, its own input_snapshot) exactly like a
+    fresh iter pass. The original is then marked ``disposition='replayed'``
+    so it leaves the dead-letter queue; a handler that raises records the
+    replay run as failed (its own dead letter) and the exception
+    propagates, mirroring registration-mode semantics.
+
+    Unlike registration mode, the snapshot is always passed *positionally*
+    (``handler(item)``) — never unpacked as kwargs. The iter contract is
+    ``body(item)`` on the whole item; an item dict is the argument, not a
+    bag of keyword arguments.
+    """
+    # Lazy import avoids a circular import (iterators imports papayya.durable).
+    # SQLiteStore is already imported at module scope.
+    from papayya import iterators
+
+    load_store = SQLiteStore(str(db_path))
+    try:
+        checkpoint = load_store.load(run_id)
+    finally:
+        load_store.close()
+    # The run row exists (read at the top of replay()), so load() should
+    # not return None; guard anyway and fall back to empty attribution.
+    item_id = "" if checkpoint is None or checkpoint.item_id is None else str(
+        checkpoint.item_id
+    )
+    partition_key = (
+        ""
+        if checkpoint is None or checkpoint.partition_key is None
+        else str(checkpoint.partition_key)
+    )
+
+    run_store = SQLiteStore(str(db_path))
+    replay_error: BaseException | None = None
+    result: Any = None
+    try:
+        for item in iterators.iter(
+            [snapshot],
+            workload=workload,
+            item_id=lambda _it: item_id,
+            partition_key=lambda _it: partition_key,
+            store=run_store,
+        ):
+            result = handler(item)
+    except Exception as exc:  # noqa: BLE001 — handler's exception class is unknown
+        replay_error = exc
+    finally:
+        run_store.close()
+
+    mark_store = SQLiteStore(str(db_path))
+    try:
+        mark_store.mark_dlq_disposition(run_id, _schema.DLQ_REPLAYED)
+    finally:
+        mark_store.close()
+
+    if replay_error is not None:
+        raise replay_error
+    return result
+
+
 def replay(
     run_id: str,
     *,
+    handler: Callable[[Any], Any] | None = None,
     agent_module: str | Path | None = None,
     db_path: str | Path | None = None,
     latest: bool = False,
@@ -174,10 +247,24 @@ def replay(
 ) -> Any:
     """Re-drive a failed durable run from its captured input snapshot.
 
-    Loads the run's input_snapshot from the local SQLite DB, finds the
-    matching ``@agent`` registration in the agent module, and re-invokes
-    it. Dict snapshots whose keys bind to the agent's parameters are
-    unpacked as kwargs; everything else is passed positionally.
+    Two resolution modes for *what to re-run*:
+
+    * **Registration mode (default).** Loads the run's input_snapshot,
+      finds the matching ``@agent`` registration in the agent module, and
+      re-invokes it. Dict snapshots whose keys bind to the agent's
+      parameters are unpacked as kwargs; everything else is passed
+      positionally. This is the path for ``@agent``-created runs.
+    * **Handler mode (``handler=``).** ``papayya.iter`` runs have no
+      ``@agent`` registration to discover — the loop body is a suspended
+      frame, not a callable. Pass ``handler=`` (the same callable your
+      loop drives) and the captured item is re-driven through
+      ``papayya.iter`` once: the replay is itself a fully-recorded run
+      (fresh ``run_id``, leaf-decorator capture, outcome inspection),
+      exactly like the original, and the original is marked
+      ``disposition='replayed'``. Item-granularity only — the whole item
+      re-runs; there is no step cache at this tier (that's the
+      ``@agent`` + ``run.step`` upgrade), so ``from_step=`` is rejected.
+      ``handler=`` and ``agent_module=`` are mutually exclusive.
 
     Version gate (ADR-0002 #7) refuses to replay when the captured
     ``agent_version`` differs from the registration's current value.
@@ -252,6 +339,28 @@ def replay(
         input_snapshot = json.loads(raw)
     except (TypeError, ValueError):
         input_snapshot = raw
+
+    # Handler mode: re-drive the captured item through the caller's own
+    # callable. Branches before @agent discovery / version gate / from_step
+    # hydration — none of those apply when there's no registration. The
+    # failed/undisposed/has-snapshot gates above still ran, so handler mode
+    # inherits them.
+    if handler is not None:
+        if agent_module is not None:
+            raise ReplayError(
+                "Pass either handler= (re-drive the captured item through your "
+                "own callable) or agent_module= (discover an @agent "
+                "registration), not both."
+            )
+        if from_step is not None:
+            raise ReplayError(
+                "from_step= is not supported with handler=. iter-style replay is "
+                "item-granularity: the whole item re-runs. Step-level rewind "
+                "requires the @agent + run.step path."
+            )
+        return _replay_with_handler(
+            run_id, handler, input_snapshot, row["agent"], db_path
+        )
 
     agent_name = row["agent"]
 

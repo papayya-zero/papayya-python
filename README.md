@@ -13,16 +13,41 @@ With Papayya: *agent spent $4.20 thrashing on step 7 because the tool returned m
 pip install papayya
 ```
 
-## Try it in 30 seconds (no LLM key needed)
 
 ```bash
 papayya init                                    # writes papayya.yaml
-papayya example                                 # scaffolds local_demo_agent.py
-python local_demo_agent.py                      # one keyless durable run
+papayya example                                 # scaffolds agent.py
+python agent.py                                 # one keyless durable run
 papayya dev                                     # open the local dashboard
 ```
 
 The demo agent runs a two-step durable workflow against canned data — no provider key, no network. Open `papayya dev` to see the run, the per-step input/output, and the lineage. That's the iteration loop.
+
+## Your first workload
+
+Two entrypoints, and you touch both: `@papayya.durable` marks the function that owns one item, and `papayya.map` fans it out. Nothing threads a `run` through your signature.
+
+```python
+import papayya
+
+@papayya.llm
+def extract_fields(name, snippet):
+    ...                     # your LLM call — recorded and inspected
+
+@papayya.durable
+def enrich(company):
+    snippet = fetch_company_snippet(company.domain)
+    fields  = extract_fields(company.name, snippet)
+    return {**company.dict(), **fields}
+
+papayya.map(enrich, companies,
+            item_id=lambda c: c.id,
+            partition_key=lambda c: c.tenant)
+```
+
+Each item runs in its own durable isolate. The `@papayya.llm` call inside the body is journaled *and* inspected — Papayya records not just that it ran, but whether it **worked** (a refusal, an empty result, or a degenerate stop-reason flips the run to `degraded`, even on a 200). `item_id` and `partition_key` tag every row, so the dashboard groups by item and tenant. No `run.step` bookkeeping, no `papayya().run(...)` — your function stays ordinary Python.
+
+`@papayya.durable` is also deployable: `papayya deploy` discovers it and the cloud runtime runs the same function per item.
 
 ## Quick start with your own LLM
 
@@ -50,9 +75,9 @@ def research_bot(input_data):
 
 `budget_usd` on the `@agent` decorator is metadata the cloud runtime uses to cap per-run spend. It is **not** enforced when you call the function directly on your laptop.
 
-### Run a pile of items, durably
+### Finer control: explicit steps (the escape hatch)
 
-Wrap long-running work in checkpoint-able steps. Each item gets its own run, tagged so you can find it later. If a run crashes, it resumes from the last checkpoint instead of re-executing completed steps.
+`@papayya.durable` + `papayya.map` cover the common case. When you need to draw the checkpoint seams yourself — non-deterministic side-effecting code that isn't an LLM/tool call, or a workflow you'd rather orchestrate by hand — drop to explicit steps. Each item gets its own run; if it crashes, replay feeds cached results back instead of re-executing completed steps.
 
 ```python
 from papayya.durable import papayya
@@ -61,7 +86,7 @@ for company in companies:
     run = papayya().run("enrich-company", item_id=company.id)
 
     fetch    = run.step("fetch",    fetch_company_snippet)
-    extract  = run.step("extract",  extract_fields, kind="llm")
+    extract  = run.llm_step("extract", extract_fields)
 
     snippet = fetch(company.domain)        # cached on replay
     fields  = extract(company.name, snippet)  # cached on replay
@@ -69,7 +94,7 @@ for company in companies:
     run.complete({**company.dict(), **fields})
 ```
 
-`step()` and `task()` are aliases. Use whichever reads better. `kind="llm"` records the step as an LLM call so the dashboard renders tokens, model, and cost beside it — without wrapping any provider SDK.
+`step()` and `task()` are aliases. Use whichever reads better. `run.llm_step(...)` records the step as an LLM call so the dashboard renders tokens, model, and cost beside it — and runs the ran-vs-worked inspectors on the result — without wrapping any provider SDK.
 
 When `PAPAYYA_API_KEY` is set, checkpoints round-trip through the cloud control plane. Without a key, the SDK writes to a local SQLite at `.papayya/local.db` — the same database `papayya dev` reads from.
 

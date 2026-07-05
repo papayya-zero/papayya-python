@@ -81,6 +81,41 @@ def iter(
     return _iter_gen(items, workload, item_id, partition_key, store)
 
 
+def map(
+    fn: Callable[[T], Any],
+    items: Iterable[T],
+    *,
+    item_id: Callable[[T], str],
+    partition_key: Callable[[T], str],
+    workload: str | None = None,
+    store: Any | None = None,
+) -> list:
+    """Eager fan-out: run ``fn`` once per item, each inside its own run.
+
+    The eager sibling of :func:`iter` and the documented lead entrypoint.
+    Equivalent to
+    ``[fn(x) for x in papayya.iter(items, workload=…, item_id=…, partition_key=…)]``.
+
+    ``fn`` may be an ordinary function — its ambient ``@papayya.llm`` /
+    ``mark_degraded`` calls resolve against the per-item run ``map`` opens — or
+    an ``@papayya.durable`` / ``@agent`` function, which detects the active run
+    and reuses it rather than opening a second. Either way attribution comes
+    from ``map``'s explicit ``item_id`` / ``partition_key`` (callables over the
+    item), not the decorator's weaker first-argument guess — which is why
+    ``map`` is the correct-attribution path for rich items.
+
+    ``workload`` defaults to the function's registered agent name, else its
+    ``__name__``. As with :func:`iter`, a failing item marks its run failed and
+    the exception propagates; wrap the body for per-item error isolation.
+    """
+    reg = getattr(fn, "_papayya_agent", None)
+    resolved_workload = workload or getattr(reg, "name", None) or getattr(fn, "__name__", "workload")
+    results: list = []
+    for item in _iter_gen(items, resolved_workload, item_id, partition_key, store):
+        results.append(fn(item))
+    return results
+
+
 def _resolve_default_store() -> Any:
     """Resolve the same store the @agent/client path uses (SQLite or Cloud).
 
@@ -117,6 +152,15 @@ def _iter_gen(
                 item_id=str(item_id_fn(item)),
                 partition_key=str(partition_key_fn(item)),
                 store=resolved_store,
+                # Capture the item as the run's input_snapshot at the item
+                # boundary we already cross. This is the only write needed
+                # for item-replay: the run row now carries the exact payload
+                # that produced it, so a failed iter-run can be re-driven
+                # from its run_id. Zero added hot-path latency — store.create
+                # already writes the row; this just fills a column that was
+                # NULL before (the @agent path captures args via decorator,
+                # which iter has no equivalent of).
+                input_snapshot=item,
             )
         )
         run.init()
@@ -163,6 +207,147 @@ def _iter_gen(
                     )
         finally:
             _ACTIVE_RUN.reset(token)
+
+
+class _LazyIsolate:
+    """Deferred per-item run for an ``@papayya.durable`` clean-path body.
+
+    The decorator publishes one of these (not a run) before invoking the
+    body. A run is minted only when the body actually touches an ambient
+    verb (``@papayya.llm`` / ``@papayya.step`` / ``mark_degraded``) — which
+    is precisely when the body is NOT managing its own ``papayya().run()``.
+    Legacy bodies that call ``run()`` themselves never trip this, so their
+    bootstrap-id / replay-hydration adoption is untouched.
+    """
+
+    __slots__ = ("agent", "item_id", "own_completion", "run", "run_token")
+
+    def __init__(self, agent: str, item_id: Any, own_completion: bool) -> None:
+        self.agent = agent
+        self.item_id = item_id
+        self.own_completion = own_completion
+        self.run: "PapayyaRun | None" = None
+        self.run_token: Any = None
+
+
+# Set by the @agent/@papayya.durable clean-path wrapper. Read by _resolve_run
+# to lazily mint the ambient run on first in-body verb use.
+_AMBIENT_ISOLATE: ContextVar["_LazyIsolate | None"] = ContextVar(
+    "papayya_ambient_isolate", default=None
+)
+
+
+def _coerce_item_id(value: Any) -> str | None:
+    """Best-effort item_id for a bare-decorator lazy run.
+
+    The clean ``def f(item)`` path extracts ``args[0]`` as the item id, which
+    is only a stable identifier when the first arg IS one (a str/int — the
+    worker's ``fn(item_id)`` convention). A rich object (``def f(company)``
+    called with a dataclass/dict) has no stable id here, so we record None
+    rather than binding an unstable ``repr``. Correct per-item attribution for
+    rich items is what ``papayya.map(..., item_id=lambda c: c.id)`` is for.
+    """
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _resolve_run() -> "PapayyaRun | None":
+    """Return the run the ambient verbs should write against.
+
+    Preference order: an explicit run installed by ``iter`` or the
+    ``def f(run, …)`` inject path (``_ACTIVE_RUN``); else a lazily-minted run
+    for an ``@papayya.durable`` clean-path body (``_AMBIENT_ISOLATE``); else
+    ``None`` (call runs bare — adoption stays rewarded, never required).
+    """
+    run = _ACTIVE_RUN.get()
+    if run is not None:
+        return run
+    iso = _AMBIENT_ISOLATE.get()
+    if iso is None:
+        return None
+    if iso.run is None:
+        from papayya.durable import papayya as _factory
+        from papayya.agent import _LEGACY_AGENT_PATH_ACTIVE
+
+        # Minting the ambient run is the NEW recommended path — it must not
+        # fire the "you called papayya().run() inside @agent" deprecation
+        # warning, which keys off this flag. Suppress it just for the mint.
+        tok = _LEGACY_AGENT_PATH_ACTIVE.set(False)
+        try:
+            iso.run = _factory().run(agent=iso.agent, item_id=_coerce_item_id(iso.item_id))
+        finally:
+            _LEGACY_AGENT_PATH_ACTIVE.reset(tok)
+        # Create the run row now (same as iter does before the body) so a verb
+        # that writes directly — e.g. mark_degraded's synthetic entry — has a
+        # run to aggregate onto. run.step/llm_step self-init, but mark_* don't.
+        iso.run.init()
+        # Publish so this and every later verb in the body resolve to it.
+        # The wrapper (drive_ambient_*) resets this token when the body ends.
+        iso.run_token = _ACTIVE_RUN.set(iso.run)
+    return iso.run
+
+
+def drive_ambient_sync(agent: str, item_id: Any, body: Callable[[], T], *, own_completion: bool) -> T:
+    """Run an ``@papayya.durable`` clean-path body under a lazy isolate.
+
+    Publishes an :class:`_LazyIsolate` so ambient verbs resolve (minting the
+    run on first use), then — if a run was minted and ``own_completion`` —
+    marks it completed/failed around the body. ``own_completion=False`` on the
+    hosted worker path, where the worker/control-plane own terminal status.
+    """
+    iso = _LazyIsolate(agent, item_id, own_completion)
+    iso_token = _AMBIENT_ISOLATE.set(iso)
+    try:
+        try:
+            result = body()
+        except BaseException as exc:
+            if iso.run is not None and own_completion:
+                _write_synthetic_entry(iso.run, OutcomeVerdict("failed", "agent_body_exception"))
+                try:
+                    iso.run.fail(error=str(exc))
+                except Exception:
+                    log.exception("papayya: run.fail() raised handling an agent-body exception")
+            raise
+        else:
+            if iso.run is not None and own_completion:
+                try:
+                    iso.run.complete()
+                except Exception:
+                    log.exception("papayya: run.complete() raised at agent-body return")
+            return result
+    finally:
+        if iso.run_token is not None:
+            _ACTIVE_RUN.reset(iso.run_token)
+        _AMBIENT_ISOLATE.reset(iso_token)
+
+
+async def drive_ambient_async(agent: str, item_id: Any, body: Callable[[], Any], *, own_completion: bool) -> Any:
+    """Async sibling of :func:`drive_ambient_sync`. ``body`` returns an awaitable."""
+    iso = _LazyIsolate(agent, item_id, own_completion)
+    iso_token = _AMBIENT_ISOLATE.set(iso)
+    try:
+        try:
+            result = await body()
+        except BaseException as exc:
+            if iso.run is not None and own_completion:
+                _write_synthetic_entry(iso.run, OutcomeVerdict("failed", "agent_body_exception"))
+                try:
+                    iso.run.fail(error=str(exc))
+                except Exception:
+                    log.exception("papayya: run.fail() raised handling an agent-body exception")
+            raise
+        else:
+            if iso.run is not None and own_completion:
+                try:
+                    iso.run.complete()
+                except Exception:
+                    log.exception("papayya: run.complete() raised at agent-body return")
+            return result
+    finally:
+        if iso.run_token is not None:
+            _ACTIVE_RUN.reset(iso.run_token)
+        _AMBIENT_ISOLATE.reset(iso_token)
 
 
 def mark_degraded(reason: str) -> None:
@@ -259,7 +444,7 @@ def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
             # an awaitable.
             @functools.wraps(f)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                run = _ACTIVE_RUN.get()
+                run = _resolve_run()
                 if run is None:
                     return await f(*args, **kwargs)
                 return await _record(run)(*args, **kwargs)
@@ -268,9 +453,10 @@ def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
 
         @functools.wraps(f)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            run = _ACTIVE_RUN.get()
+            run = _resolve_run()
             if run is None:
-                # No ambient papayya.iter run — run the function unchanged.
+                # No ambient run (no iter / @papayya.durable in scope) — run
+                # the function unchanged. Adoption is rewarded, never required.
                 return f(*args, **kwargs)
             return _record(run)(*args, **kwargs)
 
@@ -308,12 +494,12 @@ def active_run_id() -> str | None:
     Useful for correlating an item with the outcome Papayya recorded for it
     (e.g. ``store.load(papayya.active_run_id()).worst_outcome_status``).
     """
-    run = _ACTIVE_RUN.get()
+    run = _resolve_run()
     return run.run_id if run is not None else None
 
 
 def _mark(verdict: OutcomeVerdict) -> None:
-    run = _ACTIVE_RUN.get()
+    run = _resolve_run()
     if run is None:
         log.warning(
             "papayya.mark_%s(%r) called outside an active papayya.iter run; ignored",

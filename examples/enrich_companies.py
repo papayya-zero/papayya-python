@@ -65,7 +65,7 @@ def enrich_one(company_id: str, name: str, domain: str) -> dict[str, Any]:
     run = papayya().run("enrich-companies", item_id=company_id)
 
     fetch = run.step("fetch_snippet", fetch_snippet)
-    extract = run.step("extract_fields", extract_fields, kind="llm")
+    extract = run.llm_step("extract_fields", extract_fields)
 
     snippet = fetch(domain)
     fields = extract(name, snippet)

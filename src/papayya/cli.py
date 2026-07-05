@@ -271,13 +271,22 @@ def init() -> None:
             abort=True,
         )
 
-    target.write_text("version: 1\n")
+    # A starter env so the first `papayya deploy` doesn't fail
+    # `_pick_yaml_env` with "no `envs:` block." `agents: {}` is valid —
+    # deploy discovers the @agent-decorated function from agent.py; the
+    # yaml block only carries per-agent schedules/webhooks.
+    target.write_text(
+        "version: 1\n"
+        "envs:\n"
+        "  dev:\n"
+        "    agents: {}\n"
+    )
     click.echo(f"✓ Created papayya.yaml in {cwd}")
     click.echo("")
     click.echo("Next: scaffold a runnable demo to feel the loop:")
     click.echo("")
-    click.echo("    papayya example     # writes local_demo_agent.py")
-    click.echo("    python local_demo_agent.py")
+    click.echo("    papayya example     # writes agent.py")
+    click.echo("    python agent.py")
     click.echo("    papayya dev         # open the dashboard")
     click.echo("")
     click.echo("Or write your own agent — see https://docs.getpapayya.com")
@@ -296,7 +305,7 @@ def init() -> None:
     help="Print the demo to stdout instead of writing a file.",
 )
 def example(print_only: bool) -> None:
-    """Scaffold local_demo_agent.py — a keyless durable run you can execute immediately."""
+    """Scaffold agent.py — a keyless durable run you can execute immediately."""
     from papayya._demo import LOCAL_DEMO_AGENT_SOURCE
 
     if print_only:
@@ -304,21 +313,24 @@ def example(print_only: bool) -> None:
         return
 
     cwd = Path.cwd()
-    target = cwd / "local_demo_agent.py"
+    # Write agent.py — the same name `deploy` / `run` auto-discover, so the
+    # scaffold flows straight into the golden path instead of failing with
+    # "No agent.py found."
+    target = cwd / "agent.py"
 
     if target.exists():
         click.confirm(
-            "local_demo_agent.py already exists. Overwrite?",
+            "agent.py already exists. Overwrite?",
             default=False,
             abort=True,
         )
 
     target.write_text(LOCAL_DEMO_AGENT_SOURCE)
-    click.echo(f"✓ Wrote local_demo_agent.py to {cwd}")
+    click.echo(f"✓ Wrote agent.py to {cwd}")
     click.echo("")
     click.echo("Run it:")
     click.echo("")
-    click.echo("    python local_demo_agent.py")
+    click.echo("    python agent.py")
     click.echo("")
     click.echo("Then open the dashboard:")
     click.echo("")
@@ -2088,10 +2100,8 @@ def _resolve_agent_id(
 @click.argument("input_positional", required=False)
 @click.option("--file", default=None, help="Path to agent definition file (default: agent.py in cwd)")
 @click.option("--input", "input_flag", default=None, help="Input for the agent (alt to positional)")
-@click.option("--local", "use_local", is_flag=True, default=False, help="Run locally (no cloud needed)")
 @click.option("--agent-id", default=None, help="Agent UUID (escape hatch; wins over positional)")
 @click.option("--name", "agent_name", default=None, help="Agent name (required when file declares multiple @agent functions)")
-@click.option("--api-key", "run_api_key", default=None, help="LLM API key for local runs")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -2099,10 +2109,8 @@ def run(
     input_positional: str | None,
     file: str | None,
     input_flag: str | None,
-    use_local: bool,
     agent_id: str | None,
     agent_name: str | None,
-    run_api_key: str | None,
 ) -> None:
     """Trigger a cloud run.
 
@@ -2111,11 +2119,10 @@ def run(
       papayya run my-agent "hello"              # slug + positional input
       papayya run my-agent "hello" --file a.py  # explicit file
       papayya run <uuid> "hello"                # UUID also works
-    """
-    if use_local:
-        _run_local(None, input_flag or input_positional, run_api_key)
-        return
 
+    To run locally without the cloud, execute your file directly:
+      python agent.py
+    """
     # Resolve input: positional wins; fall back to --input flag.
     if input_positional is not None and input_flag is not None:
         click.echo(
@@ -2167,31 +2174,6 @@ def run(
 
     resolved_agent_id = _resolve_agent_id(agent, agent_id, ctx.obj)
     _run_cloud(ctx, reg, resolved_file, input_text, resolved_agent_id)
-
-
-def _run_local(agent: Any, input_text: str, api_key_override: str | None) -> None:
-    """Local execution is BYOF — run your agent file directly.
-
-    Papayya does not ship LLM provider adapters, so the CLI cannot run an
-    agent on your behalf. See the deprecation message below for the two
-    supported paths (direct python invocation, or durable local wrap).
-    """
-    del agent, input_text, api_key_override
-    click.echo(
-        "`papayya run --local` was removed.\n"
-        "\n"
-        "To run your scaffolded agent locally (no durable execution):\n"
-        "    python agent.py\n"
-        "\n"
-        "To deploy and run in papayya's cloud runtime (durable + observable):\n"
-        "    papayya deploy\n"
-        "    papayya run --file agent.py --input \"...\"\n"
-        "\n"
-        "To add durable execution without deploying, wrap your LLM calls\n"
-        "with the papayya() factory — see Path A in https://getpapayya.com/docs/quickstart",
-        err=True,
-    )
-    sys.exit(1)
 
 
 def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str) -> None:

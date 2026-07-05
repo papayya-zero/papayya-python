@@ -17,9 +17,10 @@ from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 # level name is ``papayya.iter``.
 
 def __getattr__(name: str):
-    if name in ("iter", "mark_degraded", "mark_outcome", "llm", "step", "active_run_id"):
+    if name in ("iter", "map", "mark_degraded", "mark_outcome", "llm", "step", "active_run_id"):
         from papayya.iterators import (
             iter as _iter,
+            map as _map,
             mark_degraded as _mark_degraded,
             mark_outcome as _mark_outcome,
             llm as _llm,
@@ -28,6 +29,7 @@ def __getattr__(name: str):
         )
         return {
             "iter": _iter,
+            "map": _map,
             "mark_degraded": _mark_degraded,
             "mark_outcome": _mark_outcome,
             "llm": _llm,
@@ -45,12 +47,12 @@ def __getattr__(name: str):
     raise AttributeError(f"module 'papayya' has no attribute {name!r}")
 
 __all__ = [
-    "agent", "get_registry", "get_agent",
+    "agent", "durable", "get_registry", "get_agent",
     "schedule", "trigger",
     "Papayya", "Client", "RunResult",
     "papayya", "PapayyaRun",
     "CreditExhausted", "BudgetExceeded",
     "is_credit_exhaustion_error", "classify_provider_error",
-    "iter", "mark_degraded", "mark_outcome",
+    "iter", "map", "mark_degraded", "mark_outcome",
     "llm", "step", "active_run_id",
 ]

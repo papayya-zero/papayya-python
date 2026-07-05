@@ -534,28 +534,56 @@ def agent(
                     item_id=item_id_value,
                     partition_key=partition_key_value,
                 )
-                if inject_run:
-                    # Lazy import: papayya.durable.client imports
-                    # papayya.papayya which imports papayya.agent.
-                    from papayya.durable import papayya as _papayya_factory
-                    run_obj = _papayya_factory().run(
-                        agent=name, item_id=item_id_value,
-                    )
-                    active_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
-                    try:
-                        return await fn(run_obj, *args, **kwargs)
-                    finally:
-                        _ACTIVE_RUN_ID.reset(active_token)
-                        clear_papayya_baggage(baggage_token)
-                        _AGENT_INPUT.reset(input_token)
-                else:
+                # Lazy imports: papayya.iterators and papayya.durable both
+                # import back into papayya.agent, so resolve them at call
+                # time (both modules are fully loaded by the time an agent
+                # body runs).
+                from papayya import iterators as _iterators
+                try:
+                    existing = _iterators._ACTIVE_RUN.get()
+                    if existing is not None:
+                        # Case C: a run is already active (papayya.map opened
+                        # it, or we're a nested agent). Reuse it — ambient
+                        # verbs resolve against it — instead of opening a
+                        # second run. The owning caller closes it.
+                        if inject_run:
+                            return await fn(existing, *args, **kwargs)
+                        return await fn(*args, **kwargs)
+
+                    if inject_run:
+                        # `def f(run, …)`: create the run and inject it (as
+                        # before); additionally publish it as the ambient run
+                        # so in-body verbs resolve too. Customer owns completion.
+                        from papayya.durable import papayya as _papayya_factory
+                        run_obj = _papayya_factory().run(agent=name, item_id=item_id_value)
+                        active_id_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
+                        active_run_token = _iterators._ACTIVE_RUN.set(run_obj)
+                        try:
+                            return await fn(run_obj, *args, **kwargs)
+                        finally:
+                            _iterators._ACTIVE_RUN.reset(active_run_token)
+                            _ACTIVE_RUN_ID.reset(active_id_token)
+
+                    # Clean `def f(item)` path. Publish a lazy isolate so an
+                    # ambient @papayya.llm / mark_degraded mints + resolves a
+                    # run (the front door the wedge previously missed) without
+                    # eagerly opening one — legacy bodies that call
+                    # papayya().run() themselves keep their bootstrap/replay
+                    # adoption. On the hosted worker the worker/control-plane
+                    # own terminal status, so don't self-complete there.
+                    hosted = _BOOTSTRAP_RUN_ID.get() is not None
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
                     try:
-                        return await fn(*args, **kwargs)
+                        return await _iterators.drive_ambient_async(
+                            name, item_id_value,
+                            lambda: fn(*args, **kwargs),
+                            own_completion=not hosted,
+                        )
                     finally:
                         _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
-                        clear_papayya_baggage(baggage_token)
-                        _AGENT_INPUT.reset(input_token)
+                finally:
+                    clear_papayya_baggage(baggage_token)
+                    _AGENT_INPUT.reset(input_token)
         else:
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
@@ -575,26 +603,40 @@ def agent(
                     item_id=item_id_value,
                     partition_key=partition_key_value,
                 )
-                if inject_run:
-                    from papayya.durable import papayya as _papayya_factory
-                    run_obj = _papayya_factory().run(
-                        agent=name, item_id=item_id_value,
-                    )
-                    active_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
-                    try:
-                        return fn(run_obj, *args, **kwargs)
-                    finally:
-                        _ACTIVE_RUN_ID.reset(active_token)
-                        clear_papayya_baggage(baggage_token)
-                        _AGENT_INPUT.reset(input_token)
-                else:
+                from papayya import iterators as _iterators
+                try:
+                    existing = _iterators._ACTIVE_RUN.get()
+                    if existing is not None:
+                        # Case C — see the async wrapper above.
+                        if inject_run:
+                            return fn(existing, *args, **kwargs)
+                        return fn(*args, **kwargs)
+
+                    if inject_run:
+                        from papayya.durable import papayya as _papayya_factory
+                        run_obj = _papayya_factory().run(agent=name, item_id=item_id_value)
+                        active_id_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
+                        active_run_token = _iterators._ACTIVE_RUN.set(run_obj)
+                        try:
+                            return fn(run_obj, *args, **kwargs)
+                        finally:
+                            _iterators._ACTIVE_RUN.reset(active_run_token)
+                            _ACTIVE_RUN_ID.reset(active_id_token)
+
+                    # Clean `def f(item)` path — see the async wrapper above.
+                    hosted = _BOOTSTRAP_RUN_ID.get() is not None
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
                     try:
-                        return fn(*args, **kwargs)
+                        return _iterators.drive_ambient_sync(
+                            name, item_id_value,
+                            lambda: fn(*args, **kwargs),
+                            own_completion=not hosted,
+                        )
                     finally:
                         _LEGACY_AGENT_PATH_ACTIVE.reset(legacy_token)
-                        clear_papayya_baggage(baggage_token)
-                        _AGENT_INPUT.reset(input_token)
+                finally:
+                    clear_papayya_baggage(baggage_token)
+                    _AGENT_INPUT.reset(input_token)
 
         # Register the *wrapper*, not the raw fn — the runtime worker
         # calls registration.fn(item_id) directly, and the wrapper is
@@ -626,6 +668,42 @@ def agent(
         return wrapper
 
     return decorator
+
+
+def durable(fn: Callable | None = None, *, name: str | None = None, **kwargs: Any) -> Callable:
+    """The isolate boundary — register a function as a deployable durable workload.
+
+    This is :func:`agent` with the signature freed and the name optional.
+    Durability is *ambient* inside the body: an ``@papayya.llm`` /
+    ``mark_degraded`` / structural outcome inspection resolves against the run
+    the decorator opens, with no ``run`` parameter threaded through your
+    signature and no per-call bookkeeping.
+
+    Usage::
+
+        @papayya.durable
+        def enrich(company): ...
+
+        @papayya.durable(name="enrich", budget_usd=1.0)
+        def enrich(company): ...
+
+    ``name`` defaults to the function's ``__name__``. All other keyword
+    arguments pass straight through to :func:`agent`. ``@agent`` remains as a
+    lower-level alias (it requires an explicit ``name``); the public lead
+    decorator is ``@papayya.durable``.
+    """
+    # Support @papayya.durable("slug") as a positional-name form.
+    if isinstance(fn, str):
+        name = name or fn
+        fn = None
+
+    def decorate(f: Callable) -> Callable:
+        resolved_name = name or getattr(f, "__name__", None) or "workload"
+        return agent(name=resolved_name, **kwargs)(f)
+
+    if fn is not None:
+        return decorate(fn)
+    return decorate
 
 
 # ---------------------------------------------------------------------------

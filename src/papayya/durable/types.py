@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+# Sentinel for DurableRunConfig.input_snapshot. Distinguishes "caller did
+# not supply a snapshot" (fall back to the @agent contextvar in
+# PapayyaRun.init) from "caller supplied None" (an explicit empty snapshot).
+# The iter() wrapper supplies the item itself; the @agent path leaves this
+# unset so init() reads consume_agent_input_snapshot().
+_UNSET: Any = object()
+
 
 @dataclass
 class TaskEntry:
@@ -119,6 +126,14 @@ class DurableRunConfig:
     # construction time so PapayyaRun never has to re-read the project
     # config.
     partition_key: str | None = None
+    # Replay snapshot supplied at construction. The @agent decorator leaves
+    # this _UNSET and lets PapayyaRun.init() read the call args from the
+    # contextvar (consume_agent_input_snapshot); the iter() wrapper, which
+    # has no decorator to capture args, passes the per-item payload here so
+    # the run row carries an input_snapshot and `replay(run_id)` has
+    # something to re-drive. _UNSET (not None) is the "unset" marker so an
+    # explicit None snapshot is distinguishable from "fall back to @agent".
+    input_snapshot: Any = _UNSET
     # v10 / Layer 3 #7 Phase 2: sub-runs lineage. The outer run's id
     # when this run was spawned from inside an @agent body; None for
     # top-level runs. Resolved by Papayya.run() (explicit kwarg wins,

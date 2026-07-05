@@ -20,12 +20,14 @@ def test_example_scaffolds_file(tmp_path: Path) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
         result = runner.invoke(cli_module.main, ["example"])
         assert result.exit_code == 0, result.output
-        target = Path("local_demo_agent.py")
+        # A1: the scaffold writes agent.py — the name deploy/run discover —
+        # so `papayya example` flows straight into the golden path.
+        target = Path("agent.py")
         assert target.exists()
         contents = target.read_text()
         assert contents == LOCAL_DEMO_AGENT_SOURCE
-        assert '@agent(name="enrich")' in contents
-    assert "Wrote local_demo_agent.py" in result.output
+        assert "@papayya.durable" in contents
+    assert "Wrote agent.py" in result.output
     assert "papayya dev" in result.output
 
 
@@ -34,14 +36,14 @@ def test_example_print_emits_to_stdout(tmp_path: Path) -> None:
     with runner.isolated_filesystem(temp_dir=tmp_path):
         result = runner.invoke(cli_module.main, ["example", "--print"])
         assert result.exit_code == 0, result.output
-        assert not Path("local_demo_agent.py").exists()
+        assert not Path("agent.py").exists()
     assert LOCAL_DEMO_AGENT_SOURCE in result.output
 
 
 def test_example_refuses_overwrite(tmp_path: Path) -> None:
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        target = Path("local_demo_agent.py")
+        target = Path("agent.py")
         sentinel = "# user-written content; do not clobber\n"
         target.write_text(sentinel)
         # Reply "n" to the overwrite prompt.
