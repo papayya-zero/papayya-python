@@ -540,7 +540,11 @@ def agent(
                 # body runs).
                 from papayya import iterators as _iterators
                 try:
-                    existing = _iterators._ACTIVE_RUN.get()
+                    # Case C detection peeks the enclosing isolate's minted
+                    # run too — the mint no longer publishes on _ACTIVE_RUN
+                    # (a set() from inside an asyncio.Task could never be
+                    # reset from the wrapper's parent context).
+                    existing = _iterators._peek_run()
                     if existing is not None:
                         # Case C: a run is already active (papayya.map opened
                         # it, or we're a nested agent). Reuse it — ambient
@@ -554,8 +558,17 @@ def agent(
                         # `def f(run, …)`: create the run and inject it (as
                         # before); additionally publish it as the ambient run
                         # so in-body verbs resolve too. Customer owns completion.
+                        # partition_key passes explicitly (possibly None): the
+                        # customer doesn't control this run() call, so the
+                        # strict-metadata contract can't bind them here.
                         from papayya.durable import papayya as _papayya_factory
-                        run_obj = _papayya_factory().run(agent=name, item_id=item_id_value)
+                        run_obj = _papayya_factory().run(
+                            agent=name,
+                            item_id=item_id_value,
+                            partition_key=_iterators._coerce_partition_key(
+                                partition_key_value
+                            ),
+                        )
                         active_id_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
                         active_run_token = _iterators._ACTIVE_RUN.set(run_obj)
                         try:
@@ -575,7 +588,7 @@ def agent(
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
                     try:
                         return await _iterators.drive_ambient_async(
-                            name, item_id_value,
+                            name, item_id_value, partition_key_value,
                             lambda: fn(*args, **kwargs),
                             own_completion=not hosted,
                         )
@@ -605,7 +618,7 @@ def agent(
                 )
                 from papayya import iterators as _iterators
                 try:
-                    existing = _iterators._ACTIVE_RUN.get()
+                    existing = _iterators._peek_run()
                     if existing is not None:
                         # Case C — see the async wrapper above.
                         if inject_run:
@@ -613,8 +626,16 @@ def agent(
                         return fn(*args, **kwargs)
 
                     if inject_run:
+                        # See the async wrapper above for the partition_key
+                        # rationale.
                         from papayya.durable import papayya as _papayya_factory
-                        run_obj = _papayya_factory().run(agent=name, item_id=item_id_value)
+                        run_obj = _papayya_factory().run(
+                            agent=name,
+                            item_id=item_id_value,
+                            partition_key=_iterators._coerce_partition_key(
+                                partition_key_value
+                            ),
+                        )
                         active_id_token = _ACTIVE_RUN_ID.set(run_obj.run_id)
                         active_run_token = _iterators._ACTIVE_RUN.set(run_obj)
                         try:
@@ -628,7 +649,7 @@ def agent(
                     legacy_token = _LEGACY_AGENT_PATH_ACTIVE.set(True)
                     try:
                         return _iterators.drive_ambient_sync(
-                            name, item_id_value,
+                            name, item_id_value, partition_key_value,
                             lambda: fn(*args, **kwargs),
                             own_completion=not hosted,
                         )

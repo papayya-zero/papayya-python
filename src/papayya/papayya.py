@@ -59,6 +59,11 @@ from papayya.resources.webhooks import Webhooks
 
 _PARTITION_KEY_SENTINEL = object()
 
+# Distinguishes "run(partition_key=...) not passed" (strict metadata
+# extraction applies) from an explicit value — including an explicit None,
+# which opts a run out of strict-when-declared.
+_PARTITION_KEY_UNSET = object()
+
 
 def _resolve_durable_api_key(explicit: str | None) -> str | None:
     """Permissive API key resolution for the durable path.
@@ -207,6 +212,7 @@ class Papayya:
         item_id: str | None = None,
         parent_run_id: str | None = None,
         store: Any | None = None,
+        partition_key: Any = _PARTITION_KEY_UNSET,
     ) -> Any:
         """Create a new durable run.
 
@@ -215,6 +221,14 @@ class Papayya:
         strict-when-declared. The extracted value is persisted in the
         indexed ``partition_key`` column on every row written under
         this run.
+
+        Passing ``partition_key=`` explicitly overrides the metadata
+        extraction: a non-empty string is used as-is; an explicit
+        ``None`` records the run unattributed even when papayya.yaml
+        declares a field. The ``@papayya.durable`` clean path mints
+        runs this way — the caller there never sees ``run()``, so the
+        strict-metadata contract can't apply to it (use
+        ``papayya.map(..., partition_key=…)`` for real attribution).
 
         When called from inside an ``@agent`` body, the outer run's id
         is picked up automatically (sub-runs lineage / Layer 3 #7). Pass
@@ -245,10 +259,21 @@ class Papayya:
         from papayya.durable.run import PapayyaRun
         from papayya.durable.types import DurableRunConfig
 
-        partition_key_field = self._project_partition_key_field()
-        partition_key_value: str | None = None
-        if partition_key_field is not None:
-            partition_key_value = _extract_partition_key(metadata, partition_key_field)
+        partition_key_value: str | None
+        if partition_key is not _PARTITION_KEY_UNSET:
+            if partition_key is not None and (
+                not isinstance(partition_key, str) or partition_key == ""
+            ):
+                raise ValueError(
+                    f"partition_key must be a non-empty string or None; "
+                    f"got {partition_key!r}"
+                )
+            partition_key_value = partition_key
+        else:
+            partition_key_value = None
+            partition_key_field = self._project_partition_key_field()
+            if partition_key_field is not None:
+                partition_key_value = _extract_partition_key(metadata, partition_key_field)
 
         resolved_store = store or self._store_override or self._auto_store()
 

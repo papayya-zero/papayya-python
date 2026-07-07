@@ -220,14 +220,16 @@ class _LazyIsolate:
     bootstrap-id / replay-hydration adoption is untouched.
     """
 
-    __slots__ = ("agent", "item_id", "own_completion", "run", "run_token")
+    __slots__ = ("agent", "item_id", "partition_key", "own_completion", "run")
 
-    def __init__(self, agent: str, item_id: Any, own_completion: bool) -> None:
+    def __init__(
+        self, agent: str, item_id: Any, partition_key: Any, own_completion: bool
+    ) -> None:
         self.agent = agent
         self.item_id = item_id
+        self.partition_key = partition_key
         self.own_completion = own_completion
         self.run: "PapayyaRun | None" = None
-        self.run_token: Any = None
 
 
 # Set by the @agent/@papayya.durable clean-path wrapper. Read by _resolve_run
@@ -250,6 +252,32 @@ def _coerce_item_id(value: Any) -> str | None:
     if isinstance(value, (str, int)) and not isinstance(value, bool):
         return str(value)
     return None
+
+
+def _coerce_partition_key(value: Any) -> str | None:
+    """Best-effort partition_key for a bare-decorator lazy run.
+
+    Same posture as :func:`_coerce_item_id`: a str/int (a tenant id) coerces,
+    anything richer records None. ``papayya.map(partition_key=lambda c: …)``
+    is the correct-attribution path.
+    """
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _peek_run() -> "PapayyaRun | None":
+    """The run ambient work would attach to, WITHOUT minting one.
+
+    Checks ``_ACTIVE_RUN`` (set by ``iter`` and the ``def f(run, …)`` inject
+    path), then an enclosing isolate's already-minted run. Used by the
+    ``@papayya.durable`` wrapper to detect an owning run it should reuse.
+    """
+    run = _ACTIVE_RUN.get()
+    if run is not None:
+        return run
+    iso = _AMBIENT_ISOLATE.get()
+    return iso.run if iso is not None else None
 
 
 def _resolve_run() -> "PapayyaRun | None":
@@ -275,20 +303,35 @@ def _resolve_run() -> "PapayyaRun | None":
         # warning, which keys off this flag. Suppress it just for the mint.
         tok = _LEGACY_AGENT_PATH_ACTIVE.set(False)
         try:
-            iso.run = _factory().run(agent=iso.agent, item_id=_coerce_item_id(iso.item_id))
+            # partition_key is passed explicitly (possibly None): the body
+            # never sees run(), so strict-when-declared metadata extraction
+            # can't apply here — an unattributed run beats a crash.
+            iso.run = _factory().run(
+                agent=iso.agent,
+                item_id=_coerce_item_id(iso.item_id),
+                partition_key=_coerce_partition_key(iso.partition_key),
+            )
         finally:
             _LEGACY_AGENT_PATH_ACTIVE.reset(tok)
         # Create the run row now (same as iter does before the body) so a verb
         # that writes directly — e.g. mark_degraded's synthetic entry — has a
         # run to aggregate onto. run.step/llm_step self-init, but mark_* don't.
         iso.run.init()
-        # Publish so this and every later verb in the body resolve to it.
-        # The wrapper (drive_ambient_*) resets this token when the body ends.
-        iso.run_token = _ACTIVE_RUN.set(iso.run)
+        # Deliberately NOT published on _ACTIVE_RUN: this may execute inside
+        # an asyncio.Task (a copied context), where a set() token could never
+        # be reset from drive_ambient_*'s parent context. Later verbs resolve
+        # through the isolate itself, which is shared across those contexts.
     return iso.run
 
 
-def drive_ambient_sync(agent: str, item_id: Any, body: Callable[[], T], *, own_completion: bool) -> T:
+def drive_ambient_sync(
+    agent: str,
+    item_id: Any,
+    partition_key: Any,
+    body: Callable[[], T],
+    *,
+    own_completion: bool,
+) -> T:
     """Run an ``@papayya.durable`` clean-path body under a lazy isolate.
 
     Publishes an :class:`_LazyIsolate` so ambient verbs resolve (minting the
@@ -296,7 +339,7 @@ def drive_ambient_sync(agent: str, item_id: Any, body: Callable[[], T], *, own_c
     marks it completed/failed around the body. ``own_completion=False`` on the
     hosted worker path, where the worker/control-plane own terminal status.
     """
-    iso = _LazyIsolate(agent, item_id, own_completion)
+    iso = _LazyIsolate(agent, item_id, partition_key, own_completion)
     iso_token = _AMBIENT_ISOLATE.set(iso)
     try:
         try:
@@ -317,14 +360,19 @@ def drive_ambient_sync(agent: str, item_id: Any, body: Callable[[], T], *, own_c
                     log.exception("papayya: run.complete() raised at agent-body return")
             return result
     finally:
-        if iso.run_token is not None:
-            _ACTIVE_RUN.reset(iso.run_token)
         _AMBIENT_ISOLATE.reset(iso_token)
 
 
-async def drive_ambient_async(agent: str, item_id: Any, body: Callable[[], Any], *, own_completion: bool) -> Any:
+async def drive_ambient_async(
+    agent: str,
+    item_id: Any,
+    partition_key: Any,
+    body: Callable[[], Any],
+    *,
+    own_completion: bool,
+) -> Any:
     """Async sibling of :func:`drive_ambient_sync`. ``body`` returns an awaitable."""
-    iso = _LazyIsolate(agent, item_id, own_completion)
+    iso = _LazyIsolate(agent, item_id, partition_key, own_completion)
     iso_token = _AMBIENT_ISOLATE.set(iso)
     try:
         try:
@@ -345,8 +393,6 @@ async def drive_ambient_async(agent: str, item_id: Any, body: Callable[[], Any],
                     log.exception("papayya: run.complete() raised at agent-body return")
             return result
     finally:
-        if iso.run_token is not None:
-            _ACTIVE_RUN.reset(iso.run_token)
         _AMBIENT_ISOLATE.reset(iso_token)
 
 

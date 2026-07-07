@@ -153,3 +153,121 @@ def test_durable_module_still_imports_execution_machinery():
     assert callable(papayya.durable)
     from papayya.durable import papayya as factory, PapayyaRun  # noqa: F401
     assert factory is not None
+
+
+async def test_gather_fanout_body_succeeds_and_journals_one_run(db):
+    """Regression: the first ambient mint inside an asyncio.Task created its
+    _ACTIVE_RUN token in the task's copied context; the wrapper's finally then
+    reset that foreign token in the parent context and a SUCCEEDED body raised
+    ``ValueError: token was created in a different Context``."""
+    import asyncio
+
+    @papayya.llm
+    async def call_model(prompt):
+        await asyncio.sleep(0)
+        return {"content": f"answer:{prompt}", "stop_reason": "end_turn"}
+
+    @papayya.durable
+    async def enrich(item):
+        return await asyncio.gather(call_model(f"{item}-a"), call_model(f"{item}-b"))
+
+    out = await enrich("co_7")
+    assert [r["content"] for r in out] == ["answer:co_7-a", "answer:co_7-b"]
+
+    runs = _runs(db)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    # Both gathered calls journaled onto the single minted run.
+    assert [(t["label"], t["outcome_status"]) for t in _tasks(db)] == [
+        ("call_model", "ok"), ("call_model#2", "ok"),
+    ]
+
+
+def test_partition_key_kwarg_reaches_minted_run(db):
+    """The decorator's partition_key kwarg must land on the run row, not just
+    in OTel baggage."""
+
+    @papayya.durable
+    def enrich(item, *, partition_key=None):
+        papayya.mark_degraded("check_attribution")
+        return item
+
+    enrich("co_3", partition_key="tenant-a")
+
+    runs = _runs(db)
+    assert len(runs) == 1
+    assert runs[0]["partition_key"] == "tenant-a"
+
+
+@pytest.fixture
+def declared_partition_key_yaml(tmp_path, monkeypatch):
+    """A project whose papayya.yaml declares a partition_key — the
+    multi-tenant configuration. Chdir so ``papayya().run()`` resolves it."""
+    (tmp_path / "papayya.yaml").write_text(
+        "version: 1\n"
+        "partition_key: tenant_id\n"
+        "envs:\n"
+        "  dev:\n"
+        "    agents: {}\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+
+def test_declared_partition_key_does_not_crash_clean_path(
+    db, declared_partition_key_yaml
+):
+    """Regression: the lazy mint called papayya().run() with no metadata, so a
+    declared partition_key hit strict-when-declared and the first ambient verb
+    raised ValueError. The body can't pass metadata — record NULL instead."""
+
+    @papayya.llm
+    def call_model(item):
+        return {"content": "x", "stop_reason": "end_turn"}
+
+    @papayya.durable
+    def enrich(item):
+        return call_model(item)
+
+    enrich("co_1")
+
+    runs = _runs(db)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["partition_key"] is None
+
+
+def test_declared_partition_key_does_not_crash_inject_path(
+    db, declared_partition_key_yaml
+):
+    """Same regression on the ``def f(run, …)`` branch — the decorator's
+    factory call passes no metadata either."""
+
+    @papayya.durable
+    def enrich(run, item):
+        run.step("work", lambda: {"ok": True})()
+        return run.complete()
+
+    result = enrich("co_2")
+    assert result.status == "completed"
+
+
+def test_nested_durable_reuses_minted_run(db):
+    """After the outer body's first verb mints the ambient run, a nested
+    decorated fn must reuse it (Case C now peeks the isolate's minted run —
+    the mint no longer publishes on _ACTIVE_RUN)."""
+
+    @papayya.durable
+    def inner(item):
+        papayya.mark_degraded("from_inner")
+        return item
+
+    @papayya.durable
+    def outer(item):
+        papayya.mark_degraded("from_outer")  # mints the ambient run
+        return inner(item)
+
+    outer("co_5")
+
+    runs = _runs(db)
+    assert len(runs) == 1
+    assert runs[0]["worst_outcome_status"] == "degraded"
