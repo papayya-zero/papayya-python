@@ -224,7 +224,9 @@ def test_no_kind_does_not_reclassify_exceptions():
 # ---------------------------------------------------------------------------
 
 def test_llm_kind_replay_returns_cached_result():
-    run = _make_run()
+    from papayya.durable import MemoryStore
+
+    store = MemoryStore()
     call_count = {"n": 0}
 
     def call():
@@ -234,9 +236,17 @@ def test_llm_kind_replay_returns_cached_result():
             model="m",
         )
 
-    wrapped = run.step("cached", call, kind="llm")
-    first = wrapped()
-    second = wrapped()
+    run1 = PapayyaRun(
+        DurableRunConfig(agent="test-agent", run_id="llm-replay", store=store)
+    )
+    first = run1.step("cached", call, kind="llm")()
+
+    # Replay: fresh run instance, same run_id/store — cached, not re-executed.
+    run2 = PapayyaRun(
+        DurableRunConfig(agent="test-agent", run_id="llm-replay", store=store)
+    )
+    second = run2.step("cached", call, kind="llm")()
+
     assert call_count["n"] == 1
     assert first is second
 

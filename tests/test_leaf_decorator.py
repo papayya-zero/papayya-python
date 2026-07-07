@@ -146,9 +146,9 @@ def test_leaf_multiple_calls_per_item_are_distinct_steps(tmp_path):
             decorated("two")  # same fn, second call in same run
             rid = papayya.active_run_id()
         labels = [t.label for t in db.load(rid).tasks]
-        # First call keeps the clean label; the second is suffixed so it is its
-        # own durable step rather than a cache collision.
+        # First call keeps the clean label; call N is suffixed #N so it is
+        # its own durable step rather than a cache collision.
         assert "_ok" in labels
-        assert "_ok#1" in labels
+        assert "_ok#2" in labels
     finally:
         db.close()

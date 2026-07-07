@@ -431,11 +431,12 @@ def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
         def _record(run: "PapayyaRun") -> Callable:
             # run.step / run.llm_step return an async wrapper iff f is a
             # coroutine function, so the sync/async split below lines up.
-            effective_label = _next_label(run, base_label)
+            # Repeated calls per run are handled inside PapayyaRun: each
+            # call of the same label becomes its own step (label#N).
             return (
-                run.llm_step(effective_label, f)
+                run.llm_step(base_label, f)
                 if kind == "llm"
-                else run.step(effective_label, f)
+                else run.step(base_label, f)
             )
 
         if inspect.iscoroutinefunction(f):
@@ -464,28 +465,6 @@ def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
 
     # Support both bare ``@papayya.llm`` and parameterized ``@papayya.llm(label=…)``.
     return decorate(fn) if fn is not None else decorate
-
-
-def _next_label(run: "PapayyaRun", base_label: str) -> str:
-    """Give each call its own step label within a run.
-
-    Durable steps are keyed by ``(run_id, label)``; a leaf decorated function
-    called more than once per item would otherwise collide on one label and
-    only execute once. The first call keeps the clean name; later calls in the
-    same run get a ``#n`` suffix so each is its own step.
-    """
-    counts = getattr(run, "_leaf_step_counts", None)
-    if counts is None:
-        counts = {}
-        try:
-            run._leaf_step_counts = counts  # type: ignore[attr-defined]
-        except Exception:
-            # Run forbids attribute assignment — fall back to the bare label
-            # (multiple same-label calls per item will dedupe, acceptable).
-            return base_label
-    n = counts.get(base_label, 0)
-    counts[base_label] = n + 1
-    return base_label if n == 0 else f"{base_label}#{n}"
 
 
 def active_run_id() -> str | None:

@@ -51,6 +51,7 @@ class _CallCtx:
     shims that don't expose ``begin_call``).
     """
 
+    effective_label: str
     effective_item_id: str | None
     runtime_reporter: Any | None
     call_token: object | None
@@ -80,6 +81,14 @@ class PapayyaRun:
     **Execution guarantee:** at-least-once. If a crash occurs between
     executing a step and saving its checkpoint, the step will re-execute
     on resume. Design steps to be idempotent (safe to run more than once).
+
+    **Repeated labels:** each *call* is its own durable step. Calling a
+    step with the same label more than once in a run (e.g. inside an
+    agent loop) keys the first call on the clean label and call *N* on
+    ``label#N`` — call 2 never silently replays call 1's cached result.
+    Replay relies on deterministic re-execution: the resumed code must
+    make same-label calls in the same order, which is the same contract
+    every durable step already carries.
 
     Usage::
 
@@ -135,6 +144,14 @@ class PapayyaRun:
         # path, in which case init() falls back to the call args captured
         # on the contextvar. Held verbatim so an explicit None is preserved.
         self._config_input_snapshot: Any = config.input_snapshot
+        # Live-call occurrence counter per bare step label. A loop calling
+        # run.step("think", ...) once per iteration must produce one durable
+        # step per call — not silently hand iteration 2 the cached result of
+        # iteration 1. Call 1 keeps the clean label; call N keys "label#N".
+        # Never seeded from hydrated cache entries: replay re-executes the
+        # body from the top, recomputing the same sequence, so computed keys
+        # line up with stored labels positionally.
+        self._label_occurrences: dict[str, int] = {}
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
@@ -250,6 +267,12 @@ class PapayyaRun:
 
             run.step("label", some_fn)
 
+        Labels may repeat: each call is its own durable step. In a loop,
+        call 1 of ``"think"`` is stored as ``think`` and call N as
+        ``think#N`` — later iterations never replay an earlier
+        iteration's cached result. See the class docstring for the
+        determinism contract this puts on replay.
+
         For LLM calls, use the explicit ``run.llm_step("label", fn)``
         method — it's equivalent to passing ``kind="llm"`` here but
         makes the intent visible in the type signature.
@@ -320,6 +343,21 @@ class PapayyaRun:
     # as an alias so existing user code keeps working unchanged.
     step = task
 
+    def _resolve_step_label(self, label: str) -> str:
+        """Consume the next occurrence of ``label`` and return its cache key.
+
+        Mutates the per-run occurrence counter — call exactly once per
+        step invocation, from ``_pre_call``.
+        """
+        n = self._label_occurrences.get(label, 0) + 1
+        self._label_occurrences[label] = n
+        return label if n == 1 else f"{label}#{n}"
+
+    def _peek_step_label(self, label: str) -> str:
+        """Key the *next* call of ``label`` would get, without consuming it."""
+        n = self._label_occurrences.get(label, 0) + 1
+        return label if n == 1 else f"{label}#{n}"
+
     def idempotency_key(self, label: str) -> str:
         """Return a stable per-step idempotency token for this run.
 
@@ -334,12 +372,14 @@ class PapayyaRun:
             resp = run.llm_step("draft", lambda: client.messages.create(
                 ..., extra_headers={"Idempotency-Key": key}))
 
-        The token is deterministic in ``(run_id, label)`` so the same
-        logical step yields the same key across re-executions. This is a
-        seam, not exactly-once: Papayya cannot dedupe a side effect it
-        does not own.
+        The token is deterministic in ``(run_id, label, occurrence)`` so
+        the same logical step yields the same key across re-executions,
+        while call N of a repeated label (an agent loop) gets its own key
+        — matching the ``label#N`` keying of the step itself. Call it
+        immediately before the step call it protects. This is a seam, not
+        exactly-once: Papayya cannot dedupe a side effect it does not own.
         """
-        return f"{self.run_id}:{label}"
+        return f"{self.run_id}:{self._peek_step_label(label)}"
 
     def llm_step(
         self,
@@ -441,7 +481,13 @@ class PapayyaRun:
             self.init()
             self._throw_if_finished()
 
-            cached = self._cache.get(label)
+            # Each call consumes an occurrence of the bare label: call 1
+            # keys the clean label, call N keys "label#N". Cache hits
+            # consume too — on replay the recomputed sequence must walk
+            # the hydrated entries in the same order it wrote them.
+            effective_label = self._resolve_step_label(label)
+
+            cached = self._cache.get(effective_label)
             if cached is not None:
                 return cached.result, None
 
@@ -463,7 +509,7 @@ class PapayyaRun:
                 # one release.
                 if hasattr(runtime_reporter, "begin_call"):
                     try:
-                        call_token = runtime_reporter.begin_call(label)
+                        call_token = runtime_reporter.begin_call(effective_label)
                     except Exception:
                         # Telemetry must never crash a step. Falling
                         # back to "no dedupe" means a duplicate emission
@@ -476,6 +522,7 @@ class PapayyaRun:
                         legacy_pre_count = 0
 
             return _MISS, _CallCtx(
+                effective_label=effective_label,
                 effective_item_id=effective_item_id,
                 runtime_reporter=runtime_reporter,
                 call_token=call_token,
@@ -549,7 +596,7 @@ class PapayyaRun:
                 if ctx.runtime_reporter is not None:
                     if not _interceptor_already_emitted(ctx):
                         ctx.runtime_reporter.report_llm_call(
-                            label=label,
+                            label=ctx.effective_label,
                             usage=usage,
                             duration_ms=duration_ms,
                             error_category=None,
@@ -597,7 +644,7 @@ class PapayyaRun:
                 output_snapshot = None
 
             entry = TaskEntry(
-                label=label,
+                label=ctx.effective_label,
                 result=result,
                 duration_ms=duration_ms,
                 completed_at=datetime.now(timezone.utc).isoformat(),
@@ -618,8 +665,8 @@ class PapayyaRun:
                 outcome_reason=outcome_reason,
             )
 
-            self._cache[label] = entry
-            self._task_call_order.append(label)
+            self._cache[ctx.effective_label] = entry
+            self._task_call_order.append(ctx.effective_label)
             self._store.save_task(self.run_id, entry)
 
             return result
@@ -640,7 +687,7 @@ class PapayyaRun:
             duration_ms_exc = int((_time.monotonic() - ctx.start) * 1000)
             try:
                 ctx.runtime_reporter.report_llm_call(
-                    label=label,
+                    label=ctx.effective_label,
                     usage=LlmUsage(None, None, None, None, None, "unknown"),
                     duration_ms=duration_ms_exc,
                     error_category=classify_provider_error(exc),
@@ -687,7 +734,7 @@ class PapayyaRun:
                         category = classify_provider_error(exc)
                         if category == "credit" and not isinstance(exc, CreditExhausted):
                             raise CreditExhausted(
-                                f"{label}: provider credits exhausted ({exc})"
+                                f"{ctx.effective_label}: provider credits exhausted ({exc})"
                             ) from exc
                     raise
                 return _post_call_success(result, ctx, args, kwargs)

@@ -128,6 +128,88 @@ class TestResume:
 
 
 # --------------------------------------------------------------------------- #
+#  Repeated labels — agent loops                                               #
+# --------------------------------------------------------------------------- #
+
+
+class TestRepeatedLabels:
+    def test_loop_executes_every_iteration(self) -> None:
+        """Same label in a loop must run each time, never replay call 1."""
+        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
+        calls: list[str] = []
+
+        def think(prompt: str) -> str:
+            calls.append(prompt)
+            return f"thought about {prompt}"
+
+        outputs = [run.step("think", think)(f"topic-{i}") for i in range(3)]
+
+        assert calls == ["topic-0", "topic-1", "topic-2"]
+        assert outputs == [f"thought about topic-{i}" for i in range(3)]
+
+        result = run.complete(outputs[-1])
+        assert [t.label for t in result.tasks] == ["think", "think#2", "think#3"]
+
+    def test_reused_wrapper_executes_each_call(self) -> None:
+        """One wrapper called twice is two steps, not a memoized value."""
+        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
+        search = run.step("search", search_web)
+
+        assert search("first") == ["result for: first"]
+        assert search("second") == ["result for: second"]
+
+    def test_replay_resumes_mid_loop(self) -> None:
+        """Crash after iteration 2 of 3: resume replays 1-2, executes 3."""
+        store = MemoryStore()
+        run_id = "loop-resume"
+
+        run1 = PapayyaRun(DurableRunConfig(agent="test", run_id=run_id, store=store))
+        for i in range(2):
+            run1.step("think", lambda p: f"thought {p}")(f"topic-{i}")
+        # No complete() — simulates a crash before iteration 3.
+
+        run2 = PapayyaRun(DurableRunConfig(agent="test", run_id=run_id, store=store))
+        live_calls: list[str] = []
+
+        def think2(prompt: str) -> str:
+            live_calls.append(prompt)
+            return f"thought {prompt}"
+
+        outputs = [run2.step("think", think2)(f"topic-{i}") for i in range(3)]
+
+        assert live_calls == ["topic-2"]  # only iteration 3 executed
+        assert outputs == [f"thought topic-{i}" for i in range(3)]
+
+    def test_async_loop_executes_every_iteration(self) -> None:
+        import asyncio
+
+        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
+        calls: list[str] = []
+
+        async def think(prompt: str) -> str:
+            calls.append(prompt)
+            return f"thought about {prompt}"
+
+        async def main() -> list[str]:
+            return [await run.step("think", think)(f"t-{i}") for i in range(2)]
+
+        outputs = asyncio.run(main())
+        assert calls == ["t-0", "t-1"]
+        assert outputs == ["thought about t-0", "thought about t-1"]
+
+    def test_idempotency_key_tracks_occurrence(self) -> None:
+        run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
+
+        key1 = run.idempotency_key("draft")
+        run.step("draft", lambda: "v1")()
+        key2 = run.idempotency_key("draft")
+
+        assert key1 == f"{run.run_id}:draft"
+        assert key2 == f"{run.run_id}:draft#2"
+        assert key1 != key2
+
+
+# --------------------------------------------------------------------------- #
 #  Task label handling                                                         #
 # --------------------------------------------------------------------------- #
 

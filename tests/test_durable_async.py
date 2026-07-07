@@ -162,17 +162,25 @@ async def test_async_step_basic_pipeline():
 
 
 async def test_async_step_replay_returns_plain_value_not_coroutine():
-    run = _make_run()
+    from papayya.durable import MemoryStore
 
+    store = MemoryStore()
     calls: list[int] = []
 
     async def fetch():
         calls.append(1)
         return "first-call"
 
-    wrapped = run.step("fetch", fetch)
-    first = await wrapped()
-    second = await wrapped()
+    run1 = PapayyaRun(
+        DurableRunConfig(agent="async-test-agent", run_id="replay-plain", store=store)
+    )
+    first = await run1.step("fetch", fetch)()
+
+    # Replay: fresh run instance, same run_id/store — the step is cached.
+    run2 = PapayyaRun(
+        DurableRunConfig(agent="async-test-agent", run_id="replay-plain", store=store)
+    )
+    second = await run2.step("fetch", fetch)()
 
     assert first == "first-call"
     assert second == "first-call"
@@ -184,7 +192,9 @@ async def test_async_step_replay_returns_plain_value_not_coroutine():
 
 
 async def test_async_two_step_sequence_caches_on_replay():
-    run = _make_run()
+    from papayya.durable import MemoryStore
+
+    store = MemoryStore()
     counts = {"a": 0, "b": 0}
 
     async def step_a():
@@ -195,12 +205,18 @@ async def test_async_two_step_sequence_caches_on_replay():
         counts["b"] += 1
         return "B"
 
-    wrap_a = run.step("a", step_a)
-    wrap_b = run.step("b", step_b)
-    assert await wrap_a() == "A"
-    assert await wrap_b() == "B"
-    assert await wrap_a() == "A"  # cached
-    assert await wrap_b() == "B"  # cached
+    run1 = PapayyaRun(
+        DurableRunConfig(agent="async-test-agent", run_id="replay-seq", store=store)
+    )
+    assert await run1.step("a", step_a)() == "A"
+    assert await run1.step("b", step_b)() == "B"
+
+    # Replay: fresh run instance re-executes the body; both steps cached.
+    run2 = PapayyaRun(
+        DurableRunConfig(agent="async-test-agent", run_id="replay-seq", store=store)
+    )
+    assert await run2.step("a", step_a)() == "A"  # cached
+    assert await run2.step("b", step_b)() == "B"  # cached
     assert counts == {"a": 1, "b": 1}
 
 
