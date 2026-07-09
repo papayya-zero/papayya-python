@@ -56,7 +56,10 @@ def _get(base: str, path: str) -> urllib.request.http.client.HTTPResponse:
 
 class TestCleanUrlRouting:
     @pytest.mark.parametrize("path", [
-        "/", "/batches", "/batch", "/run", "/search", "/cost", "/upgrade",
+        "/", "/agents", "/runs", "/run", "/items", "/item", "/record",
+        "/search", "/cost", "/upgrade",
+        # Legacy paths (one release): old bookmarks keep resolving.
+        "/batches", "/batch",
     ])
     def test_page_returns_html(self, server: str, path: str) -> None:
         resp = _get(server, path)
@@ -68,6 +71,19 @@ class TestCleanUrlRouting:
         # set a data-page attribute the dispatcher keys on.
         if path not in ("/",):
             assert "data-page=" in body
+
+    def test_nav_speaks_new_nouns(self, server: str) -> None:
+        """Plan 34 Unit 3: nav is Agents → Runs → Items; no page says
+        'Batches' anywhere."""
+        body = _get(server, "/runs").read().decode()
+        for nav in ("Agents", "Runs", "Items"):
+            assert f">{nav}</a>" in body
+        assert "Batches" not in body
+        assert "<title>Runs · Papayya Dev</title>" in body
+
+    def test_legacy_batches_path_serves_runs_page(self, server: str) -> None:
+        body = _get(server, "/batches").read().decode()
+        assert 'data-page="runs"' in body
 
 
 class TestStaticAssets:

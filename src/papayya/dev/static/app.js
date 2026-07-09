@@ -1,5 +1,10 @@
 // Papayya Dev Dashboard — vanilla JS, zero build step.
 //
+// Nouns (Plan 34): agent → run (one invocation) → item (one record
+// processed) → step (one trace node). Two item keyspaces, never merged:
+//   /record?id=<items.id>       one record, in one run   (surrogate uuid)
+//   /item?id=<customer item id> one item, over time      (lineage)
+//
 // Three shared helpers only (convention, guarded in PR review):
 //   - fetchJSON(url)          : GET + JSON parse with status-aware error
 //   - renderTable(cols, rows) : generic table renderer; cols declare label + render
@@ -22,7 +27,9 @@
             const body = await r.json().catch(() => ({}));
             if (!r.ok) {
                 const msg = body && body.error ? body.error : `HTTP ${r.status}`;
-                throw new Error(msg);
+                const err = new Error(msg);
+                err.status = r.status;
+                throw err;
             }
             return body;
         });
@@ -84,6 +91,41 @@
         return renderBadge(k, status || "unknown");
     }
 
+    // The wedge badge: ran vs WORKED. `ok` renders as "worked" so the
+    // difference from a plain status "completed" is visible at a glance.
+    function badgeForOutcome(outcome) {
+        if (outcome === "degraded") return renderBadge("warn", "degraded");
+        if (outcome === "failed") return renderBadge("err", "failed");
+        return renderBadge("ok", "worked");
+    }
+
+    // An item that hard-failed shows "failed" even if no inspector fired.
+    function itemOutcome(row) {
+        if (row.status === "failed" || row.worst_outcome_status === "failed") return "failed";
+        return row.worst_outcome_status || "ok";
+    }
+
+    // Run-level outcome cell: "N of M items degraded" is the incident
+    // signal that must read off the runs list without clicking anything.
+    function runOutcomeCell(r) {
+        const total = r.item_count != null ? r.item_count : (r.total_items || 0);
+        const parts = [];
+        if (r.degraded_items) {
+            parts.push(renderBadge("warn", r.degraded_items + " of " + total + " degraded"));
+            if (r.degraded_tenants > 0) {
+                parts.push(" ");
+                parts.push(el("span", { class: "muted" },
+                    r.degraded_tenants + " tenant" + (r.degraded_tenants === 1 ? "" : "s")));
+            }
+        }
+        if (r.failed_items) {
+            if (parts.length) parts.push(" ");
+            parts.push(renderBadge("err", r.failed_items + " failed"));
+        }
+        if (!parts.length) parts.push(renderBadge("ok", "worked"));
+        return el("div", null, ...parts);
+    }
+
     function badgeForErrorCategory(cat) {
         const k = {
             provider: "warn", tool: "warn", timeout: "muted", logic: "err",
@@ -94,6 +136,18 @@
     function fmtInt(n) {
         if (n == null) return "0";
         return Number(n).toLocaleString();
+    }
+
+    // Local cost signal: the ledger has no $ column (rate cards are
+    // hosted-side), so token totals are the honest per-item cost proxy.
+    function fmtTokens(n) {
+        if (n == null) return "—";
+        return fmtInt(n) + " tok";
+    }
+
+    function shortId(id) {
+        if (!id) return "";
+        return id.length > 14 ? id.slice(0, 12) + "…" : id;
     }
 
     function fmtDuration(ms) {
@@ -147,58 +201,26 @@
             el("p", null, err.message || String(err))));
     }
 
+    function recordHref(row) {
+        const run = row.run_id ? "&run=" + encodeURIComponent(row.run_id) : "";
+        return "/record?id=" + encodeURIComponent(row.id || row.item_id) + run;
+    }
+
     // ----- empty-state helpers -----
 
-    const QUICKSTART = `from papayya import agent\n\n@agent\ndef my_agent(run):\n    return run.task("search", lambda: "hello")()\n`;
+    const QUICKSTART = "papayya example   # scaffolds agent.py\npython agent.py   # one keyless run over canned items\n";
 
     function emptyRoot(title, body) {
         const pre = el("pre", null, QUICKSTART);
         const copyBtn = el("button", {
             class: "copy-btn",
             onclick: () => copyToClipboard(QUICKSTART),
-        }, "Copy snippet");
+        }, "Copy commands");
         return el("div", { class: "empty" },
             el("h3", null, title),
             el("p", null, body),
             pre,
             copyBtn);
-    }
-
-    // ----- page: batches -----
-
-    function pageBatches() {
-        Promise.all([fetchJSON("/api/batches"), fetchJSON("/api/stats")])
-            .then(([batches, stats]) => {
-                if (!batches.length) {
-                    mount(emptyRoot(
-                        "No batches yet",
-                        "Run an agent to see its runs grouped as a batch of 1. When you process a list, they'll appear here as one batch."));
-                    return;
-                }
-
-                const statRow = el("div", { class: "stats-row" },
-                    stat("Total batches", stats.total_batches),
-                    stat("In progress", stats.batches_in_progress),
-                    stat("Completed", stats.batches_completed),
-                    stat("Runs", stats.total_runs));
-
-                const cols = [
-                    { label: "Batch", render: (r) => el("a", { href: "/batch?id=" + encodeURIComponent(r.batch_id) }, r.batch_id) },
-                    { label: "Agent", key: "agent" },
-                    { label: "Status", render: (r) => badgeForStatus(r.status) },
-                    { label: "Progress", render: (r) => progressCell(r) },
-                    { label: "Started", cls: "muted", render: (r) => timeAgo(r.created_at) },
-                ];
-                const tbl = renderTable(cols, batches, {
-                    onRowClick: (r) => { location.href = "/batch?id=" + encodeURIComponent(r.batch_id); },
-                });
-
-                mount(el("div", null,
-                    el("h1", null, "Batches"),
-                    el("p", { class: "subtitle" }, "Every run is part of a batch. Single runs show up as batches of 1."),
-                    statRow, tbl));
-            })
-            .catch(showError);
     }
 
     function stat(label, value) {
@@ -207,103 +229,203 @@
             el("div", { class: "value" }, value == null ? "—" : String(value)));
     }
 
-    function progressCell(batch) {
-        const done = (batch.completed || 0) + (batch.failed || 0);
-        const total = batch.total_items || 1;
+    // ----- page: agents -----
+
+    function pageAgents() {
+        fetchJSON("/api/agents").then((agents) => {
+            if (!agents.length) {
+                mount(emptyRoot(
+                    "No agents yet",
+                    "Run something with the SDK and every agent shows up here with its runs and outcomes."));
+                return;
+            }
+            const cols = [
+                { label: "Agent", render: (a) => el("a", { href: "/runs?agent=" + encodeURIComponent(a.agent) }, a.agent) },
+                { label: "Runs", cls: "num", render: (a) => fmtInt(a.run_count) },
+                { label: "Items", cls: "num", render: (a) => fmtInt(a.item_count) },
+                { label: "Degraded", cls: "num", render: (a) => a.degraded_items ? renderBadge("warn", fmtInt(a.degraded_items)) : "0" },
+                { label: "Failed", cls: "num", render: (a) => a.failed_items ? renderBadge("err", fmtInt(a.failed_items)) : "0" },
+                { label: "Tokens", cls: "num", render: (a) => fmtTokens(a.total_tokens) },
+                { label: "Last run", cls: "muted", render: (a) => timeAgo(a.last_run_at) },
+            ];
+            mount(el("div", null,
+                el("h1", null, "Agents"),
+                el("p", { class: "subtitle" }, "Every deployable unit that has written to this ledger."),
+                renderTable(cols, agents, {
+                    onRowClick: (a) => { location.href = "/runs?agent=" + encodeURIComponent(a.agent); },
+                })));
+        }).catch(showError);
+    }
+
+    // ----- page: runs (invocations) -----
+
+    function pageRuns() {
+        const agentFilter = readQuery().agent;
+        const url = "/api/runs" + (agentFilter ? "?agent=" + encodeURIComponent(agentFilter) : "");
+        Promise.all([fetchJSON(url), fetchJSON("/api/stats")])
+            .then(([runs, stats]) => {
+                if (!runs.length) {
+                    mount(emptyRoot(
+                        "No runs yet",
+                        "One map() call, one cron fire, or one direct call is one run. Scaffold the demo to see your first:"));
+                    return;
+                }
+
+                const statRow = el("div", { class: "stats-row" },
+                    stat("Runs", stats.runs_total),
+                    stat("In progress", stats.runs_in_progress),
+                    stat("Items", stats.items_total),
+                    stat("Degraded items", stats.items_degraded));
+
+                const cols = [
+                    { label: "Run", render: (r) => el("a", { href: "/run?id=" + encodeURIComponent(r.run_id) }, shortId(r.run_id)) },
+                    { label: "Agent", key: "agent" },
+                    { label: "Status", render: (r) => badgeForStatus(r.status) },
+                    { label: "Outcome", render: (r) => runOutcomeCell(r) },
+                    { label: "Progress", render: (r) => progressCell(r) },
+                    { label: "Tokens", cls: "num", render: (r) => fmtTokens(r.total_tokens) },
+                    { label: "Started", cls: "muted", render: (r) => timeAgo(r.created_at) },
+                ];
+                const tbl = renderTable(cols, runs, {
+                    onRowClick: (r) => { location.href = "/run?id=" + encodeURIComponent(r.run_id); },
+                });
+
+                mount(el("div", null,
+                    el("h1", null, "Runs", agentFilter ? el("span", { class: "muted" }, " · " + agentFilter) : null),
+                    el("p", { class: "subtitle" }, "One run per invocation. The Outcome column is ran-vs-worked: a run can complete and still have degraded items."),
+                    statRow, tbl));
+            })
+            .catch(showError);
+    }
+
+    function progressCell(run) {
+        const done = (run.completed || 0) + (run.failed || 0);
+        const total = run.total_items || 1;
         const pct = Math.min(100, Math.round(100 * done / total));
         const bar = el("div", { class: "progress" },
-            el("div", { class: "bar" + (batch.failed ? " failed" : ""), style: "width:" + pct + "%" }));
+            el("div", { class: "bar" + (run.failed ? " failed" : ""), style: "width:" + pct + "%" }));
         return el("div", null, bar,
             el("div", { class: "progress-label" }, done + " / " + total + " (" + pct + "%)"));
     }
 
-    // ----- page: batch detail -----
+    // ----- page: run detail -----
 
-    function pageBatch() {
-        const batchId = readQuery().id;
-        if (!batchId) { showError(new Error("missing ?id")); return; }
+    function pageRun() {
+        const runId = readQuery().id;
+        if (!runId) { showError(new Error("missing ?id")); return; }
 
-        Promise.all([
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId)),
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/runs"),
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/clusters"),
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/outliers"),
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/items").catch(() => []),
-            fetchJSON("/api/batches/" + encodeURIComponent(batchId) + "/dlq").catch(() => []),
-        ]).then(([batch, runs, clusters, outliers, items, dlq]) => {
-            const header = el("div", null,
-                el("h1", null, "Batch ", el("code", null, batch.batch_id), " ", badgeForStatus(batch.status)),
-                el("p", { class: "subtitle" }, batch.agent));
-
-            const stats = el("div", { class: "stats-row" },
-                stat("Items", batch.total_items),
-                stat("Completed", batch.completed),
-                stat("Failed", batch.failed));
-
-            const cancelBtn = ["completed", "failed", "cancelled", "partial"].includes(batch.status)
-                ? null
-                : el("button", {
-                    class: "copy-btn",
-                    onclick: () => cancelBatch(batchId),
-                }, "Cancel batch");
-
-            const clusterSection = clusters.length
-                ? el("div", null,
-                    el("h2", null, "Failure clusters ", el("span", { class: "count" }, "(" + clusters.length + ")")),
-                    renderTable([
-                        { label: "Error", render: (c) => renderBadge("err", c.error_code) },
-                        { label: "Count", cls: "num", key: "count" },
-                        { label: "Sample label", key: "sample_label", cls: "muted" },
-                    ], clusters))
-                : null;
-
-            const outlierSection = outliers.length
-                ? el("div", null,
-                    el("h2", null, "Longest-running runs"),
-                    renderTable([
-                        { label: "Run", render: (r) => el("a", { href: "/run?id=" + encodeURIComponent(r.run_id) }, r.run_id) },
-                        { label: "Status", render: (r) => badgeForStatus(r.status) },
-                        { label: "Duration", cls: "num", render: (r) => fmtDuration(r.duration_ms) },
-                    ], outliers))
-                : null;
-
-            const runsSection = el("div", null,
-                el("h2", null, "Runs ", el("span", { class: "count" }, "(" + runs.length + ")")),
-                renderTable([
-                    { label: "Run", render: (r) => el("a", { href: "/run?id=" + encodeURIComponent(r.run_id) }, r.run_id) },
-                    { label: "Status", render: (r) => badgeForStatus(r.status) },
-                    { label: "Started", cls: "muted", render: (r) => timeAgo(r.created_at) },
-                ], runs));
-
-            const itemsSection = items && items.length
-                ? el("div", null,
-                    el("h2", null, "Items ", el("span", { class: "count" }, "(" + items.length + ")")),
-                    renderTable([
-                        { label: "Item", render: (i) => el("a", { href: "/item?id=" + encodeURIComponent(i.item_id) }, i.item_id) },
-                        { label: "Runs", cls: "num", key: "run_count" },
-                        { label: "Steps", cls: "num", key: "step_count" },
-                        { label: "Failed runs", cls: "num", render: (i) => i.failed_runs ? renderBadge("err", i.failed_runs) : "0" },
-                        { label: "Last seen", cls: "muted", render: (i) => timeAgo(i.last_seen) },
-                    ], items))
-                : null;
-
-            const dlqSection = dlq.length
-                ? el("div", null,
-                    el("h2", null, "Dead letter queue ",
-                        el("span", { class: "count" }, "(" + dlq.length + ")")),
-                    el("p", { class: "subtitle" },
-                        "Failed runs waiting for triage. Replay rebuilds the run from its captured input; skip / acknowledge resolves it without re-running."),
-                    el("div", { class: "dlq-list" },
-                        ...dlq.map((d) => renderDlqRow(batchId, d))))
-                : null;
-
-            const upgradeCard = maybeRenderBatchUpgradeCard(batch);
-
-            mount(el("div", null, header, upgradeCard, cancelBtn, stats, dlqSection, clusterSection, outlierSection, itemsSection, runsSection));
+        fetchJSON("/api/runs/" + encodeURIComponent(runId)).then((run) => {
+            // Legacy deep link: a pre-0.3.0 "run id" was a record uuid. The
+            // API falls back to the item row; send the browser to /record.
+            if (run.id) {
+                location.replace(recordHref(run));
+                return;
+            }
+            return Promise.all([
+                fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/items"),
+                fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/tenants").catch(() => []),
+                fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/clusters").catch(() => []),
+                fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/outliers").catch(() => []),
+                fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/dlq").catch(() => []),
+            ]).then(([items, tenants, clusters, outliers, dlq]) => {
+                renderRunDetail(runId, run, items, tenants, clusters, outliers, dlq);
+            });
         }).catch(showError);
     }
 
-    function renderDlqRow(batchId, d) {
+    function renderRunDetail(runId, run, items, tenants, clusters, outliers, dlq) {
+        const header = el("div", null,
+            el("h1", null, "Run ", el("code", null, run.run_id), " ",
+                badgeForStatus(run.status), " ", runOutcomeCell(run)),
+            el("p", { class: "subtitle" }, run.agent,
+                run.replayed_from
+                    ? el("span", null, " · replay of ",
+                        el("a", { href: "/run?id=" + encodeURIComponent(run.replayed_from) }, shortId(run.replayed_from)))
+                    : ""));
+
+        const worked = Math.max(0, (run.item_count || 0) - (run.degraded_items || 0) - (run.failed_items || 0));
+        const stats = el("div", { class: "stats-row" },
+            stat("Items", run.item_count),
+            stat("Worked", worked),
+            stat("Degraded", run.degraded_items),
+            stat("Failed", run.failed_items),
+            stat("Tokens", run.total_tokens == null ? "—" : fmtInt(run.total_tokens)));
+
+        const cancelBtn = ["completed", "failed", "cancelled", "partial"].includes(run.status)
+            ? null
+            : el("button", {
+                class: "copy-btn",
+                onclick: () => cancelRun(runId),
+            }, "Cancel run");
+
+        // Per-tenant blast radius — shown whenever anything didn't work,
+        // or the run spans multiple tenants.
+        const showTenants = tenants.length > 1
+            || tenants.some((t) => t.degraded_items || t.failed_items);
+        const tenantSection = showTenants && tenants.length
+            ? el("div", null,
+                el("h2", null, "By tenant"),
+                renderTable([
+                    { label: "Tenant", key: "tenant" },
+                    { label: "Items", cls: "num", key: "item_count" },
+                    { label: "Worked", cls: "num", render: (t) => Math.max(0, t.item_count - (t.degraded_items || 0) - (t.failed_items || 0)) },
+                    { label: "Degraded", cls: "num", render: (t) => t.degraded_items ? renderBadge("warn", t.degraded_items) : "0" },
+                    { label: "Failed", cls: "num", render: (t) => t.failed_items ? renderBadge("err", t.failed_items) : "0" },
+                ], tenants))
+            : null;
+
+        const clusterSection = clusters.length
+            ? el("div", null,
+                el("h2", null, "Failure clusters ", el("span", { class: "count" }, "(" + clusters.length + ")")),
+                renderTable([
+                    { label: "Error", render: (c) => renderBadge("err", c.error_category) },
+                    { label: "Count", cls: "num", key: "count" },
+                    { label: "Sample step", key: "sample_label", cls: "muted" },
+                    { label: "Sample reason", key: "sample_reason", cls: "muted" },
+                ], clusters))
+            : null;
+
+        const outlierSection = outliers.length
+            ? el("div", null,
+                el("h2", null, "Longest-running items"),
+                renderTable([
+                    { label: "Item", render: (r) => el("a", { href: "/record?id=" + encodeURIComponent(r.id) + "&run=" + encodeURIComponent(runId) }, r.item_id || shortId(r.id)) },
+                    { label: "Outcome", render: (r) => badgeForOutcome(itemOutcome(r)) },
+                    { label: "Status", render: (r) => badgeForStatus(r.status) },
+                    { label: "Duration", cls: "num", render: (r) => fmtDuration(r.duration_ms) },
+                ], outliers))
+            : null;
+
+        const itemsSection = el("div", null,
+            el("h2", null, "Items ", el("span", { class: "count" }, "(" + items.length + ")")),
+            renderTable([
+                { label: "Item", render: (i) => el("a", { href: recordHref(i) }, i.item_id || shortId(i.id)) },
+                { label: "Outcome", render: (i) => badgeForOutcome(itemOutcome(i)) },
+                { label: "Status", render: (i) => badgeForStatus(i.status) },
+                { label: "Tenant", key: "partition_key", cls: "muted" },
+                { label: "Steps", cls: "num", key: "step_count" },
+                { label: "Tokens", cls: "num", render: (i) => fmtTokens(i.total_tokens) },
+                { label: "Started", cls: "muted", render: (i) => timeAgo(i.created_at) },
+            ], items, {
+                onRowClick: (i) => { location.href = recordHref(i); },
+            }));
+
+        const dlqSection = dlq.length
+            ? el("div", null,
+                el("h2", null, "Dead letter queue ",
+                    el("span", { class: "count" }, "(" + dlq.length + ")")),
+                el("p", { class: "subtitle" },
+                    "Failed items waiting for triage. Replay re-drives the item from its captured input; skip / acknowledge resolves it without re-running."),
+                el("div", { class: "dlq-list" },
+                    ...dlq.map((d) => renderDlqRow(runId, d))))
+            : null;
+
+        const upgradeCard = maybeRenderRunUpgradeCard(run);
+
+        mount(el("div", null, header, upgradeCard, cancelBtn, stats, dlqSection, tenantSection, clusterSection, outlierSection, itemsSection));
+    }
+
+    function renderDlqRow(runId, d) {
         const snap = parseSnapshot(d.input_snapshot);
         const snapBlock = snap === undefined
             ? null
@@ -317,31 +439,33 @@
         const actions = el("div", { class: "dlq-actions" },
             el("button", {
                 class: "dlq-btn dlq-btn-primary",
-                onclick: () => dlqReplay(batchId, d.run_id),
+                onclick: () => dlqReplay(runId, d.id),
             }, "Replay"),
             el("button", {
                 class: "dlq-btn",
-                onclick: () => dlqDispose(batchId, d.run_id, "skip"),
+                onclick: () => dlqDispose(runId, d.id, "skip"),
             }, "Skip"),
             el("button", {
                 class: "dlq-btn",
-                onclick: () => dlqDispose(batchId, d.run_id, "acknowledge"),
+                onclick: () => dlqDispose(runId, d.id, "acknowledge"),
             }, "Acknowledge"));
 
         return el("div", { class: "dlq-item" },
             el("div", { class: "dlq-head" },
-                el("a", { href: "/run?id=" + encodeURIComponent(d.run_id) }, d.run_id),
+                el("a", { href: "/record?id=" + encodeURIComponent(d.id) + "&run=" + encodeURIComponent(runId) },
+                    d.item_id || shortId(d.id)),
                 d.item_id ? el("span", null, " · ",
-                    el("a", { href: "/item?id=" + encodeURIComponent(d.item_id) }, "item " + d.item_id)) : null,
+                    el("a", { href: "/item?id=" + encodeURIComponent(d.item_id) }, "history")) : null,
+                d.partition_key ? el("span", { class: "muted" }, " · " + d.partition_key) : null,
                 el("span", { class: "muted" }, " · " + timeAgo(d.created_at))),
             errLine,
             snapBlock,
             actions);
     }
 
-    function dlqDispose(batchId, runId, action) {
-        const url = "/api/batches/" + encodeURIComponent(batchId)
-            + "/dlq/" + encodeURIComponent(runId) + "/" + action;
+    function dlqDispose(runId, recordId, action) {
+        const url = "/api/runs/" + encodeURIComponent(runId)
+            + "/dlq/" + encodeURIComponent(recordId) + "/" + action;
         fetch(url, { method: "POST" })
             .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
             .then(({ ok, body }) => {
@@ -349,15 +473,15 @@
                     alert("Action failed: " + (body.error || "unknown"));
                     return;
                 }
-                // Refresh the batch page so the DLQ list updates.
-                pageBatch();
+                // Refresh the run page so the DLQ list updates.
+                pageRun();
             })
             .catch((e) => alert("Action failed: " + e.message));
     }
 
-    function dlqReplay(batchId, runId) {
-        const url = "/api/batches/" + encodeURIComponent(batchId)
-            + "/dlq/" + encodeURIComponent(runId) + "/replay";
+    function dlqReplay(runId, recordId) {
+        const url = "/api/runs/" + encodeURIComponent(runId)
+            + "/dlq/" + encodeURIComponent(recordId) + "/replay";
         // Replay can take up to ~120s (the server-side timeout). Show an
         // inline "running..." state rather than a browser-level spinner.
         const existingBtns = document.querySelectorAll(".dlq-btn");
@@ -374,7 +498,7 @@
                     alert("Replay exited " + body.exit_code
                         + (body.stderr ? "\n\n" + body.stderr : ""));
                 }
-                pageBatch();
+                pageRun();
             })
             .catch((e) => {
                 existingBtns.forEach((b) => { b.disabled = false; });
@@ -382,73 +506,102 @@
             });
     }
 
-    function cancelBatch(id) {
-        fetch("/api/batches/" + encodeURIComponent(id) + "/cancel", { method: "POST" })
+    function cancelRun(id) {
+        fetch("/api/runs/" + encodeURIComponent(id) + "/cancel", { method: "POST" })
             .then((r) => r.json())
             .then((body) => {
-                alert(body.noop ? "Batch already terminal — nothing to cancel" : "Cancelled");
-                pageBatch();
+                alert(body.noop ? "Run already terminal — nothing to cancel" : "Cancelled");
+                pageRun();
             })
             .catch((e) => alert("Cancel failed: " + e.message));
     }
 
-    // ----- page: run detail -----
+    // ----- page: record (one item, in one run — surrogate-uuid keyspace) -----
 
-    function pageRun() {
-        const runId = readQuery().id;
-        if (!runId) { showError(new Error("missing ?id")); return; }
+    function pageRecord() {
+        const q = readQuery();
+        const recordId = q.id;
+        if (!recordId) { showError(new Error("missing ?id")); return; }
 
-        Promise.all([
-            fetchJSON("/api/runs/" + encodeURIComponent(runId)),
-            fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/tasks"),
-            fetchJSON("/api/thrashing?run_id=" + encodeURIComponent(runId)).catch(() => []),
-        ]).then(([run, tasks, thrash]) => {
+        // Internal links always carry &run=. A bare ?id= (old bookmark)
+        // resolves the parent run via the legacy /api/runs/<record> fallback.
+        const withRun = q.run
+            ? Promise.resolve(q.run)
+            : fetchJSON("/api/runs/" + encodeURIComponent(recordId)).then((row) => {
+                if (!row.id) throw new Error("that id is a run — open /run?id=" + recordId);
+                return row.run_id;
+            });
+
+        withRun.then((runId) => Promise.all([
+            fetchJSON("/api/runs/" + encodeURIComponent(runId) + "/items/" + encodeURIComponent(recordId)),
+            fetchJSON("/api/thrashing?item=" + encodeURIComponent(recordId)).catch(() => []),
+        ])).then(([detail, thrash]) => {
+            const item = detail.item;
+            const steps = detail.steps || [];
+
+            // Record page title: "Item <customer id> in run <short>" — the
+            // lineage page ("Item <id> — history") is the other keyspace.
             const header = el("div", null,
-                el("h1", null, "Run ", el("code", null, run.run_id), " ", badgeForStatus(run.status)),
-                el("p", { class: "subtitle" }, run.agent,
-                    run.batch_id ? el("span", null, " · ", el("a", { href: "/batch?id=" + encodeURIComponent(run.batch_id) }, "batch " + run.batch_id)) : "",
-                    run.item_id ? el("span", null, " · ", el("a", { href: "/item?id=" + encodeURIComponent(run.item_id) }, "item " + run.item_id)) : ""));
+                el("h1", null,
+                    "Item ", el("code", null, item.item_id || shortId(item.id)), " ",
+                    badgeForOutcome(itemOutcome(item)), " ",
+                    badgeForStatus(item.status)),
+                el("p", { class: "subtitle" },
+                    item.agent,
+                    " · in run ",
+                    el("a", { href: "/run?id=" + encodeURIComponent(item.run_id) }, shortId(item.run_id)),
+                    item.item_id ? el("span", null, " · ",
+                        el("a", { href: "/item?id=" + encodeURIComponent(item.item_id) }, "history")) : "",
+                    item.partition_key ? " · tenant " + item.partition_key : "",
+                    item.replayed_from ? el("span", null, " · replay of ",
+                        el("a", { href: "/record?id=" + encodeURIComponent(item.replayed_from) }, shortId(item.replayed_from))) : ""));
 
             const stats = el("div", { class: "stats-row" },
-                stat("Steps", tasks.length),
-                stat("Started", timeAgo(run.created_at)));
+                stat("Steps", steps.length),
+                stat("Degraded steps", item.degraded_count || 0),
+                stat("Tokens", item.total_tokens == null ? "—" : fmtInt(item.total_tokens)),
+                stat("Started", timeAgo(item.created_at)));
 
             const thrashBanner = thrash && thrash.length
                 ? el("div", { class: "banner warn" },
                     el("div", null,
                         el("strong", null, "Thrashing detected"),
                         el("p", null,
-                            "Tool ", el("code", null, thrash[0].tool_name),
-                            " called ", String(thrash[0].repeat_count),
+                            "Step ", el("code", null, thrash[0].label),
+                            " journaled ", String(thrash[0].repeat_count),
                             " times with identical input — a common sign of a model loop or missing stop condition.")))
                 : null;
 
-            const timeline = tasks.length
+            const timeline = steps.length
                 ? el("div", { class: "timeline" },
-                    ...tasks.map((t, i) => el("div", { class: "step" },
+                    ...steps.map((t, i) => el("div", { class: "step" },
                         el("div", { class: "idx" }, "#" + (i + 1)),
                         el("div", null,
                             el("div", null,
                                 t.label || el("em", null, "untitled"),
                                 " ",
+                                t.outcome_status && t.outcome_status !== "ok"
+                                    ? badgeForOutcome(t.outcome_status) : null,
+                                " ",
                                 ...renderLlmBadges(t),
                                 " ",
                                 t.error_category ? badgeForErrorCategory(t.error_category) : null),
                             el("div", { class: "meta" },
+                                t.outcome_reason ? el("span", null, t.outcome_reason) : null,
                                 t.kind === "llm" && t.llm_model ? el("span", null, t.llm_model) : null,
                                 el("span", null, fmtDuration(t.duration_ms)))),
                         el("div", null, timeAgo(t.completed_at)))))
                 : el("div", { class: "empty" },
                     el("h3", null, "No steps yet"),
-                    el("p", null, "Steps appear when the agent wraps work in run.step(...) or run.step(..., kind=\"llm\")."));
+                    el("p", null, "Steps appear when the item's trace records work — an @papayya.llm / @papayya.step call, or run.step(...)."));
 
             mount(el("div", null, header, thrashBanner, stats, timeline));
         }).catch(showError);
     }
 
-    // Render badges for a task's LLM usage metadata. Returns an array of
+    // Render badges for a step's LLM usage metadata. Returns an array of
     // nodes (possibly empty) so callers can spread them into a parent.
-    // Only emits anything when the task was wrapped with kind="llm".
+    // Only emits anything when the step was recorded with kind="llm".
     function renderLlmBadges(t) {
         if (t.kind !== "llm") return [];
         const out = [];
@@ -474,40 +627,99 @@
         return out;
     }
 
-    // ----- page: item timeline (Slice 6) -----
+    // ----- page: items (latest records across all runs) -----
+
+    function pageItems() {
+        const params = readQuery();
+        const query = [];
+        if (params.outcome) query.push("outcome=" + encodeURIComponent(params.outcome));
+        if (params.agent) query.push("agent=" + encodeURIComponent(params.agent));
+        fetchJSON("/api/items" + (query.length ? "?" + query.join("&") : "")).then((items) => {
+            if (!items.length) {
+                mount(emptyRoot(
+                    "No items yet",
+                    "Every record a run processes shows up here with its ran-vs-worked outcome."));
+                return;
+            }
+            const cols = [
+                { label: "Item", render: (i) => el("a", { href: recordHref(i) }, i.item_id || shortId(i.id)) },
+                { label: "Outcome", render: (i) => badgeForOutcome(itemOutcome(i)) },
+                { label: "Status", render: (i) => badgeForStatus(i.status) },
+                { label: "Agent", key: "agent" },
+                { label: "Run", render: (i) => i.run_id ? el("a", { href: "/run?id=" + encodeURIComponent(i.run_id) }, shortId(i.run_id)) : "—" },
+                { label: "Tenant", key: "partition_key", cls: "muted" },
+                { label: "Tokens", cls: "num", render: (i) => fmtTokens(i.total_tokens) },
+                { label: "History", render: (i) => i.item_id ? el("a", { href: "/item?id=" + encodeURIComponent(i.item_id) }, "history") : "" },
+                { label: "Started", cls: "muted", render: (i) => timeAgo(i.created_at) },
+            ];
+            const filterBar = el("div", { class: "filter-bar" },
+                ...["", "degraded", "failed", "ok"].map((o) =>
+                    el("a", {
+                        class: "pill pill-" + (params.outcome === o || (!params.outcome && o === "") ? "info" : "muted"),
+                        href: "/items" + (o ? "?outcome=" + o : ""),
+                        style: "margin-right:8px",
+                    }, o === "" ? "all" : o)));
+            mount(el("div", null,
+                el("h1", null, "Items"),
+                el("p", { class: "subtitle" }, "Latest processed records across every run. Click an item for its trace, or its history for the same item over time."),
+                filterBar,
+                renderTable(cols, items, {
+                    onRowClick: (i) => { location.href = recordHref(i); },
+                })));
+        }).catch(showError);
+    }
+
+    // ----- page: item history (customer-identity keyspace) -----
 
     function pageItem() {
         const itemId = readQuery().id;
         if (!itemId) { showError(new Error("missing ?id")); return; }
 
         fetchJSON("/api/items/" + encodeURIComponent(itemId)).then((data) => {
-            const runs = data.runs || [];
-            const tasks = data.tasks || [];
+            const records = data.records || [];
+            const steps = data.steps || [];
 
-            const firstRun = runs[0];
             const header = el("div", null,
-                el("h1", null, "Item ", el("code", null, data.item_id)),
+                el("h1", null, "Item ", el("code", null, data.item_id), " — history"),
                 el("p", { class: "subtitle" },
-                    runs.length + " run" + (runs.length === 1 ? "" : "s"),
+                    "The same item over time, across runs. ",
+                    records.length + " record" + (records.length === 1 ? "" : "s"),
                     " · ",
-                    tasks.length + " step" + (tasks.length === 1 ? "" : "s"),
-                    firstRun && firstRun.batch_id
-                        ? el("span", null, " · ", el("a", { href: "/batch?id=" + encodeURIComponent(firstRun.batch_id) }, "batch " + firstRun.batch_id))
-                        : ""));
+                    steps.length + " step" + (steps.length === 1 ? "" : "s")));
 
+            const degraded = records.filter((r) => itemOutcome(r) === "degraded").length;
+            const failed = records.filter((r) => itemOutcome(r) === "failed").length;
             const stats = el("div", { class: "stats-row" },
-                stat("Runs", runs.length),
-                stat("Steps", tasks.length),
-                stat("First seen", firstRun ? timeAgo(firstRun.created_at) : "—"));
+                stat("Records", records.length),
+                stat("Degraded", degraded),
+                stat("Failed", failed),
+                stat("First seen", records[0] ? timeAgo(records[0].created_at) : "—"));
 
-            const timeline = tasks.length
-                ? el("div", { class: "timeline" },
-                    ...tasks.map((t) => renderItemStep(t)))
+            const recordsSection = records.length
+                ? el("div", null,
+                    el("h2", null, "Records"),
+                    renderTable([
+                        { label: "Record", render: (r) => el("a", { href: recordHref(r) }, shortId(r.id)) },
+                        { label: "Outcome", render: (r) => badgeForOutcome(itemOutcome(r)) },
+                        { label: "Status", render: (r) => badgeForStatus(r.status) },
+                        { label: "Run", render: (r) => r.run_id ? el("a", { href: "/run?id=" + encodeURIComponent(r.run_id) }, shortId(r.run_id)) : "—" },
+                        { label: "Agent", key: "agent" },
+                        { label: "When", cls: "muted", render: (r) => timeAgo(r.created_at) },
+                    ], records, {
+                        onRowClick: (r) => { location.href = recordHref(r); },
+                    }))
+                : null;
+
+            const timeline = steps.length
+                ? el("div", null,
+                    el("h2", null, "Steps"),
+                    el("div", { class: "timeline" },
+                        ...steps.map((t) => renderItemStep(t))))
                 : el("div", { class: "empty" },
                     el("h3", null, "No steps yet"),
-                    el("p", null, "Steps with this item_id appear here once a run.step(...) call tags them."));
+                    el("p", null, "Steps tagged with this item id appear here once a run records them."));
 
-            mount(el("div", null, header, stats, timeline));
+            mount(el("div", null, header, stats, recordsSection, timeline));
         }).catch(showError);
     }
 
@@ -533,13 +745,16 @@
                 el("div", null,
                     t.label || el("em", null, "untitled"),
                     " ",
-                    t.run_agent ? renderBadge("info", t.run_agent) : null,
+                    t.outcome_status && t.outcome_status !== "ok"
+                        ? badgeForOutcome(t.outcome_status) : null,
+                    " ",
+                    t.record_agent ? renderBadge("info", t.record_agent) : null,
                     " ",
                     ...renderLlmBadges(t),
                     " ",
                     t.error_category ? badgeForErrorCategory(t.error_category) : null),
                 el("div", { class: "meta" },
-                    el("a", { href: "/run?id=" + encodeURIComponent(t.run_id) }, "run " + t.run_id),
+                    el("a", { href: "/record?id=" + encodeURIComponent(t.item_id) + (t.run_id ? "&run=" + encodeURIComponent(t.run_id) : "") }, "record " + shortId(t.item_id)),
                     t.kind === "llm" && t.llm_model ? el("span", null, t.llm_model) : null,
                     el("span", null, fmtDuration(t.duration_ms))),
                 diffBadges,
@@ -585,10 +800,12 @@
                 pageSearch();
             },
         },
-            el("label", null, "Tool name",
-                el("input", { name: "tool_name", value: params.tool_name || "" })),
-            el("label", null, "Error code",
-                el("input", { name: "error_code", value: params.error_code || "" })),
+            el("label", null, "Step label",
+                el("input", { name: "label", value: params.label || "" })),
+            el("label", null, "Error category",
+                el("input", { name: "error_category", value: params.error_category || "" })),
+            el("label", null, "Outcome",
+                el("input", { name: "outcome", value: params.outcome || "", placeholder: "degraded" })),
             el("button", { type: "submit" }, "Search"));
 
         const hasFilters = Object.values(params).some(Boolean);
@@ -604,17 +821,18 @@
                         return;
                     }
                     resultsHost.appendChild(renderTable([
-                        { label: "Run", render: (r) => el("a", { href: "/run?id=" + encodeURIComponent(r.run_id) }, r.run_id.slice(0, 12)) },
-                        { label: "Tool", render: (r) => r.tool_name ? renderBadge("info", r.tool_name) : "—" },
-                        { label: "Error", render: (r) => r.error_code ? renderBadge("err", r.error_code) : "—" },
+                        { label: "Step", key: "label" },
+                        { label: "Item", render: (r) => el("a", { href: "/record?id=" + encodeURIComponent(r.item_id) }, shortId(r.item_id)) },
+                        { label: "Outcome", render: (r) => badgeForOutcome(r.outcome_status || "ok") },
+                        { label: "Error", render: (r) => r.error_category ? badgeForErrorCategory(r.error_category) : "—" },
                         { label: "Duration", cls: "num", render: (r) => fmtDuration(r.duration_ms) },
-                        { label: "When", cls: "muted", render: (r) => timeAgo(r.created_at) },
+                        { label: "When", cls: "muted", render: (r) => timeAgo(r.completed_at) },
                     ], rows));
                 })
                 .catch((e) => resultsHost.appendChild(el("p", null, "Error: " + e.message)));
         } else {
             resultsHost.appendChild(el("p", { class: "subtitle" },
-                "Search every step across every run. Filter by tool or error."));
+                "Search every step across every run. Filter by label, error category, or outcome (ok / degraded / failed)."));
         }
 
         mount(el("div", null, el("h1", null, "Search steps"), form, resultsHost));
@@ -629,9 +847,9 @@
             const primary = rec.primary;
 
             const statsBlock = el("div", { class: "stats-row" },
-                stat("Runs", fmtInt(p.total_runs)),
-                stat("Batches", fmtInt(p.total_batches)),
-                stat("Largest batch", fmtInt(p.largest_batch)),
+                stat("Items", fmtInt(p.total_items)),
+                stat("Runs", fmtInt(p.runs_total)),
+                stat("Largest run", fmtInt(p.largest_run)),
                 stat("Compute minutes", (p.compute_minutes || 0).toFixed(1)),
                 stat("Peak concurrency", fmtInt(body.peak_concurrency)));
 
@@ -658,33 +876,33 @@
             mount(el("div", null,
                 el("h1", null, "Your last 30 days"),
                 el("p", { class: "subtitle" },
-                    "Here's what your workload looks like at scale. Papayya Cloud runs this while your laptop's closed."),
+                    "Here's what your agents look like at scale. Papayya Cloud runs this while your laptop's closed."),
                 statsBlock, recCard, cta));
         }).catch(showError);
     }
 
-    // ----- contextual upgrade card on batch detail -----
+    // ----- contextual upgrade card on run detail -----
 
-    function maybeRenderBatchUpgradeCard(batch) {
+    function maybeRenderRunUpgradeCard(run) {
         // Show the card when the user has actually done pile-shaped work.
         // Conditions (any one triggers it): >20 items or >5 min elapsed.
-        const items = Number(batch.total_items || 0);
-        const started = Date.parse(batch.created_at || "");
-        const ended = Date.parse(batch.completed_at || new Date().toISOString());
+        const items = Number(run.total_items || 0);
+        const started = Date.parse(run.created_at || "");
+        const ended = Date.parse(run.completed_at || new Date().toISOString());
         const elapsedMin = isNaN(started) || isNaN(ended) ? 0 : (ended - started) / 60000;
 
         const trigger = items > 20 || elapsedMin > 5;
         if (!trigger) return null;
 
-        const key = "papayya.dev.upgrade-dismissed." + batch.batch_id;
+        const key = "papayya.dev.upgrade-dismissed." + run.run_id;
         if (localStorage.getItem(key) === "1") return null;
 
         const card = el("div", { class: "banner" },
             el("div", null,
                 el("strong", null, "Running this nightly?"),
-                el("p", null, "Papayya Cloud runs batches while your laptop's closed — with team dashboards, alerts, and persistent history."),
+                el("p", null, "Papayya Cloud runs this while your laptop's closed — with team dashboards, alerts, and persistent history."),
                 el("a", {
-                    href: "https://app.getpapayya.com/signup?ref=dev-batch&batch=" + encodeURIComponent(batch.batch_id),
+                    href: "https://app.getpapayya.com/signup?ref=dev-run&run=" + encodeURIComponent(run.run_id),
                 }, "See your recommended tier →")),
             el("button", {
                 class: "dismiss",
@@ -700,9 +918,11 @@
     // ----- dispatcher -----
 
     const ROUTES = {
-        batches: pageBatches,
-        batch:   pageBatch,
+        agents:  pageAgents,
+        runs:    pageRuns,
         run:     pageRun,
+        record:  pageRecord,
+        items:   pageItems,
         item:    pageItem,
         search:  pageSearch,
         upgrade: pageUpgrade,
@@ -710,7 +930,7 @@
 
     function highlightNav() {
         const page = document.body.dataset.page;
-        const navKey = ["batch", "run", "item"].includes(page) ? "batches" : page;
+        const navKey = { run: "runs", record: "items", item: "items" }[page] || page;
         document.querySelectorAll(".topnav a").forEach((a) => {
             if (a.dataset.nav === navKey) a.classList.add("active");
         });

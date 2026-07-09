@@ -38,12 +38,17 @@ def _free_port() -> int:
 
 
 def _checkpoint(
-    run_id: str, agent: str = "t", invocation_id: str | None = None
+    run_id: str,
+    agent: str = "t",
+    invocation_id: str | None = None,
+    partition_key: str | None = None,
+    item_id: str | None = None,
 ) -> RunCheckpoint:
     now = datetime.now(timezone.utc).isoformat()
     return RunCheckpoint(
         run_id=run_id, agent=agent, tasks=[], status="running",
         created_at=now, updated_at=now, invocation_id=invocation_id,
+        partition_key=partition_key, item_id=item_id,
     )
 
 
@@ -56,12 +61,35 @@ def _task() -> TaskEntry:
 
 def _seed(store: SQLiteStore) -> None:
     """Populate a representative local DB for the endpoint tests."""
-    # Explicit run (invocation) with 3 items — 2 successes, 1 failure
+    # Explicit run (invocation) with 3 items — 2 successes, 1 failure.
+    # Item 2 completes but its LLM step is DEGRADED (the wedge case: ran,
+    # didn't work) and carries a tenant so /tenants has a blast radius.
     store.create_run("b-explicit", agent="enrich", total_items=3)
     for i, status in enumerate(("completed", "completed", "failed"), start=1):
-        chk = _checkpoint(f"run-{i}", agent="enrich", invocation_id="b-explicit")
+        chk = _checkpoint(
+            f"run-{i}",
+            agent="enrich",
+            invocation_id="b-explicit",
+            partition_key="acme" if i == 2 else "globex",
+            item_id=f"co_{i}",
+        )
         store.create(chk)
         store.save_task(f"run-{i}", _task())
+        if i == 2:
+            store.save_task(
+                f"run-{i}",
+                TaskEntry(
+                    label="call-model",
+                    result={"content": ""},
+                    duration_ms=80,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    kind="llm",
+                    llm_total_tokens=130,
+                    outcome_status="degraded",
+                    outcome_reason="empty_string",
+                    partition_key="acme",
+                ),
+            )
         # Item 3 carries a classified provider failure so the clusters
         # endpoint (grouping on steps.error_category) has one bucket.
         if i == 3:
@@ -77,7 +105,7 @@ def _seed(store: SQLiteStore) -> None:
             )
         store.set_status(f"run-{i}", status, output=None)
 
-    # A separate direct-call item outside the run for /api/runs breadth
+    # A separate direct-call item outside the run for /api/items breadth
     store.create(_checkpoint("run-single"))
     store.save_task("run-single", _task())
     store.set_status("run-single", "completed", output=None)
@@ -136,6 +164,10 @@ class TestStats:
         assert "total_batches" in body
         assert body["total_batches"] >= 2  # b-explicit + implicit for run-single
         assert body["total_runs"] == 4
+        # New-noun keys, incl. the wedge counter the runs page shows.
+        assert body["items_total"] == 4
+        assert body["items_degraded"] == 1
+        assert body["runs_total"] >= 2
 
 
 class TestBatches:
@@ -297,11 +329,19 @@ class TestStepSearch:
         assert body == []
 
     def test_by_error_code(self, seeded_server: tuple[str, Path]) -> None:
-        """error_code now maps onto steps.error_category."""
+        """error_code is the legacy spelling of error_category."""
         base, _ = seeded_server
         status, body = _get(base, "/api/steps/search?error_code=provider")
         assert status == 200
         assert len(body) == 1
+
+    def test_by_label_and_outcome(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/steps/search?label=call&outcome=degraded")
+        assert status == 200
+        assert len(body) == 1
+        assert body[0]["label"] == "call-model"
+        assert body[0]["outcome_status"] == "degraded"
 
 
 class TestThrashing:
@@ -322,13 +362,46 @@ class TestThrashing:
     def test_batch_scope_also_empty(
         self, seeded_server: tuple[str, Path]
     ) -> None:
-        """Thrashing was fed by the dead legacy LLM-call log; the endpoint
-        survives (no 404/500 for the shipped UI) but returns [] until the
-        Unit 3 pass rebuilds it on step rows."""
+        """Legacy batch_id scope still accepted; the seed has no repeated
+        identical steps so nothing is flagged."""
         base, _ = seeded_server
         status, body = _get(base, "/api/thrashing?batch_id=b-explicit")
         assert status == 200
         assert body == []
+
+    def test_detects_repeated_identical_steps(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        """Rebuilt on v12 step rows: the same step journaled 3+ times with
+        the same input snapshot is a thrash. Repeated live calls store as
+        label / label#2 / label#3 (occurrence suffix), so the detector
+        groups on the bare label."""
+        base, db_path = seeded_server
+        store = SQLiteStore(str(db_path))
+        store.create(_checkpoint("run-thrash"))
+        for label in ("search", "search#2", "search#3"):
+            store.save_task(
+                "run-thrash",
+                TaskEntry(
+                    label=label,
+                    result=None,
+                    duration_ms=10,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    input_snapshot='{"q": "same"}',
+                ),
+            )
+        store.close()
+
+        status, body = _get(base, "/api/thrashing?item=run-thrash")
+        assert status == 200
+        assert len(body) == 1
+        assert body[0]["label"] == "search"
+        assert body[0]["repeat_count"] == 3
+
+        # Legacy spelling of the record scope still works.
+        status, body = _get(base, "/api/thrashing?run_id=run-thrash")
+        assert status == 200
+        assert body[0]["repeat_count"] == 3
 
 
 class TestProjection:
@@ -343,25 +416,159 @@ class TestProjection:
 
 
 class TestRunEndpoints:
-    def test_run_detail(self, seeded_server: tuple[str, Path]) -> None:
+    """The new-noun surface: /api/runs lists INVOCATIONS with the outcome
+    rollup, /api/runs/:id/items lists the records, and
+    /api/runs/:id/items/:record is per-record detail."""
+
+    def test_runs_list_carries_worst_outcome_status(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        """The wedge must read off the runs list without clicking anything:
+        every run row carries worst_outcome_status + degraded/failed counts."""
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs")
+        assert status == 200
+        run = next(r for r in body if r["run_id"] == "b-explicit")
+        assert run["worst_outcome_status"] == "failed"  # 1 failed beats 1 degraded
+        assert run["degraded_items"] == 1
+        assert run["failed_items"] == 1
+        assert run["item_count"] == 3
+        assert run["degraded_tenants"] == 1
+        assert run["total_tokens"] == 130
+        # Legacy alias kept one release.
+        assert run["batch_id"] == "b-explicit"
+
+    def test_runs_list_agent_filter(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs?agent=enrich")
+        assert status == 200
+        assert all(r["agent"] == "enrich" for r in body)
+        assert any(r["run_id"] == "b-explicit" for r in body)
+
+    def test_run_detail_is_invocation(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs/b-explicit")
+        assert status == 200
+        assert body["run_id"] == "b-explicit"
+        assert body["total_items"] == 3
+        assert body["worst_outcome_status"] == "failed"
+
+    def test_run_detail_falls_back_to_record(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
+        """A pre-0.3.0 'run id' was a record uuid — the endpoint falls back
+        to the item row so old deep links land somewhere useful."""
         base, _ = seeded_server
         status, body = _get(base, "/api/runs/run-1")
         assert status == 200
-        assert body["run_id"] == "run-1"
+        assert body["id"] == "run-1"
+        assert body["run_id"] == "b-explicit"  # NEW meaning: the invocation
 
     def test_run_not_found(self, seeded_server: tuple[str, Path]) -> None:
         base, _ = seeded_server
         status, _body = _get(base, "/api/runs/does-not-exist")
         assert status == 404
 
-    def test_run_steps_endpoint_survives_empty(self, seeded_server: tuple[str, Path]) -> None:
-        """/steps served the dead legacy LLM-call log; it now always returns
-        [] (the real trace is /tasks). Must not 404/500 — the shipped run
-        page still fetches it."""
+    def test_run_items_carry_outcome_and_tokens(
+        self, seeded_server: tuple[str, Path]
+    ) -> None:
         base, _ = seeded_server
-        status, body = _get(base, "/api/runs/run-1/steps")
+        status, body = _get(base, "/api/runs/b-explicit/items")
         assert status == 200
-        assert body == []
+        assert len(body) == 3
+        degraded = next(i for i in body if i["id"] == "run-2")
+        assert degraded["worst_outcome_status"] == "degraded"
+        assert degraded["degraded_count"] == 1
+        assert degraded["total_tokens"] == 130
+        assert degraded["step_count"] == 2
+        assert degraded["partition_key"] == "acme"
+
+    def test_run_items_outcome_filter(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs/b-explicit/items?outcome=degraded")
+        assert status == 200
+        assert [i["id"] for i in body] == ["run-2"]
+
+    def test_record_detail(self, seeded_server: tuple[str, Path]) -> None:
+        """Per-RECORD keyspace: /api/runs/:run/items/:record returns the
+        item row + its step trace."""
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs/b-explicit/items/run-2")
+        assert status == 200
+        assert body["item"]["id"] == "run-2"
+        assert body["item"]["item_id"] == "co_2"  # customer identity
+        assert len(body["steps"]) == 2
+        degraded_step = body["steps"][1]
+        assert degraded_step["outcome_status"] == "degraded"
+        assert degraded_step["outcome_reason"] == "empty_string"
+
+    def test_record_detail_wrong_run_404(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, _body = _get(base, "/api/runs/b-explicit/items/run-single")
+        assert status == 404
+
+    def test_run_tenants_blast_radius(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/runs/b-explicit/tenants")
+        assert status == 200
+        by_tenant = {t["tenant"]: t for t in body}
+        assert by_tenant["acme"]["degraded_items"] == 1
+        assert by_tenant["globex"]["failed_items"] == 1
+        # Sorted worst-first: the degraded tenant leads.
+        assert body[0]["tenant"] == "acme"
+
+    def test_legacy_steps_endpoint_gone(self, seeded_server: tuple[str, Path]) -> None:
+        """/api/runs/<record>/steps served a dead pre-v12 table via a []
+        stub; the stub is removed along with the page that fetched it."""
+        base, _ = seeded_server
+        status, _body = _get(base, "/api/runs/run-1/steps")
+        assert status == 404
+
+
+class TestAgentsEndpoint:
+    def test_lists_agents_with_rollups(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/agents")
+        assert status == 200
+        enrich = next(a for a in body if a["agent"] == "enrich")
+        assert enrich["run_count"] == 1
+        assert enrich["item_count"] == 3
+        assert enrich["degraded_items"] == 1
+        assert enrich["failed_items"] == 1
+
+
+class TestItemsCollection:
+    def test_lists_latest_records(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/items")
+        assert status == 200
+        assert len(body) == 4
+        assert {i["id"] for i in body} == {"run-1", "run-2", "run-3", "run-single"}
+
+    def test_outcome_filter(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, body = _get(base, "/api/items?outcome=degraded")
+        assert status == 200
+        assert [i["id"] for i in body] == ["run-2"]
+
+
+class TestItemLineage:
+    def test_customer_keyspace(self, seeded_server: tuple[str, Path]) -> None:
+        """/api/items/<customer id> is the lineage view — records + steps
+        for that identity across runs (the OTHER keyspace)."""
+        base, _ = seeded_server
+        status, body = _get(base, "/api/items/co_2")
+        assert status == 200
+        assert body["item_id"] == "co_2"
+        assert len(body["records"]) == 1
+        assert body["records"][0]["id"] == "run-2"
+        # Pre-0.3.0 keys kept one release.
+        assert body["runs"] == body["records"]
+
+    def test_unknown_item_404(self, seeded_server: tuple[str, Path]) -> None:
+        base, _ = seeded_server
+        status, _body = _get(base, "/api/items/co_nope")
+        assert status == 404
 
     def test_run_tasks_exposes_llm_fields(
         self, seeded_server: tuple[str, Path], tmp_path: Path
