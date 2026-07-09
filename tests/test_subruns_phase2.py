@@ -36,7 +36,7 @@ def _isolate_env(monkeypatch, tmp_path):
 def _read_parent(db_path: str, run_id: str) -> str | None:
     store = SQLiteStore(db_path)
     rows = store._conn.execute(
-        "SELECT parent_run_id FROM runs WHERE run_id = ?", (run_id,),
+        "SELECT parent_run_id FROM items WHERE id = ?", (run_id,),
     ).fetchall()
     assert len(rows) == 1, f"expected one row for {run_id}, got {len(rows)}"
     return rows[0]["parent_run_id"]

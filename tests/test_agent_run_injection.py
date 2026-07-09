@@ -98,7 +98,7 @@ def test_inject_run_populates_input_snapshot(tmp_path, monkeypatch):
 
     store = SQLiteStore(str(db_path))
     rows = store._conn.execute(
-        "SELECT input_snapshot FROM runs WHERE agent = 'inject-snap'"
+        "SELECT input_snapshot FROM items WHERE agent = 'inject-snap'"
     ).fetchall()
     assert len(rows) == 1
     assert json.loads(rows[0]["input_snapshot"]) == {"item_id": "co_seed"}

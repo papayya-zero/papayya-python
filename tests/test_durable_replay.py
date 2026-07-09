@@ -95,10 +95,10 @@ def test_replay_happy_path_returns_agent_value(
 
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='dead-run'").fetchone()
+    row = conn.execute("SELECT * FROM items WHERE id='dead-run'").fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
-    assert row[_schema.COL_RUN_DLQ_RESOLVED_AT] is not None
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+    assert row[_schema.COL_ITEM_DLQ_RESOLVED_AT] is not None
 
 
 def test_replay_rejects_null_snapshot(tmp_path: Path, db_env: Path) -> None:
@@ -110,7 +110,7 @@ def test_replay_rejects_null_snapshot(tmp_path: Path, db_env: Path) -> None:
     # encoding the test would silently stop exercising the guard.
     conn = sqlite3.connect(db_env)
     snap = conn.execute(
-        f"SELECT {_schema.COL_RUN_INPUT_SNAPSHOT} FROM runs WHERE run_id='legacy'"
+        f"SELECT {_schema.COL_ITEM_INPUT_SNAPSHOT} FROM items WHERE id='legacy'"
     ).fetchone()[0]
     conn.close()
     if snap is not None:
@@ -122,9 +122,9 @@ def test_replay_rejects_null_snapshot(tmp_path: Path, db_env: Path) -> None:
     # Original is untouched: gate fired before mark_dlq_disposition.
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='legacy'").fetchone()
+    row = conn.execute("SELECT * FROM items WHERE id='legacy'").fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] is None
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] is None
 
 
 def test_replay_blocks_version_mismatch_until_latest(
@@ -143,10 +143,10 @@ def test_replay_blocks_version_mismatch_until_latest(
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT * FROM runs WHERE run_id='versioned'"
+        "SELECT * FROM items WHERE id='versioned'"
     ).fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] is None
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] is None
 
     # latest=True opts out of the gate and completes the replay.
     result = replay("versioned", agent_module=agent_file, latest=True)
@@ -155,10 +155,10 @@ def test_replay_blocks_version_mismatch_until_latest(
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT * FROM runs WHERE run_id='versioned'"
+        "SELECT * FROM items WHERE id='versioned'"
     ).fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
 
 
 def test_replay_rejects_missing_registration(
@@ -292,7 +292,7 @@ def _new_run_ids(db_path: Path, *, exclude: str) -> list[str]:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT run_id FROM runs WHERE run_id != ?", (exclude,)
+            "SELECT id AS run_id FROM items WHERE id != ?", (exclude,)
         ).fetchall()
     finally:
         conn.close()
@@ -303,7 +303,7 @@ def _task_labels_for(db_path: Path, run_id: str) -> list[str]:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT label FROM tasks WHERE run_id = ? ORDER BY id", (run_id,)
+            "SELECT label FROM steps WHERE item_id = ? ORDER BY id", (run_id,)
         ).fetchall()
     finally:
         conn.close()
@@ -412,9 +412,9 @@ def test_replay_from_step_int_out_of_range_raises(
     # Original un-marked — gate fired before mark_dlq_disposition.
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='dead'").fetchone()
+    row = conn.execute("SELECT * FROM items WHERE id='dead'").fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] is None
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] is None
 
 
 def test_replay_from_step_first_step_replays_everything(
@@ -473,9 +473,9 @@ def test_replay_bounded_by_captured_input_propagates_keyerror(
     # semantics preserved.
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='dead'").fetchone()
+    row = conn.execute("SELECT * FROM items WHERE id='dead'").fetchone()
     conn.close()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
 
 
 def test_replay_from_step_writes_only_reexecuted_steps_to_new_run(
@@ -529,7 +529,7 @@ def test_replay_from_step_carries_input_snapshot(
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT input_snapshot FROM runs WHERE run_id = ?", (new_ids[0],)
+        "SELECT input_snapshot FROM items WHERE id = ?", (new_ids[0],)
     ).fetchone()
     conn.close()
     import json

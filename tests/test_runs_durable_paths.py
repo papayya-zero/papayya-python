@@ -14,7 +14,7 @@ from typing import Callable
 import httpx
 
 from papayya.api import APIClient, APIConfig
-from papayya.resources.runs import Runs
+from papayya.resources.items import Items
 
 
 def _make(handler: Callable[[httpx.Request], httpx.Response]) -> tuple[Runs, APIClient]:
@@ -27,7 +27,7 @@ def _make(handler: Callable[[httpx.Request], httpx.Response]) -> tuple[Runs, API
         headers=api._http.headers,
         transport=transport,
     )
-    return Runs(api), api
+    return Items(api), api
 
 
 def _record(paths: list[str], json_body: object) -> Callable[[httpx.Request], httpx.Response]:

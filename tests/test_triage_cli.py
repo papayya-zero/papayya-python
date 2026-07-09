@@ -60,6 +60,8 @@ class _FakeTriage:
 class _FakeClient:
     def __init__(self, runs: _FakeRuns, triage: _FakeTriage | None = None) -> None:
         self.runs = runs
+        # Plan 34: quarantine ops live on the per-item resource (client.items).
+        self.items = runs
         self.triage = triage or _FakeTriage([])
         self.closed = False
 

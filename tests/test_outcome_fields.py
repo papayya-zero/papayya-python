@@ -155,18 +155,18 @@ def test_fresh_db_has_outcome_columns(tmp_path):
     store = SQLiteStore(str(tmp_path / "fresh.db"))
     try:
         conn = store._conn
-        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()}
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
 
-        assert _schema.COL_TASK_OUTCOME_STATUS in task_cols
-        assert _schema.COL_TASK_OUTCOME_REASON in task_cols
-        assert _schema.COL_RUN_WORST_OUTCOME_STATUS in run_cols
-        assert _schema.COL_RUN_DEGRADED_COUNT in run_cols
+        assert _schema.COL_STEP_OUTCOME_STATUS in task_cols
+        assert _schema.COL_STEP_OUTCOME_REASON in task_cols
+        assert _schema.COL_ITEM_WORST_OUTCOME_STATUS in run_cols
+        assert _schema.COL_ITEM_DEGRADED_COUNT in run_cols
 
-        # Schema version must have advanced to '11'.
+        # Fresh DBs are created at the current schema version directly.
         version = conn.execute(
             "SELECT value FROM _meta WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "11"
+        assert version == _schema.SCHEMA_VERSION
     finally:
         store.close()

@@ -74,8 +74,11 @@ class _CapturingRun(PapayyaRun):
 
 @pytest.fixture(autouse=True)
 def _patch_papayya_run(monkeypatch):
-    """Swap PapayyaRun for the capturing subclass for every test."""
+    """Swap Item (né PapayyaRun) for the capturing subclass for every test."""
     _CapturingRun.reset()
+    # _iter_gen constructs via the module-level ``Item`` binding (Plan 34
+    # rename); patch both names so either spelling routes through the seam.
+    monkeypatch.setattr(iterators, "Item", _CapturingRun)
     monkeypatch.setattr(iterators, "PapayyaRun", _CapturingRun)
     yield
     _CapturingRun.reset()

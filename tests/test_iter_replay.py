@@ -147,7 +147,7 @@ def _other_runs(db_path, *, exclude: str) -> list[str]:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            f"SELECT run_id FROM {_schema.TBL_RUNS} WHERE run_id != ? "
+            f"SELECT {_schema.COL_ITEM_ID} AS run_id FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} != ? "
             f"ORDER BY created_at",
             (exclude,),
         ).fetchall()
@@ -166,8 +166,8 @@ def _disposition(db_path, run_id: str):
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            f"SELECT {_schema.COL_RUN_DLQ_DISPOSITION} AS disp "
-            f"FROM {_schema.TBL_RUNS} WHERE run_id = ?",
+            f"SELECT {_schema.COL_ITEM_DLQ_DISPOSITION} AS disp "
+            f"FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?",
             (run_id,),
         ).fetchone()
     finally:

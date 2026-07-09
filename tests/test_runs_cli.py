@@ -42,6 +42,9 @@ class _FakeRuns:
 class _FakeClient:
     def __init__(self) -> None:
         self.runs = _FakeRuns()
+        # Plan 34: the CLI's data commands read through the per-item
+        # resource, which now lives at client.items.
+        self.items = self.runs
         self.closed = False
 
     def close(self) -> None:

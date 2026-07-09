@@ -47,14 +47,11 @@ def populated_db(tmp_path: Path) -> Path:
     store = SQLiteStore(str(db_path))
     store.create(_checkpoint("run-1"))
     store.save_task("run-1", TaskEntry(
-        label="t", result="ok", duration_ms=100,
+        label="t", result="some model response", duration_ms=100,
         completed_at=datetime.now(timezone.utc).isoformat(),
+        item_id="co_1", input_snapshot={"q": "foo"},
+        output_snapshot={"answer": "some model response"},
     ))
-    store.record_step(
-        "run-1", task_label="search",
-        tool_calls=[{"name": "search_web", "arguments": {"q": "foo"}}],
-        duration_ms=50, response_text="some model response",
-    )
     store.set_status("run-1", "completed", output=None)
     store.close()
     return db_path
@@ -133,9 +130,11 @@ class TestProjectExport:
         steps = [r for r in records if r["type"] == "step"]
         assert steps  # the seeded DB has at least one step
         for s in steps:
-            assert "response_text" not in s["data"], (
-                "response_text must be excluded by default to protect user data"
-            )
+            # v12 privacy posture: raw results/snapshots (which carry model
+            # output and customer payloads) are excluded by default.
+            assert "result" not in s["data"]
+            assert "input_snapshot" not in s["data"]
+            assert "output_snapshot" not in s["data"]
 
     def test_include_response_text_flag(
         self, populated_db: Path, tmp_path: Path
@@ -151,7 +150,7 @@ class TestProjectExport:
 
         records = [json.loads(line) for line in out.read_text().splitlines() if line]
         steps = [r for r in records if r["type"] == "step"]
-        assert any("response_text" in s["data"] for s in steps)
+        assert any(s["data"].get("result") == '"some model response"' for s in steps)
 
     def test_missing_db_exits_nonzero(self, tmp_path: Path) -> None:
         runner = CliRunner()
@@ -172,8 +171,10 @@ class TestProjectExport:
             "project", "export", "--out", str(out), "--db", str(populated_db),
         ])
         records = [json.loads(line) for line in out.read_text().splitlines() if line]
-        assert len([r for r in records if r["type"] == "batch"]) >= 1
+        # v12 export nouns: run (invocation), item, step. The direct-call
+        # item is wrapped in an implicit run-of-one, so all three appear.
         assert len([r for r in records if r["type"] == "run"]) >= 1
+        assert len([r for r in records if r["type"] == "item"]) >= 1
         assert len([r for r in records if r["type"] == "step"]) >= 1
 
 
@@ -193,9 +194,10 @@ class TestProjectImport:
         ])
 
         result = runner.invoke(cli_main, ["project", "import", str(out)])
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "Validated import file" in result.output
-        assert "batches:" in result.output
+        assert "runs:" in result.output
+        assert "items:" in result.output
 
     def test_rejects_missing_file(self, tmp_path: Path) -> None:
         runner = CliRunner()

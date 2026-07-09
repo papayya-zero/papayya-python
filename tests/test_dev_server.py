@@ -37,11 +37,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _checkpoint(run_id: str, agent: str = "t") -> RunCheckpoint:
+def _checkpoint(
+    run_id: str, agent: str = "t", invocation_id: str | None = None
+) -> RunCheckpoint:
     now = datetime.now(timezone.utc).isoformat()
     return RunCheckpoint(
         run_id=run_id, agent=agent, tasks=[], status="running",
-        created_at=now, updated_at=now,
+        created_at=now, updated_at=now, invocation_id=invocation_id,
     )
 
 
@@ -54,35 +56,28 @@ def _task() -> TaskEntry:
 
 def _seed(store: SQLiteStore) -> None:
     """Populate a representative local DB for the endpoint tests."""
-    # Explicit batch with 3 runs — 2 successes, 1 failure
-    store.create_batch("b-explicit", agent="enrich", total_items=3)
+    # Explicit run (invocation) with 3 items — 2 successes, 1 failure
+    store.create_run("b-explicit", agent="enrich", total_items=3)
     for i, status in enumerate(("completed", "completed", "failed"), start=1):
-        chk = _checkpoint(f"run-{i}")
-        chk.agent = "enrich"
+        chk = _checkpoint(f"run-{i}", agent="enrich", invocation_id="b-explicit")
         store.create(chk)
-        # Rewrite the implicit-batch linkage so these 3 belong to b-explicit
-        store._conn.execute(
-            "UPDATE runs SET batch_id='b-explicit' WHERE run_id=?", (f"run-{i}",)
-        )
-        store._conn.commit()
         store.save_task(f"run-{i}", _task())
-        # Two runs share a tool + input (cluster of 2); run-3 fails provider
-        if i < 3:
-            store.record_step(
-                f"run-{i}", task_label="search",
-                tool_calls=[{"name": "search_web", "arguments": {"q": "x"}}],
-                duration_ms=50,
-            )
-        else:
-            store.record_step(
-                f"run-{i}", task_label="search",
-                tool_calls=[{"name": "search_web", "arguments": {"q": "y"}}],
-                duration_ms=50,
-                error_message="HTTP 429: rate limit",
+        # Item 3 carries a classified provider failure so the clusters
+        # endpoint (grouping on steps.error_category) has one bucket.
+        if i == 3:
+            store.save_task(
+                f"run-{i}",
+                TaskEntry(
+                    label="search",
+                    result=None,
+                    duration_ms=50,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    error_category="provider",
+                ),
             )
         store.set_status(f"run-{i}", status, output=None)
 
-    # A separate single-run outside the batch for /api/runs breadth
+    # A separate direct-call item outside the run for /api/runs breadth
     store.create(_checkpoint("run-single"))
     store.save_task("run-single", _task())
     store.set_status("run-single", "completed", output=None)
@@ -181,9 +176,11 @@ class TestBatches:
         base, _ = seeded_server
         status, body = _get(base, "/api/batches/b-explicit/clusters")
         assert status == 200
-        # Exactly one failed step cluster (provider_rate_limit / hash of q=y)
+        # Exactly one cluster: the seeded provider-classified step. The v12
+        # clusters endpoint groups on steps.error_category and emits it under
+        # the old error_code key for the shipped UI.
         assert len(body) == 1
-        assert body[0]["error_code"] == "provider_rate_limit"
+        assert body[0]["error_code"] == "provider"
         assert body[0]["count"] == 1
 
     def test_outliers_sorted_by_duration(self, seeded_server: tuple[str, Path]) -> None:
@@ -246,15 +243,11 @@ class TestDlqActions:
     def test_acknowledge_marks_disposition(
         self, seeded_server: tuple[str, Path], tmp_path: Path
     ) -> None:
-        # Make a second failed run in the same batch so we can acknowledge
+        # Make a second failed item in the same run so we can acknowledge
         # it without interfering with the skip test's run-3.
         base, db_path = seeded_server
         store = SQLiteStore(str(db_path))
-        store.create(_checkpoint("run-ack"))
-        store._conn.execute(
-            "UPDATE runs SET batch_id='b-explicit' WHERE run_id='run-ack'"
-        )
-        store._conn.commit()
+        store.create(_checkpoint("run-ack", invocation_id="b-explicit"))
         store.set_status("run-ack", "failed", output="nope")
         store.close()
 
@@ -295,16 +288,18 @@ class TestDlqActions:
 
 
 class TestStepSearch:
-    def test_by_tool_name(self, seeded_server: tuple[str, Path]) -> None:
+    def test_by_tool_name_returns_empty(self, seeded_server: tuple[str, Path]) -> None:
+        """tool_name searched the dead legacy LLM-call log; v12 has no such
+        column, so the filter matches nothing (Unit 3 redesigns the page)."""
         base, _ = seeded_server
         status, body = _get(base, "/api/steps/search?tool_name=search_web")
         assert status == 200
-        assert len(body) == 3
-        assert all(s["tool_name"] == "search_web" for s in body)
+        assert body == []
 
     def test_by_error_code(self, seeded_server: tuple[str, Path]) -> None:
+        """error_code now maps onto steps.error_category."""
         base, _ = seeded_server
-        status, body = _get(base, "/api/steps/search?error_code=provider_rate_limit")
+        status, body = _get(base, "/api/steps/search?error_code=provider")
         assert status == 200
         assert len(body) == 1
 
@@ -324,21 +319,16 @@ class TestThrashing:
         assert status == 200
         assert body == []
 
-    def test_detects_repeated_identical_calls(
-        self, seeded_server: tuple[str, Path], tmp_path: Path
+    def test_batch_scope_also_empty(
+        self, seeded_server: tuple[str, Path]
     ) -> None:
-        base, db_path = seeded_server
-        store = SQLiteStore(str(db_path))
-        for _ in range(5):
-            store.record_step(
-                "run-1", task_label="search",
-                tool_calls=[{"name": "thrash_tool", "arguments": {"x": 1}}],
-            )
-        store.close()
-
-        status, body = _get(base, "/api/thrashing?run_id=run-1")
+        """Thrashing was fed by the dead legacy LLM-call log; the endpoint
+        survives (no 404/500 for the shipped UI) but returns [] until the
+        Unit 3 pass rebuilds it on step rows."""
+        base, _ = seeded_server
+        status, body = _get(base, "/api/thrashing?batch_id=b-explicit")
         assert status == 200
-        assert any(r["tool_name"] == "thrash_tool" and r["repeat_count"] == 5 for r in body)
+        assert body == []
 
 
 class TestProjection:
@@ -364,11 +354,14 @@ class TestRunEndpoints:
         status, _body = _get(base, "/api/runs/does-not-exist")
         assert status == 404
 
-    def test_run_steps(self, seeded_server: tuple[str, Path]) -> None:
+    def test_run_steps_endpoint_survives_empty(self, seeded_server: tuple[str, Path]) -> None:
+        """/steps served the dead legacy LLM-call log; it now always returns
+        [] (the real trace is /tasks). Must not 404/500 — the shipped run
+        page still fetches it."""
         base, _ = seeded_server
         status, body = _get(base, "/api/runs/run-1/steps")
         assert status == 200
-        assert len(body) >= 1
+        assert body == []
 
     def test_run_tasks_exposes_llm_fields(
         self, seeded_server: tuple[str, Path], tmp_path: Path
@@ -419,7 +412,7 @@ class TestCancelEndpoint:
         base, db_path = seeded_server
         # Seed a new running batch that isn't yet terminal
         store = SQLiteStore(str(db_path))
-        store.create_batch("b-live", agent="t", total_items=5)
+        store.create_run("b-live", agent="t", total_items=5)
         store.close()
 
         status, body = _post(base, "/api/batches/b-live/cancel")

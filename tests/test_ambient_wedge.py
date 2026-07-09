@@ -32,14 +32,14 @@ def db(tmp_path, monkeypatch):
 def _runs(db_path):
     return SQLiteStore(db_path)._conn.execute(
         "SELECT run_id, item_id, partition_key, status, worst_outcome_status "
-        "FROM runs ORDER BY item_id"
+        "FROM items ORDER BY item_id"
     ).fetchall()
 
 
 def _tasks(db_path):
     return SQLiteStore(db_path)._conn.execute(
         "SELECT r.item_id, t.label, t.kind, t.outcome_status "
-        "FROM tasks t JOIN runs r ON t.run_id = r.run_id "
+        "FROM steps t JOIN items r ON t.item_id = r.id "
         "ORDER BY r.item_id, t.label"
     ).fetchall()
 

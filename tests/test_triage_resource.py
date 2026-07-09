@@ -14,7 +14,7 @@ from typing import Any, Callable
 import httpx
 
 from papayya.api import APIClient, APIConfig
-from papayya.resources.runs import Runs
+from papayya.resources.items import Items
 from papayya.resources.triage import Triage
 
 
@@ -28,7 +28,7 @@ def _make_clients(handler: Callable[[httpx.Request], httpx.Response]):
         headers=api._http.headers,
         transport=transport,
     )
-    return Runs(api), Triage(api), api
+    return Items(api), Triage(api), api
 
 
 # ── Runs.quarantine / release / discard ──

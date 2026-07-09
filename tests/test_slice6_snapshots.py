@@ -43,12 +43,12 @@ class TestSchemaV3:
     def test_fresh_db_has_v3_columns(self, tmp_db: Path) -> None:
         SQLiteStore(str(tmp_db))
         conn = sqlite3.connect(tmp_db)
-        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
-        assert _schema.COL_TASK_ITEM_ID in task_cols
-        assert _schema.COL_TASK_INPUT_SNAPSHOT in task_cols
-        assert _schema.COL_TASK_OUTPUT_SNAPSHOT in task_cols
-        assert _schema.COL_RUN_ITEM_ID in run_cols
+        step_cols = {r[1] for r in conn.execute("PRAGMA table_info(steps)")}
+        item_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        assert _schema.COL_STEP_CUSTOMER_ITEM_ID in step_cols
+        assert _schema.COL_STEP_INPUT_SNAPSHOT in step_cols
+        assert _schema.COL_STEP_OUTPUT_SNAPSHOT in step_cols
+        assert _schema.COL_ITEM_ITEM_ID in item_cols
 
     def test_fresh_db_has_v3_indexes(self, tmp_db: Path) -> None:
         SQLiteStore(str(tmp_db))
@@ -59,8 +59,8 @@ class TestSchemaV3:
                 "SELECT name FROM sqlite_master WHERE type='index'"
             ).fetchall()
         }
-        assert _schema.IDX_TASKS_ITEM in indexes
-        assert _schema.IDX_RUNS_ITEM in indexes
+        assert _schema.IDX_STEPS_CUSTOMER_ITEM in indexes
+        assert _schema.IDX_ITEMS_ITEM in indexes
 
     def test_fresh_db_reports_current(self, tmp_db: Path) -> None:
         SQLiteStore(str(tmp_db))
@@ -123,10 +123,10 @@ class TestStepWriteWithSnapshot:
 
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM tasks WHERE label='enrich'").fetchone()
-        assert row[_schema.COL_TASK_ITEM_ID] == "co_42"
-        assert json.loads(row[_schema.COL_TASK_INPUT_SNAPSHOT]) == {"id": "co_42"}
-        assert json.loads(row[_schema.COL_TASK_OUTPUT_SNAPSHOT]) == {
+        row = conn.execute("SELECT * FROM steps WHERE label='enrich'").fetchone()
+        assert row[_schema.COL_STEP_CUSTOMER_ITEM_ID] == "co_42"
+        assert json.loads(row[_schema.COL_STEP_INPUT_SNAPSHOT]) == {"id": "co_42"}
+        assert json.loads(row[_schema.COL_STEP_OUTPUT_SNAPSHOT]) == {
             "id": "co_42",
             "enriched": True,
         }
@@ -138,10 +138,10 @@ class TestStepWriteWithSnapshot:
 
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM tasks WHERE label='plain'").fetchone()
-        assert row[_schema.COL_TASK_ITEM_ID] is None
-        assert row[_schema.COL_TASK_INPUT_SNAPSHOT] is None
-        assert row[_schema.COL_TASK_OUTPUT_SNAPSHOT] is None
+        row = conn.execute("SELECT * FROM steps WHERE label='plain'").fetchone()
+        assert row[_schema.COL_STEP_CUSTOMER_ITEM_ID] is None
+        assert row[_schema.COL_STEP_INPUT_SNAPSHOT] is None
+        assert row[_schema.COL_STEP_OUTPUT_SNAPSHOT] is None
 
     def test_runs_item_id_denormalized(self, tmp_db: Path) -> None:
         run = self._run(tmp_db)
@@ -150,9 +150,9 @@ class TestStepWriteWithSnapshot:
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT * FROM runs WHERE run_id=?", (run.run_id,)
+            "SELECT * FROM items WHERE id=?", (run.run_id,)
         ).fetchone()
-        assert row[_schema.COL_RUN_ITEM_ID] == "co_7"
+        assert row[_schema.COL_ITEM_ITEM_ID] == "co_7"
 
 
 # --------------------------------------------------------------------------- #
@@ -175,9 +175,9 @@ class TestItemIdInheritance:
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT label, item_id FROM tasks ORDER BY id"
+            "SELECT label, customer_item_id FROM steps ORDER BY id"
         ).fetchall()
-        assert [r["item_id"] for r in rows] == ["co_1", "co_1"]
+        assert [r["customer_item_id"] for r in rows] == ["co_1", "co_1"]
 
     def test_first_step_item_id_seeds_run_and_later_steps_inherit(
         self, tmp_db: Path
@@ -189,10 +189,10 @@ class TestItemIdInheritance:
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT label, item_id FROM tasks ORDER BY id"
+            "SELECT label, customer_item_id FROM steps ORDER BY id"
         ).fetchall()
-        assert rows[0]["item_id"] == "co_2"
-        assert rows[1]["item_id"] == "co_2"
+        assert rows[0]["customer_item_id"] == "co_2"
+        assert rows[1]["customer_item_id"] == "co_2"
 
     def test_per_step_override_does_not_rewrite_run_level(
         self, tmp_db: Path
@@ -202,14 +202,14 @@ class TestItemIdInheritance:
 
         conn = sqlite3.connect(tmp_db)
         conn.row_factory = sqlite3.Row
-        task_row = conn.execute(
-            "SELECT item_id FROM tasks WHERE label='a'"
+        step_row = conn.execute(
+            "SELECT customer_item_id FROM steps WHERE label='a'"
         ).fetchone()
-        run_row = conn.execute(
-            "SELECT item_id FROM runs WHERE run_id=?", (run.run_id,)
+        item_row = conn.execute(
+            "SELECT item_id FROM items WHERE id=?", (run.run_id,)
         ).fetchone()
-        assert task_row["item_id"] == "co_override"
-        assert run_row["item_id"] == "co_primary"
+        assert step_row["customer_item_id"] == "co_override"
+        assert item_row["item_id"] == "co_primary"
 
 
 # --------------------------------------------------------------------------- #
@@ -269,19 +269,16 @@ def item_server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
     """A server with two items in one batch: 'co_a' across 2 runs, 'co_b' in 1."""
     db_path = tmp_path / "local.db"
     store = SQLiteStore(str(db_path))
-    store.create_batch("b1", agent="enrich", total_items=3)
+    store.create_run("b1", agent="enrich", total_items=3)
 
     def _run_with_item(run_id: str, item_id: str, snapshot_in: dict, snapshot_out: dict) -> None:
         run = PapayyaRun(
-            DurableRunConfig(agent="enrich", store=store, run_id=run_id, item_id=item_id)
+            DurableRunConfig(
+                agent="enrich", store=store, run_id=run_id, item_id=item_id,
+                invocation_id="b1",
+            )
         )
-        # First step forces init() → creates the runs row. Update batch_id
-        # after that so the row actually exists to be rewritten.
         run.step("enrich", lambda: snapshot_out, snapshot=snapshot_in)()
-        store._conn.execute(
-            "UPDATE runs SET batch_id=? WHERE run_id=?", ("b1", run_id)
-        )
-        store._conn.commit()
         run.complete(snapshot_out)
 
     _run_with_item("run-a1", "co_a", {"name": "acme"}, {"name": "acme", "tier": "gold"})

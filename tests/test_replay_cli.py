@@ -91,9 +91,9 @@ def test_replay_invokes_agent_and_marks_disposition(tmp_path: Path) -> None:
     # Old run should now be disposition=replayed
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='dead-run'").fetchone()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
-    assert row[_schema.COL_RUN_DLQ_RESOLVED_AT] is not None
+    row = conn.execute("SELECT * FROM items WHERE id='dead-run'").fetchone()
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+    assert row[_schema.COL_ITEM_DLQ_RESOLVED_AT] is not None
 
 
 def test_replay_marks_disposition_even_when_agent_raises(tmp_path: Path) -> None:
@@ -116,8 +116,8 @@ def test_replay_marks_disposition_even_when_agent_raises(tmp_path: Path) -> None
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM runs WHERE run_id='dead-raise'").fetchone()
-    assert row[_schema.COL_RUN_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
+    row = conn.execute("SELECT * FROM items WHERE id='dead-raise'").fetchone()
+    assert row[_schema.COL_ITEM_DLQ_DISPOSITION] == _schema.DLQ_REPLAYED
 
 
 def test_replay_rejects_already_resolved(tmp_path: Path) -> None:
@@ -150,7 +150,7 @@ def test_replay_rejects_run_without_snapshot(tmp_path: Path) -> None:
     # Verify: null snapshot → replay rejected.
     conn = sqlite3.connect(db_path)
     snap = conn.execute(
-        f"SELECT {_schema.COL_RUN_INPUT_SNAPSHOT} FROM runs WHERE run_id='old-run'"
+        f"SELECT {_schema.COL_ITEM_INPUT_SNAPSHOT} FROM items WHERE id='old-run'"
     ).fetchone()[0]
     conn.close()
 

@@ -87,11 +87,11 @@ def _disposition(db_path: Path, run_id: str) -> str | None:
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,),
+            "SELECT * FROM items WHERE id = ?", (run_id,),
         ).fetchone()
     finally:
         conn.close()
-    return row[_schema.COL_RUN_DLQ_DISPOSITION] if row is not None else None
+    return row[_schema.COL_ITEM_DLQ_DISPOSITION] if row is not None else None
 
 
 def _invoke_replay(*, db_path: Path, agent_path: Path, latest: bool = False):

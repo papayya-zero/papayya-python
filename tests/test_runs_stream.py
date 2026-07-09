@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from papayya.api import APIClient, APIConfig, PapayyaAPIError
-from papayya.resources.runs import Runs, _parse_sse
+from papayya.resources.items import Items, _parse_sse
 
 
 def _make_runs(handler: Callable[[httpx.Request], httpx.Response]) -> tuple[Runs, APIClient]:
@@ -26,7 +26,7 @@ def _make_runs(handler: Callable[[httpx.Request], httpx.Response]) -> tuple[Runs
         headers=api._http.headers,
         transport=transport,
     )
-    return Runs(api), api
+    return Items(api), api
 
 
 # ── _parse_sse: wire-format parser ────────────────────────────────────────

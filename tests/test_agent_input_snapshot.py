@@ -132,7 +132,7 @@ def test_run_input_snapshot_populated_from_agent_args(tmp_path):
 
     store = SQLiteStore(db_path)
     rows = store._conn.execute(
-        "SELECT input_snapshot FROM runs WHERE agent = 'enrich-snap'"
+        "SELECT input_snapshot FROM items WHERE agent = 'enrich-snap'"
     ).fetchall()
     assert len(rows) == 1
     import json
@@ -154,6 +154,6 @@ def test_run_without_agent_decorator_still_works(tmp_path):
 
     store = SQLiteStore(db_path)
     row = store._conn.execute(
-        "SELECT input_snapshot FROM runs WHERE agent = 'bare'"
+        "SELECT input_snapshot FROM items WHERE agent = 'bare'"
     ).fetchone()
     assert row["input_snapshot"] is None

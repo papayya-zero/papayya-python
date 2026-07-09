@@ -54,7 +54,7 @@ class SharedSQLiteStore:
         conn = self._fresh_conn()
         try:
             cur = conn.execute(
-                "SELECT COUNT(*) AS n FROM runs WHERE status = 'completed'"
+                "SELECT COUNT(*) AS n FROM items WHERE status = 'completed'"
             )
             return cur.fetchone()["n"]
         finally:
@@ -65,7 +65,7 @@ class SharedSQLiteStore:
         conn = self._fresh_conn()
         try:
             row = conn.execute(
-                "SELECT run_id FROM runs WHERE item_id = ? AND status = 'completed' "
+                "SELECT id AS run_id FROM items WHERE item_id = ? AND status = 'completed' "
                 "ORDER BY updated_at DESC LIMIT 1",
                 (item_id,),
             ).fetchone()
@@ -79,7 +79,7 @@ class SharedSQLiteStore:
         conn = self._fresh_conn()
         try:
             rows = conn.execute(
-                "SELECT run_id FROM runs ORDER BY created_at"
+                "SELECT id AS run_id FROM items ORDER BY created_at"
             ).fetchall()
         finally:
             conn.close()

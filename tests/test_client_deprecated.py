@@ -1,48 +1,40 @@
-"""Unit 3: Client deprecation.
+"""Plan 34: papayya.Client is folded into Papayya.
 
-papayya.Client is the legacy HTTP run-trigger client. Papayya consolidates
-trigger + monitor onto Papayya.runs (resource namespace), so Client emits
-a DeprecationWarning on construction. Behavior is unchanged for one
-release — removal is scheduled for the next minor.
+The legacy HTTP run-trigger Client (deprecated with a removal notice in
+the previous release) is gone in 0.3.0; ``papayya.Client`` now resolves
+to the ``Papayya`` class itself, so old imports keep constructing a
+working client while the v1-trigger method surface is honestly removed.
 """
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 
-def test_client_emits_deprecation_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_client_is_papayya(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PAPAYYA_API_KEY", "cpk_test")
     monkeypatch.setenv("PAPAYYA_BASE_URL", "http://mock")
 
+    from papayya import Papayya
     from papayya.client import Client
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        Client()
-
-    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert deprecations, "expected a DeprecationWarning on Client(...)"
-    msg = str(deprecations[0].message)
-    assert "Client" in msg and "Papayya" in msg
+    assert Client is Papayya
+    client = Client()
+    assert isinstance(client, Papayya)
 
 
-def test_client_message_points_at_papayya_runs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The deprecation message names the replacement so users have a
-    one-line migration recipe."""
-    monkeypatch.setenv("PAPAYYA_API_KEY", "cpk_test")
-    monkeypatch.setenv("PAPAYYA_BASE_URL", "http://mock")
+def test_client_importable_from_package_root() -> None:
+    import papayya
+    from papayya import Papayya
 
-    from papayya.client import Client
+    assert papayya.Client is Papayya
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        Client()
 
-    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    msg = str(deprecations[0].message)
-    assert "runs.create" in msg
+def test_run_result_still_importable() -> None:
+    """RunResult stays importable for old type annotations."""
+    from papayya.client import RunResult
+
+    r = RunResult("out", run_id="r1", status="completed")
+    assert r == "out"
+    assert r.run_id == "r1"
+    assert r.status == "completed"
