@@ -2,9 +2,12 @@
 
 All notable changes to the `papayya` Python package.
 
-## Unreleased (0.3.0)
+## 0.3.0 — 2026-07-09
 
-Plan 34 noun consolidation — one vocabulary everywhere:
+Two things ship together in 0.3.0: everything that landed since 0.2.1
+(the ambient adoption tier and the coherence core — the silent-failure
+wedge now fires on every entry path), and the Plan 34 noun
+consolidation — one vocabulary everywhere:
 
 > An **agent** is loaded once by the worker pool; each **run** processes
 > **items**; every item shows what it did and what it cost, and you can
@@ -45,7 +48,42 @@ These names persist with NEW semantics — they could not be aliased:
   fetched it. (`/api/batches*` aliases and old page paths survive one
   release; `/api/runs/<record>` falls back to per-record detail.)
 
-### Added
+- `papayya worker` (the v1 tool-call worker) is removed; the durable
+  worker pool is the only execution path. The dead `--local` /
+  `--api-key` run flags are gone with it.
+
+### Added — ambient tier + coherence core (since 0.2.1)
+
+- **`papayya.map()` / `papayya.iter()`**: wrapper-shaped adoption — wrap
+  the iterable you already loop over and every item gets its own durable
+  record, outcome, and per-tenant attribution (`item_id=` /
+  `partition_key=` lambdas). No signature changes in your business code.
+- **`@papayya.durable`**: `@agent` with the signature freed and the name
+  optional — decorate `def f(item)` directly.
+- **`@papayya.llm` / `@papayya.step`**: leaf adoption — decorate the
+  function that calls your model and get automatic ran-vs-worked outcome
+  detection with no `run` handle threaded through any signature. Sync
+  and async; runs bare (no recording) outside an active run.
+- **`papayya.mark_degraded()` / `papayya.mark_outcome()`**: explicit
+  outcome verbs for the ambient tier.
+- **The wedge fires on the clean front door** (coherence core): the
+  `@papayya.durable`/`@agent` wrapper publishes a lazy isolate, so a
+  silent degraded-200 caught by `@papayya.llm` flips the item to
+  `degraded` even when the body never touches a `run` handle.
+- **`@papayya.schedule` / `@papayya.trigger`** decorators: declare cron
+  schedules and inbound triggers in code; `papayya deploy` reconciles
+  them (PUT-replace for code-managed agents, `--dry-run` renders the
+  diff).
+- **`papayya triage`** CLI + `Triage` resource: failure clusters and
+  quarantine actions from the terminal.
+- Outcome inspectors, OTel baggage emission, and sub-run lineage
+  (`parent_run_id`) on the durable path.
+- `run.idempotency_key` seam + idempotent step saves.
+- `papayya example` scaffolds `agent.py` — the filename `deploy`/`run`
+  docs reference; `papayya init` emits a starter `envs:` block so the
+  first deploy doesn't fail.
+
+### Added — noun consolidation (Plan 34)
 
 - **Invocation minting**: `papayya.map()` / `papayya.iter()` mint ONE run
   row per call and link every processed item to it — a 1,000-item map()
@@ -104,6 +142,16 @@ These names persist with NEW semantics — they could not be aliased:
   current schema version directly, with no backups.
 - `map()`/`iter()` over an empty iterable no longer strands a
   forever-'running' run row.
+- **Local SQLite frame loss under concurrent workers**: the local store
+  now opens with `journal_mode=DELETE` + `busy_timeout`, fixing
+  committed checkpoints vanishing when a worker process was killed
+  mid-WAL.
+- **Agent-loop label collision**: repeated `run.step("label", ...)`
+  calls in a loop each get their own checkpoint (occurrence-suffixed
+  `label#N`) instead of silently replay-hydrating from the first call.
+- Two clean-front-door crashes in the ambient isolate: a foreign-token
+  contextvar reset under `asyncio.gather`, and a mint crash when
+  `partition_key` came from `papayya.yaml`.
 
 ### Unchanged (wire freezes)
 
