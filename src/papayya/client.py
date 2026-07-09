@@ -1,42 +1,35 @@
-"""High-level client for backend integration.
+"""Deprecated ``papayya.Client`` shim — folded into ``Papayya`` (Plan 34).
 
-.. deprecated::
-    ``papayya.Client`` is deprecated. Use ``papayya.Papayya`` instead —
-    its ``runs`` namespace exposes ``runs.create``, ``runs.get_status``,
-    and ``runs.get_steps`` covering the same surface. Scheduled for
-    removal in the next minor release.
+BREAKING in 0.3.0: the old ``Client`` class (``client.run(agent_id, input)``
+/ ``run_sync`` / ``get_status`` / ``get_steps`` against the v1 trigger
+endpoints) is gone — it was deprecated with a removal notice in the
+previous release, and the v1 endpoints it spoke retired with the v1 DROP.
 
-Usage:
-    from papayya import Client
+``Client`` is now an alias of :class:`papayya.Papayya`:
 
-    client = Client()
+* per-item reads:  ``Papayya().items.get(...)`` / ``.list()`` / ``.steps(...)``
+* submissions:     ``Papayya().runs.create(agent_id, items)``
+* durable local:   ``Papayya().item(agent="...")``
 
-    # Fire-and-forget (async)
-    run = client.run(agent_id="research-agent", input="Stripe")
-    print(run["id"])
-
-    # Simple blocking call
-    result = client.run_sync(agent_id="research-agent", input="Stripe")
-    print(result)
+``RunResult`` is kept importable for callers that type-annotated against
+it; nothing constructs it anymore.
 """
 
 from __future__ import annotations
 
-import time
-import warnings
-from typing import Any
+from papayya.papayya import Papayya
 
-from papayya.api import APIClient, PapayyaAPIError, resolve_config
+# Alias, not a subclass: isinstance(client, Papayya) and
+# isinstance(client, Client) are the same check.
+Client = Papayya
 
 
 class RunResult(str):
-    """Result of a synchronous run. Behaves like a string (the output) but
-    also exposes run_id and status for programmatic access.
+    """Legacy result type of the removed ``Client.run_sync``.
 
-        result = client.run_sync(...)
-        print(result)           # prints the output
-        print(result.run_id)    # the run ID
-        steps = client.get_steps(result.run_id)
+    Behaves like a string (the output) but also exposes ``run_id`` and
+    ``status``. Kept importable for old type annotations; the SDK no
+    longer returns it.
     """
 
     def __new__(cls, output: str, run_id: str, status: str):
@@ -47,106 +40,4 @@ class RunResult(str):
         return instance
 
 
-class Client:
-    """Developer-facing client for triggering and monitoring runs.
-
-    .. deprecated::
-        Use ``papayya.Papayya`` instead. ``Papayya.runs.create``,
-        ``Papayya.runs.get_status``, and ``Papayya.runs.get_steps``
-        cover the same surface. ``Client`` is scheduled for removal
-        in the next minor release.
-    """
-
-    def __init__(
-        self,
-        api_key: str | None = None,
-        base_url: str | None = None,
-    ) -> None:
-        warnings.warn(
-            "papayya.Client is deprecated; use papayya.Papayya which "
-            "exposes runs.create / runs.get_status / runs.get_steps via "
-            "the resource namespace. Client will be removed in the next "
-            "minor release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        config = resolve_config(api_key=api_key, base_url=base_url)
-        self._api = APIClient(config)
-
-    def run(
-        self,
-        agent_id: str,
-        input: Any,
-        *,
-        model: str = "gpt-4o-mini",
-        system_prompt: str = "You are a helpful assistant.",
-        max_steps: int = 50,
-        budget_cents: int = 500,
-    ) -> dict[str, Any]:
-        """Trigger a run and return the run object."""
-        return self._api.trigger_run(
-            agent_id=agent_id,
-            model=model,
-            system_prompt=system_prompt,
-            input_data={"message": input} if isinstance(input, str) else input,
-            max_steps=max_steps,
-            budget_cents=budget_cents,
-        )
-
-    def get_status(self, run_id: str) -> dict[str, Any]:
-        return self._api.get_run(run_id)
-
-    def get_steps(self, run_id: str) -> list[dict[str, Any]]:
-        return self._api.get_steps(run_id)
-
-    def run_sync(
-        self,
-        agent_id: str,
-        input: Any,
-        *,
-        model: str = "gpt-4o-mini",
-        system_prompt: str = "You are a helpful assistant.",
-        max_steps: int = 50,
-        budget_cents: int = 500,
-        timeout: float = 300,
-        poll_interval: float = 2,
-    ) -> RunResult:
-        """Trigger a run and block until it completes.
-
-        Returns a RunResult that behaves like a string (the output) but also
-        exposes .run_id and .status for programmatic access.
-
-        Raises TimeoutError if the run doesn't finish within `timeout` seconds.
-        Raises PapayyaAPIError if the run fails.
-        """
-        run = self.run(
-            agent_id=agent_id,
-            input=input,
-            model=model,
-            system_prompt=system_prompt,
-            max_steps=max_steps,
-            budget_cents=budget_cents,
-        )
-        run_id = run["id"]
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            status = self.get_status(run_id)
-
-            if status["status"] == "completed":
-                return RunResult(
-                    output=status.get("output", ""),
-                    run_id=run_id,
-                    status="completed",
-                )
-
-            if status["status"] in ("failed", "cancelled"):
-                error = status.get("error_message", status["status"])
-                raise PapayyaAPIError(400, f"Run {status['status']}: {error}")
-
-            time.sleep(poll_interval)
-
-        raise TimeoutError(f"Run {run_id} did not complete within {timeout}s")
-
-    def close(self) -> None:
-        self._api.close()
+__all__ = ["Client", "RunResult"]

@@ -2,15 +2,22 @@
 
 One client class covers both surfaces:
 
-* **Durable execution** — ``papayya.run(agent="...", metadata={...})`` returns
-  a ``PapayyaRun`` you wrap your steps with. Works locally (SQLite) or
+* **Durable execution** — ``papayya.item(agent="...", metadata={...})``
+  returns an ``Item`` you wrap your steps with. Works locally (SQLite) or
   against the hosted control plane (CloudStore) — same call, the right
-  store gets selected automatically.
-* **Platform resources** — ``papayya.runs``, ``papayya.batches``,
-  ``papayya.agents``, ``papayya.schedules``, ``papayya.webhooks``,
-  ``papayya.deployments``, ``papayya.secrets``, ``papayya.projects``,
-  ``papayya.api_keys``, ``papayya.usage``. These talk to the hosted API
-  and require an ``api_key``.
+  store gets selected automatically. (``papayya.run(...)`` is the
+  pre-Plan-34 spelling, kept as a deprecated alias.)
+* **Platform resources** — ``papayya.runs`` (invocations),
+  ``papayya.items`` (per-item records), ``papayya.agents``,
+  ``papayya.schedules``, ``papayya.webhooks``, ``papayya.deployments``,
+  ``papayya.secrets``, ``papayya.projects``, ``papayya.api_keys``,
+  ``papayya.usage``. These talk to the hosted API and require an
+  ``api_key``.
+
+BREAKING in 0.3.0 (Plan 34): ``papayya.runs`` used to be the per-item
+resource; it now addresses invocations (the old ``batches`` surface).
+Per-item access moved to ``papayya.items``. ``papayya.batches`` forwards
+to ``papayya.runs`` as a deprecated alias.
 
 Resource namespaces lazy-resolve the API key, so a local-only script
 that never touches a resource namespace runs without credentials. The
@@ -21,7 +28,7 @@ Usage::
     from papayya import Papayya
 
     client = Papayya(api_key="cpk_...")
-    run = client.run(agent="my-agent", metadata={"organization_id": "org_42"})
+    item = client.item(agent="my-agent", metadata={"organization_id": "org_42"})
 
     # Or use the factory for automatic env/config resolution:
     from papayya import papayya
@@ -46,8 +53,8 @@ from papayya._defaults import DEFAULT_BASE_URL
 from papayya.api import APIClient, resolve_config
 from papayya.resources.agents import Agents
 from papayya.resources.api_keys import ApiKeys
-from papayya.resources.batches import Batches
 from papayya.resources.deployments import Deployments
+from papayya.resources.items import Items
 from papayya.resources.projects import Projects
 from papayya.resources.runs import Runs
 from papayya.resources.schedules import Schedules
@@ -203,7 +210,7 @@ class Papayya:
 
     # --- durable runtime ---------------------------------------------- #
 
-    def run(
+    def item(
         self,
         agent: str,
         *,
@@ -214,7 +221,14 @@ class Papayya:
         store: Any | None = None,
         partition_key: Any = _PARTITION_KEY_UNSET,
     ) -> Any:
-        """Create a new durable run.
+        """Create a new durable per-item record, returned as an :class:`Item`.
+
+        Plan 34 rename of ``papayya().run(...)`` — the old name is kept as
+        a deprecated alias. A direct call like this is an implicit
+        run-of-one: the local ledger wraps the item in its own run row.
+        ``run_id=`` (the item's surrogate id) and ``parent_run_id=`` keep
+        their pre-consolidation kwarg names for compatibility; ``item_id=``
+        stays reserved for CUSTOMER identity (e.g. ``"co_007"``).
 
         When ``papayya.yaml`` declares a ``partition_key:``, the
         supplied ``metadata`` MUST include that key —
@@ -329,15 +343,28 @@ class Papayya:
             )
         )
 
+    # Deprecated pre-Plan-34 alias: "run" now names the whole invocation,
+    # not the per-item record this returns. Silent for one release —
+    # internal callers and existing user code keep working unchanged.
+    run = item
+
     # --- resource namespaces ------------------------------------------ #
 
     @cached_property
     def runs(self) -> Runs:
+        """Invocation resource (BREAKING shift in 0.3.0 — was per-item;
+        per-item access moved to :attr:`items`)."""
         return Runs(self._api_client())
 
     @cached_property
-    def batches(self) -> Batches:
-        return Batches(self._api_client())
+    def items(self) -> Items:
+        """Per-item resource (the pre-0.3.0 ``runs`` surface, renamed)."""
+        return Items(self._api_client())
+
+    @property
+    def batches(self) -> Runs:
+        """Deprecated alias: forwards to :attr:`runs` (invocations)."""
+        return self.runs
 
     @cached_property
     def schedules(self) -> Schedules:

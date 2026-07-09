@@ -1,4 +1,10 @@
-"""PapayyaRun — durable execution wrapper for any function."""
+"""Item — the durable per-item execution wrapper (formerly PapayyaRun).
+
+Plan 34 noun consolidation: one *item* is one record a run processed —
+outcome, trace, cost; replayable. The class wraps functions as
+checkpoint-able steps exactly as before; only the noun changed.
+``PapayyaRun`` remains available as a deprecated alias.
+"""
 
 from __future__ import annotations
 
@@ -75,8 +81,8 @@ def _label_for_warning(label_or_fn: Any, fn: Any) -> str:
     return "<unknown>"
 
 
-class PapayyaRun:
-    """A durable run that wraps functions as checkpoint-able steps.
+class Item:
+    """A durable per-item record that wraps functions as checkpoint-able steps.
 
     **Execution guarantee:** at-least-once. If a crash occurs between
     executing a step and saving its checkpoint, the step will re-execute
@@ -115,6 +121,10 @@ class PapayyaRun:
     def __init__(self, config: DurableRunConfig) -> None:
         self.agent = config.agent
         self.run_id = config.run_id or str(uuid.uuid4())
+        # Plan 34: id of the run row (invocation) this item belongs to.
+        # Set by papayya.map()/iter()/slice-replay; None for direct calls
+        # (the store wraps those in an implicit run-of-one at create time).
+        self._invocation_id: str | None = config.invocation_id
         self._store: CheckpointStore = config.store or MemoryStore()
         self._cache: dict[str, TaskEntry] = {}
         self._task_call_order: list[str] = []
@@ -236,8 +246,19 @@ class PapayyaRun:
                 metadata=self._metadata,
                 partition_key=self._partition_key,
                 parent_run_id=self._parent_run_id,
+                invocation_id=self._invocation_id,
             )
             self._store.create(checkpoint)
+
+    @property
+    def id(self) -> str:
+        """The item's surrogate uuid (Plan 34 canonical name).
+
+        ``item_id`` stays reserved for CUSTOMER identity (the value passed
+        via ``item_id=``, e.g. ``"co_007"``); this is Papayya's own row id.
+        ``run_id`` is the deprecated pre-consolidation alias.
+        """
+        return self.run_id
 
     # ------------------------------------------------------------------ #
     #  task() — supports both higher-order function and decorator usage   #
@@ -792,3 +813,8 @@ class PapayyaRun:
             tasks=tasks,
             total_duration_ms=sum(t.duration_ms for t in tasks),
         )
+
+
+# Deprecated pre-Plan-34 alias. Existing ``PapayyaRun`` imports, type hints
+# and isinstance checks keep working; new code should say ``Item``.
+PapayyaRun = Item

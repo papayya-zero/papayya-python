@@ -13,7 +13,7 @@ from typing import Any
 
 from papayya.papayya import Papayya
 
-from ._replay import ReplayError, replay
+from ._replay import ReplayError, replay, replay_slice
 from .types import CheckpointStore
 
 
@@ -78,5 +78,6 @@ __all__ = [
     "PapayyaClientConfig",
     "papayya",
     "replay",
+    "replay_slice",
     "ReplayError",
 ]

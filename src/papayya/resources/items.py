@@ -9,7 +9,20 @@ if TYPE_CHECKING:
     from papayya.api import APIClient
 
 
-class Runs:
+class Items:
+    """Per-item resource (Plan 34 rename of the old ``Runs`` resource).
+
+    Every method here reads or mutates ONE ITEM — one record a run
+    processed. The HTTP wire below is FROZEN at the pre-consolidation
+    paths and field names (``/v1/durable/runs/{run_id}``, ``run_id`` /
+    ``item_id`` / ``parent_run_id``) until Plan 34 Unit 5 renames the
+    control-pane side; do not "fix" the paths to say items.
+
+    Reachable as ``Papayya().items``. The old ``Papayya().runs`` name now
+    addresses invocations (see ``resources/runs.py``) — that shift is a
+    declared 0.3.0 breaking change, not an alias.
+    """
+
     def __init__(self, api: APIClient) -> None:
         self._api = api
 

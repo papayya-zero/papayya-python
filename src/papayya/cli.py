@@ -1116,10 +1116,10 @@ def triage_retry(ctx: click.Context, run_id: str) -> None:
     """
     client = _make_papayya_client(ctx)
     try:
-        run = client.runs.get(run_id)
+        run = client.items.get(run_id)
         status = run.get("status")
         if status == "quarantine":
-            out = client.runs.release(run_id)
+            out = client.items.release(run_id)
         else:
             click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
             sys.exit(2)
@@ -1142,10 +1142,10 @@ def triage_dismiss(ctx: click.Context, run_id: str) -> None:
     """
     client = _make_papayya_client(ctx)
     try:
-        run = client.runs.get(run_id)
+        run = client.items.get(run_id)
         status = run.get("status")
         if status == "quarantine":
-            out = client.runs.discard(run_id)
+            out = client.items.discard(run_id)
         else:
             click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
             sys.exit(2)
@@ -1158,7 +1158,15 @@ def triage_dismiss(ctx: click.Context, run_id: str) -> None:
 
 
 @main.command("replay")
-@click.option("--run", "run_id", required=True, help="Run ID to replay")
+@click.option("--run", "run_id", default=None,
+              help="Run ID: replay the run's not-ok slice into a new run. "
+                   "(Accepts a pre-0.3.0 per-item id too — falls back to "
+                   "single-item replay when the id matches an item.)")
+@click.option("--item", "single_item_id", default=None,
+              help="Item ID: re-drive one item (the pre-0.3.0 behavior).")
+@click.option("--tenant", "tenant", default=None,
+              help="With --run: replay only items whose partition_key "
+                   "(tenant) matches this value.")
 @click.option("--file", "file", default=None,
               help="Agent file (default: auto-discover agent.py in cwd)")
 @click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
@@ -1188,38 +1196,56 @@ def triage_dismiss(ctx: click.Context, run_id: str) -> None:
     ),
 )
 def replay_cmd(
-    run_id: str,
+    run_id: str | None,
+    single_item_id: str | None,
+    tenant: str | None,
     file: str | None,
     db: str,
     latest: bool,
     from_step: str | None,
 ) -> None:
-    """Re-drive a failed local run using its captured input snapshot.
+    """Replay work that didn't work, from the local ledger.
 
     \b
     Usage:
-      papayya replay --run <run_id>
-      papayya replay --run <run_id> --file my_agents.py
+      papayya replay --run <run_id>                # slice: the run's not-ok items
+      papayya replay --run <run_id> --tenant acme  # slice, one tenant only
+      papayya replay --item <item_id>              # one item (old behavior)
       papayya replay --run <run_id> --latest
 
-    Reads the run's input_snapshot from the local DB, finds the matching
-    @agent-decorated function in the agent file, and re-invokes it. When
-    the snapshot is a dict whose keys bind to the agent's parameters
-    (the format the @agent decorator captures), the dict is unpacked as
-    kwargs. Otherwise the snapshot is passed as a single positional
-    argument — back-compat for runs whose snapshot was hand-populated.
+    Slice replay (--run): selects the run's items whose
+    worst_outcome_status != 'ok', mints a NEW run row linked to the old
+    one via replayed_from, and re-drives each item into it. --tenant
+    narrows the slice to one partition_key value.
 
-    Version gate (ADR-0002 #7): the run's captured agent_version is
-    compared to the registration's current value. A mismatch aborts the
-    replay unless --latest is passed; pre-#7 runs (NULL agent_version)
-    replay without the gate.
+    Single-item replay (--item): reads the item's input_snapshot, finds
+    the matching @agent-decorated function in the agent file, and
+    re-invokes it. When the snapshot is a dict whose keys bind to the
+    agent's parameters (the format the @agent decorator captures), the
+    dict is unpacked as kwargs; otherwise it's passed positionally.
+    --from-step applies to this mode only.
 
-    On any outcome (success or a new failure), the original run is marked
-    with disposition='replayed'. If the replay also fails it shows up as a
-    fresh dead letter, so the operator can see the pattern.
+    Compatibility: --run <pre-0.3.0 per-item id> still works — when the id
+    isn't a run but matches an item, single-item replay runs instead.
+
+    Version gate (ADR-0002 #7): captured agent_version is compared to the
+    registration's current value; a mismatch aborts unless --latest is
+    passed. NULL captured versions (legacy rows) replay without the gate.
+
+    On any outcome, re-driven failed items are marked
+    disposition='replayed'. A replay that fails again shows up as a fresh
+    dead letter, so the operator can see the pattern.
     """
+    import sqlite3 as _sqlite
+    from pathlib import Path as _Path
+
     from papayya.durable import ReplayError
     from papayya.durable.client import replay as _sdk_replay
+    from papayya.durable.client import replay_slice as _sdk_replay_slice
+
+    if (run_id is None) == (single_item_id is None):
+        click.echo("Error: pass exactly one of --run or --item.", err=True)
+        sys.exit(1)
 
     # Click hands us a string from --from-step. Coerce to int when it
     # parses as a positive number — that's the "1-indexed step number"
@@ -1232,14 +1258,70 @@ def replay_cmd(
         except ValueError:
             parsed_from_step = from_step
 
-    click.echo(f"Replaying run {run_id}...")
+    def _replay_one(item_id: str) -> None:
+        click.echo(f"Replaying item {item_id}...")
+        try:
+            result = _sdk_replay(
+                item_id,
+                agent_module=file,
+                db_path=db,
+                latest=latest,
+                from_step=parsed_from_step,
+            )
+        except ReplayError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"Replay failed: {exc}", err=True)
+            sys.exit(2)
+        click.echo(f"Replay returned: {result!r}")
+
+    if single_item_id is not None:
+        if tenant is not None:
+            click.echo("Error: --tenant only applies to --run slice replay.", err=True)
+            sys.exit(1)
+        _replay_one(single_item_id)
+        return
+
+    # --run: decide slice-vs-item by looking the id up. A run id gets
+    # slice semantics; an id that only matches an item falls back to
+    # single-item replay (pre-0.3.0 muscle memory, and what the local
+    # dashboard's DLQ Replay button sends).
+    db_file = _Path(db)
+    if not db_file.exists():
+        click.echo(f"Error: No local database at {db_file.resolve()}", err=True)
+        sys.exit(1)
+    conn = _sqlite.connect(str(db_file))
     try:
-        result = _sdk_replay(
+        is_run = conn.execute(
+            "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone() is not None
+        is_item = conn.execute(
+            "SELECT 1 FROM items WHERE id = ?", (run_id,)
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+    if not is_run and is_item:
+        _replay_one(run_id)
+        return
+
+    if from_step is not None:
+        click.echo(
+            "Error: --from-step applies to single-item replay (--item), "
+            "not slice replay.",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(f"Replaying the not-ok slice of run {run_id}...")
+    try:
+        summary = _sdk_replay_slice(
             run_id,
+            tenant=tenant,
             agent_module=file,
             db_path=db,
             latest=latest,
-            from_step=parsed_from_step,
         )
     except ReplayError as exc:
         click.echo(f"Error: {exc}", err=True)
@@ -1247,7 +1329,15 @@ def replay_cmd(
     except Exception as exc:  # noqa: BLE001
         click.echo(f"Replay failed: {exc}", err=True)
         sys.exit(2)
-    click.echo(f"Replay returned: {result!r}")
+    click.echo(
+        f"New run {summary['new_run_id']}: "
+        f"{summary['replayed_ok']} ok, {summary['replay_failed']} failed"
+        + (
+            f", {summary['skipped_no_snapshot']} skipped (no snapshot)"
+            if summary["skipped_no_snapshot"]
+            else ""
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1270,7 +1360,7 @@ def runs_list(ctx: click.Context) -> None:
     """List hosted runs (NDJSON, one run per line)."""
     client = _make_papayya_client(ctx)
     try:
-        items = client.runs.list()
+        items = client.items.list()
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -1299,7 +1389,7 @@ def runs_stream(ctx: click.Context, run_id: str, from_step: int | None) -> None:
     """
     client = _make_papayya_client(ctx)
     try:
-        for event in client.runs.stream(run_id, from_step=from_step):
+        for event in client.items.stream(run_id, from_step=from_step):
             click.echo(json.dumps(event))
             sys.stdout.flush()
     except PapayyaAPIError as e:
@@ -1949,7 +2039,7 @@ def project() -> None:
          "prompts. Only enable if you've reviewed the data.",
 )
 def project_export(out: str, db: str, include_response_text: bool) -> None:
-    """Export local history (batches, runs, steps) to a JSONL file.
+    """Export local history (runs, items, steps) to a JSONL file.
 
     Intended for uploading to Papayya Cloud after signup so your local
     dashboard's history comes with you. Until the hosted import endpoint
@@ -1965,38 +2055,49 @@ def project_export(out: str, db: str, include_response_text: bool) -> None:
         click.echo(f"No local database at {db_path.resolve()}", err=True)
         raise click.exceptions.Exit(1)
 
+    # The export reads the local ledger, so make sure it's at the current
+    # schema (a DB written by an older SDK may predate the v12 noun
+    # consolidation: batches/runs/tasks -> runs/items/steps).
+    from papayya.durable.sqlite_store import ensure_migrated as _ensure_migrated
+    _ensure_migrated(db_path)
+
     conn = _sqlite.connect(db_path)
     conn.row_factory = _sqlite.Row
 
     out_path = _Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    written = {"batches": 0, "runs": 0, "steps": 0}
+    written = {"runs": 0, "items": 0, "steps": 0}
 
     with out_path.open("w", encoding="utf-8") as fh:
-        for row in conn.execute("SELECT * FROM batches"):
-            fh.write(_json.dumps({"type": "batch", "data": dict(row)}) + "\n")
-            written["batches"] += 1
-
         for row in conn.execute("SELECT * FROM runs"):
             fh.write(_json.dumps({"type": "run", "data": dict(row)}) + "\n")
             written["runs"] += 1
 
+        for row in conn.execute("SELECT * FROM items"):
+            fh.write(_json.dumps({"type": "item", "data": dict(row)}) + "\n")
+            written["items"] += 1
+
         for row in conn.execute("SELECT * FROM steps"):
             data = dict(row)
             if not include_response_text:
-                data.pop("response_text", None)
+                # Step results and snapshots can carry raw LLM output /
+                # customer payloads — same privacy posture as the old
+                # response_text column.
+                data.pop("result", None)
+                data.pop("input_snapshot", None)
+                data.pop("output_snapshot", None)
             fh.write(_json.dumps({"type": "step", "data": data}) + "\n")
             written["steps"] += 1
 
     conn.close()
     click.echo(
-        f"Exported {written['batches']} batches, {written['runs']} runs, "
+        f"Exported {written['runs']} runs, {written['items']} items, "
         f"{written['steps']} steps to {out_path}"
     )
     if not include_response_text:
         click.echo(
-            "Note: LLM response text excluded by default. Re-run with "
-            "--include-response-text to include it."
+            "Note: step results/snapshots excluded by default. Re-run with "
+            "--include-response-text to include them."
         )
 
 
@@ -2026,14 +2127,19 @@ def project_import(file: str) -> None:
             click.echo(f"Line {i}: invalid JSON ({e})", err=True)
             raise click.exceptions.Exit(1)
         kind = obj.get("type")
-        if kind not in ("batch", "run", "step"):
+        # v12 exports emit run/item/step; pre-v12 exports emitted
+        # batch/run/step (with the old per-item meaning of "run"). Accept
+        # both so previously-exported files still validate.
+        if kind not in ("run", "item", "step", "batch"):
             click.echo(f"Line {i}: unknown record type {kind!r}", err=True)
             raise click.exceptions.Exit(1)
         counts[kind] = counts.get(kind, 0) + 1
 
     click.echo("Validated import file:")
-    plurals = {"batch": "batches", "run": "runs", "step": "steps"}
-    for kind in ("batch", "run", "step"):
+    plurals = {"run": "runs", "item": "items", "step": "steps", "batch": "batches (pre-0.3.0 export)"}
+    for kind in ("run", "item", "step", "batch"):
+        if kind == "batch" and counts.get(kind, 0) == 0:
+            continue
         click.echo(f"  {plurals[kind]}: {counts.get(kind, 0)}")
     click.echo(
         "\nHosted import endpoint is not yet live. "

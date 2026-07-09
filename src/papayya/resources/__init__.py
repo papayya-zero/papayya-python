@@ -1,3 +1,4 @@
+from papayya.resources.items import Items
 from papayya.resources.runs import Runs
 from papayya.resources.schedules import Schedules
 from papayya.resources.triage import Triage
@@ -10,6 +11,6 @@ from papayya.resources.api_keys import ApiKeys
 from papayya.resources.usage import Usage
 
 __all__ = [
-    "Runs", "Schedules", "Triage", "Webhooks", "Agents", "Deployments",
-    "Secrets", "Projects", "ApiKeys", "Usage",
+    "Items", "Runs", "Schedules", "Triage", "Webhooks", "Agents",
+    "Deployments", "Secrets", "Projects", "ApiKeys", "Usage",
 ]

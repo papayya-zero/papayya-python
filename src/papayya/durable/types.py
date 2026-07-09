@@ -108,6 +108,15 @@ class RunCheckpoint:
     # through the local + cloud stores.
     worst_outcome_status: str = "ok"
     degraded_count: int = 0
+    # Plan 34 (v12): the invocation (run row) this item belongs to. One
+    # map()/iter() call or one schedule fire mints ONE run row and threads
+    # its id here for every per-item create(); direct calls leave it None
+    # and the local store wraps them in an implicit run-of-one. Local-ledger
+    # only for now: the cloud wire is frozen at the old field names until
+    # Unit 5, so CloudStore neither sends nor reads this. Transitional
+    # attribute name — at the Unit 5 physical rename this dataclass's
+    # `run_id` becomes `id` and this field takes the `run_id` name.
+    invocation_id: str | None = None
 
 
 @dataclass
@@ -150,6 +159,12 @@ class DurableRunConfig:
     # contextvar that papayya.durable._replay sets before invoking the
     # agent fn. Stays None for non-replay callers.
     prepopulated_tasks: list[TaskEntry] | None = None
+    # Plan 34 (v12): id of the run row (invocation) this item belongs to.
+    # Set by papayya.map()/iter() (which mint one run row per call) and by
+    # slice replay (which mints a fresh run row for the re-driven items).
+    # None for direct calls — the store wraps those in an implicit
+    # run-of-one. See RunCheckpoint.invocation_id for the naming note.
+    invocation_id: str | None = None
 
 
 @dataclass

@@ -33,6 +33,12 @@ except ImportError:  # pragma: no cover - exercised by the not-installed test br
     _OTEL_AVAILABLE = False
 
 
+# Plan 34 dual-emit (wire freeze #3): `papayya.agent` is the consolidated
+# key; `papayya.workload` stays emitted alongside it because the deployed
+# control-pane mapper joins on it for cost attribution. Unit 5 makes the
+# mapper dual-read; the old key is dropped one release after that. Same
+# value goes out under both keys.
+BAGGAGE_AGENT = "papayya.agent"
 BAGGAGE_WORKLOAD = "papayya.workload"
 BAGGAGE_ITEM_ID = "papayya.item_id"
 BAGGAGE_PARTITION_KEY = "papayya.partition_key"
@@ -55,6 +61,7 @@ def set_papayya_baggage(
         return None
     ctx = context.get_current()
     if workload:
+        ctx = baggage.set_baggage(BAGGAGE_AGENT, str(workload), context=ctx)
         ctx = baggage.set_baggage(BAGGAGE_WORKLOAD, str(workload), context=ctx)
     if item_id is not None:
         ctx = baggage.set_baggage(BAGGAGE_ITEM_ID, str(item_id), context=ctx)
@@ -94,6 +101,7 @@ def annotate_current_span(
     if span is None or not span.is_recording():
         return
     if workload:
+        span.set_attribute(BAGGAGE_AGENT, str(workload))
         span.set_attribute(BAGGAGE_WORKLOAD, str(workload))
     if item_id is not None:
         span.set_attribute(BAGGAGE_ITEM_ID, str(item_id))

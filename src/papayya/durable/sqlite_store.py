@@ -1,8 +1,21 @@
 """SQLite-backed checkpoint store with step-level observability.
 
 Implements CheckpointStore for durable execution compatibility.
-Additionally supports recording individual LLM steps for the
-local development dashboard.
+
+Plan 34 noun consolidation (schema v12): the local ledger speaks the
+product vocabulary directly —
+
+    runs   = invocations (one map() call, one cron fire, or an implicit
+             run-of-one wrapped around a direct call)   [was `batches`]
+    items  = per-item records: outcome, trace, cost      [was `runs`]
+    steps  = trace nodes written by run.step()/llm_step() [was `tasks`]
+
+The CheckpointStore protocol method names (load/save_task/set_status/
+create) and their ``run_id`` parameter names are intentionally UNCHANGED:
+they are the internal contract shared with MemoryStore/FileStore/
+CloudStore, and the CloudStore HTTP wire is frozen at the old names until
+Plan 34 Unit 5. In this store, the protocol's ``run_id`` addresses an
+ITEM row (its surrogate ``id`` column).
 
 The schema is a cross-language contract — future SDKs (TypeScript, Go)
 will write to the same tables and the dashboard reads from them unchanged.
@@ -10,7 +23,6 @@ will write to the same tables and the dashboard reads from them unchanged.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -20,14 +32,15 @@ from pathlib import Path
 from typing import Any
 
 from .. import _serialize
-from . import _errors, _schema
+from . import _schema
 from .types import RunCheckpoint, TaskEntry, _outcome_severity
 
 
 # Flag gate for all Slice-2 capture logic. Setting to "false" restores the
-# Slice-1 schema-only behaviour: new columns stay null, no implicit batches,
-# no aggregate bumps. Intended as a safety hatch if capture logic produces
-# bad data in the wild; not something users should normally touch.
+# Slice-1 schema-only behaviour: new columns stay null, no implicit
+# run-of-one rows, no aggregate bumps. Intended as a safety hatch if capture
+# logic produces bad data in the wild; not something users should normally
+# touch.
 _CAPTURE_V2_ENABLED = os.environ.get("PAPAYYA_LOCAL_CAPTURE_V2", "true").lower() != "false"
 
 
@@ -37,54 +50,16 @@ def _capture_enabled() -> bool:
     return os.environ.get("PAPAYYA_LOCAL_CAPTURE_V2", "true").lower() != "false"
 
 
-def _single_batch_id(run_id: str) -> str:
-    """Sentinel batch ID for implicit batches-of-1 around single runs."""
-    return f"single-{run_id}"
+def _single_run_id(item_id: str) -> str:
+    """Sentinel run ID for the implicit run-of-one around a direct call.
 
-
-def _compute_input_hash(
-    task_label: str | None,
-    tool_calls: list[dict[str, Any]] | None,
-) -> str | None:
-    """BLAKE2b-64 hex of a stable identity for this step's input.
-
-    Uses ``task_label + first_tool_call_JSON`` — stable across retries of
-    the same logical call, so ``(error_code, input_hash)`` buckets cleanly
-    for failure clustering.
-
-    Deliberately does NOT include ``response_text``: the model's output
-    varies even for identical inputs, and we want identical-input calls
-    to hash the same.
+    A direct ``@agent`` / ``papayya().item()`` call has no surrounding
+    ``map()``/``iter()`` invocation, so the store wraps the item in a run
+    of one. The ``single-`` prefix lets the UI filter run-of-one work in
+    or out cleanly. (This is the pre-v12 implicit batch, renamed.)
     """
-    if task_label is None and not tool_calls:
-        return None
-    label = task_label or ""
-    first_tool = ""
-    if tool_calls:
-        try:
-            first_tool = json.dumps(tool_calls[0], sort_keys=True)
-        except (TypeError, ValueError):
-            first_tool = str(tool_calls[0])
-    material = (label + first_tool)[:200].encode("utf-8", errors="replace")
-    return hashlib.blake2b(material, digest_size=8).hexdigest()
+    return f"single-{item_id}"
 
-
-def _extract_tool_name(tool_calls: list[dict[str, Any]] | None) -> str | None:
-    """Pull the first tool call's name out of the permissive dict shape.
-
-    ``tool_calls`` is declared as ``list[dict[str, Any]]`` — the shape is
-    whatever the engine interceptor emits, which is itself whatever the
-    provider SDK returned. Tolerate missing keys by returning None.
-    """
-    if not tool_calls:
-        return None
-    first = tool_calls[0]
-    if not isinstance(first, dict):
-        return None
-    name = first.get("name")
-    if not isinstance(name, str):
-        return None
-    return name
 
 _SCHEMA_VERSION = _schema.SCHEMA_VERSION
 
@@ -147,257 +122,248 @@ def _decode_metadata(raw: str | None) -> dict[str, Any] | None:
         return None
     return decoded if isinstance(decoded, dict) else None
 
-# v1 base schema. Kept verbatim with the original (pre-v4) columns so the
-# migration chain still applies cleanly for long-dormant DBs upgrading from
-# v1/v2/v3. The v3→v4 migration drops the budget/cost/token columns below;
-# fresh DBs pay one create-then-drop round at init, which is fine.
-_SCHEMA_SQL = """\
-CREATE TABLE IF NOT EXISTS _meta (
+
+# v12 base schema. Fresh databases are created at the CURRENT version
+# directly — they never walk the v1→v12 migration chain (that both wasted
+# work and produced one backup file per migration step: the backup storm).
+# Existing databases (any DB that already has a `_meta` table) never run
+# this script; they go through `_migrate` instead.
+_SCHEMA_SQL = f"""\
+CREATE TABLE IF NOT EXISTS {_schema.TBL_META} (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO _meta (key, value) VALUES ('schema_version', '1');
+INSERT OR IGNORE INTO {_schema.TBL_META} (key, value)
+    VALUES ('schema_version', '{_SCHEMA_VERSION}');
 
-CREATE TABLE IF NOT EXISTS runs (
-    run_id               TEXT PRIMARY KEY,
-    agent                TEXT NOT NULL,
-    status               TEXT NOT NULL DEFAULT 'running',
-    budget_limit_usd     REAL,
-    budget_consumed_usd  REAL NOT NULL DEFAULT 0.0,
-    total_input_tokens   INTEGER NOT NULL DEFAULT 0,
-    total_output_tokens  INTEGER NOT NULL DEFAULT 0,
-    budget_input_tokens  INTEGER,
-    budget_output_tokens INTEGER,
-    output               TEXT,
-    created_at           TEXT NOT NULL,
-    updated_at           TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS {_schema.TBL_RUNS} (
+    {_schema.COL_RUN_ID}              TEXT PRIMARY KEY,
+    {_schema.COL_RUN_AGENT}           TEXT NOT NULL,
+    {_schema.COL_RUN_STATUS}          TEXT NOT NULL DEFAULT 'queued',
+    {_schema.COL_RUN_TOTAL_ITEMS}     INTEGER NOT NULL,
+    {_schema.COL_RUN_COMPLETED}       INTEGER NOT NULL DEFAULT 0,
+    {_schema.COL_RUN_FAILED}          INTEGER NOT NULL DEFAULT 0,
+    {_schema.COL_RUN_CONCURRENCY_CAP} INTEGER,
+    {_schema.COL_RUN_CREATED_AT}      TEXT NOT NULL,
+    {_schema.COL_RUN_COMPLETED_AT}    TEXT,
+    {_schema.COL_RUN_REPLAYED_FROM}   TEXT
 );
 
-CREATE TABLE IF NOT EXISTS tasks (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        TEXT NOT NULL REFERENCES runs(run_id),
-    label         TEXT NOT NULL,
-    result        TEXT,
-    cost_usd      REAL NOT NULL DEFAULT 0.0,
-    duration_ms   INTEGER NOT NULL DEFAULT 0,
-    input_tokens  INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    completed_at  TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS {_schema.TBL_ITEMS} (
+    {_schema.COL_ITEM_ID}              TEXT PRIMARY KEY,
+    {_schema.COL_ITEM_AGENT}           TEXT NOT NULL,
+    {_schema.COL_ITEM_STATUS}          TEXT NOT NULL DEFAULT 'running',
+    {_schema.COL_ITEM_OUTPUT}          TEXT,
+    {_schema.COL_ITEM_CREATED_AT}      TEXT NOT NULL,
+    {_schema.COL_ITEM_UPDATED_AT}      TEXT NOT NULL,
+    {_schema.COL_ITEM_RUN_ID}          TEXT,
+    {_schema.COL_ITEM_ERROR_CODE}      TEXT,
+    {_schema.COL_ITEM_ITEM_ID}         TEXT,
+    {_schema.COL_ITEM_INPUT_SNAPSHOT}  TEXT,
+    {_schema.COL_ITEM_DLQ_DISPOSITION} TEXT,
+    {_schema.COL_ITEM_DLQ_RESOLVED_AT} TEXT,
+    {_schema.COL_ITEM_REPLAYED_FROM}   TEXT,
+    {_schema.COL_ITEM_AGENT_VERSION}   TEXT,
+    {_schema.COL_ITEM_METADATA}        TEXT,
+    {_schema.COL_ITEM_PARTITION_KEY}   TEXT,
+    {_schema.COL_ITEM_PARENT_RUN_ID}   TEXT,
+    {_schema.COL_ITEM_WORST_OUTCOME_STATUS} TEXT NOT NULL DEFAULT 'ok',
+    {_schema.COL_ITEM_DEGRADED_COUNT}  INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_run_id ON tasks(run_id);
 
-CREATE TABLE IF NOT EXISTS steps (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id         TEXT NOT NULL REFERENCES runs(run_id),
-    task_label     TEXT,
-    step_index     INTEGER NOT NULL DEFAULT 0,
-    model          TEXT NOT NULL DEFAULT 'unknown',
-    input_tokens   INTEGER NOT NULL DEFAULT 0,
-    output_tokens  INTEGER NOT NULL DEFAULT 0,
-    cost_usd       REAL NOT NULL DEFAULT 0.0,
-    duration_ms    INTEGER NOT NULL DEFAULT 0,
-    tool_calls     TEXT,
-    response_text  TEXT,
-    created_at     TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS {_schema.TBL_STEPS} (
+    id                                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    {_schema.COL_STEP_ITEM_ID}         TEXT NOT NULL REFERENCES {_schema.TBL_ITEMS}({_schema.COL_ITEM_ID}),
+    {_schema.COL_STEP_LABEL}           TEXT NOT NULL,
+    {_schema.COL_STEP_RESULT}          TEXT,
+    {_schema.COL_STEP_DURATION_MS}     INTEGER NOT NULL DEFAULT 0,
+    {_schema.COL_STEP_COMPLETED_AT}    TEXT NOT NULL,
+    {_schema.COL_STEP_CUSTOMER_ITEM_ID} TEXT,
+    {_schema.COL_STEP_INPUT_SNAPSHOT}  TEXT,
+    {_schema.COL_STEP_OUTPUT_SNAPSHOT} TEXT,
+    {_schema.COL_STEP_KIND}            TEXT,
+    {_schema.COL_STEP_LLM_PROMPT_TOKENS}     INTEGER,
+    {_schema.COL_STEP_LLM_COMPLETION_TOKENS} INTEGER,
+    {_schema.COL_STEP_LLM_TOTAL_TOKENS}      INTEGER,
+    {_schema.COL_STEP_LLM_MODEL}       TEXT,
+    {_schema.COL_STEP_LLM_STOP_REASON} TEXT,
+    {_schema.COL_STEP_LLM_PROVIDER_SHAPE} TEXT,
+    {_schema.COL_STEP_ERROR_CATEGORY}  TEXT,
+    {_schema.COL_STEP_AGENT_VERSION}   TEXT,
+    {_schema.COL_STEP_DELIVERY_ATTEMPTS} INTEGER,
+    {_schema.COL_STEP_JOURNALED_AT}    TEXT,
+    {_schema.COL_STEP_METADATA}        TEXT,
+    {_schema.COL_STEP_PARTITION_KEY}   TEXT,
+    {_schema.COL_STEP_OUTCOME_STATUS}  TEXT NOT NULL DEFAULT 'ok',
+    {_schema.COL_STEP_OUTCOME_REASON}  TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_steps_run_id ON steps(run_id);
 """
 
+# v12 indexes, shared between fresh-create and the v11→v12 rebuild.
+_V12_INDEXES: list[str] = [
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_ITEMS_RUN} "
+    f"ON {_schema.TBL_ITEMS}({_schema.COL_ITEM_RUN_ID});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_ITEMS_ITEM} "
+    f"ON {_schema.TBL_ITEMS}({_schema.COL_ITEM_ITEM_ID});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_ITEMS_DLQ} "
+    f"ON {_schema.TBL_ITEMS}({_schema.COL_ITEM_RUN_ID}, {_schema.COL_ITEM_DLQ_DISPOSITION}) "
+    f"WHERE {_schema.COL_ITEM_STATUS} = 'failed';",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_ITEMS_PARTITION} "
+    f"ON {_schema.TBL_ITEMS}({_schema.COL_ITEM_PARTITION_KEY});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_ITEMS_PARENT} "
+    f"ON {_schema.TBL_ITEMS}({_schema.COL_ITEM_PARENT_RUN_ID});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_STEPS_ITEM} "
+    f"ON {_schema.TBL_STEPS}({_schema.COL_STEP_ITEM_ID});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_STEPS_CUSTOMER_ITEM} "
+    f"ON {_schema.TBL_STEPS}({_schema.COL_STEP_CUSTOMER_ITEM_ID});",
+    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_STEPS_PARTITION} "
+    f"ON {_schema.TBL_STEPS}({_schema.COL_STEP_PARTITION_KEY});",
+]
+
+
+# --------------------------------------------------------------------------- #
+#  Frozen migration history (v1 → v11).                                        #
+#                                                                               #
+#  Everything below this banner operates on the PRE-v12 table names            #
+#  (`batches` / `runs`-as-per-item / `tasks` / legacy `steps`) because it      #
+#  runs BEFORE the v12 rename. These are deliberately literal strings, not     #
+#  `_schema` constants — the constants now carry the post-rename meanings.     #
+#  Do not edit this history; add new migrations at the bottom.                 #
+# --------------------------------------------------------------------------- #
 
 # v2 additions: batch entity + denormalized columns for clustering and search.
-# Every ALTER is idempotent-by-detection (see `_migrate`); do not add ALTERs
-# directly to _SCHEMA_SQL — they'd fail on re-open once the columns exist.
-#
-# NOTE: This creates the batches table with the legacy aggregate_cost_usd /
-# budget_limit_usd columns. v3→v4 drops them; kept here verbatim so DBs that
-# stopped at v2 still migrate cleanly forward through v3 and then v4.
-_V2_CREATE_BATCHES = f"""\
-CREATE TABLE IF NOT EXISTS {_schema.TBL_BATCHES} (
-    {_schema.COL_BATCH_ID}         TEXT PRIMARY KEY,
-    {_schema.COL_BATCH_AGENT}      TEXT NOT NULL,
-    {_schema.COL_BATCH_STATUS}     TEXT NOT NULL DEFAULT 'queued',
-    {_schema.COL_BATCH_TOTAL_ITEMS} INTEGER NOT NULL,
-    {_schema.COL_BATCH_COMPLETED}  INTEGER NOT NULL DEFAULT 0,
-    {_schema.COL_BATCH_FAILED}     INTEGER NOT NULL DEFAULT 0,
-    aggregate_cost_usd             REAL NOT NULL DEFAULT 0.0,
-    budget_limit_usd               REAL,
-    {_schema.COL_BATCH_CONCURRENCY_CAP} INTEGER,
-    {_schema.COL_BATCH_CREATED_AT} TEXT NOT NULL,
-    {_schema.COL_BATCH_COMPLETED_AT} TEXT
+_V2_CREATE_BATCHES = """\
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id         TEXT PRIMARY KEY,
+    agent            TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    total_items      INTEGER NOT NULL,
+    completed        INTEGER NOT NULL DEFAULT 0,
+    failed           INTEGER NOT NULL DEFAULT 0,
+    aggregate_cost_usd REAL NOT NULL DEFAULT 0.0,
+    budget_limit_usd REAL,
+    concurrency_cap  INTEGER,
+    created_at       TEXT NOT NULL,
+    completed_at     TEXT
 );
 """
 
-# (table, column, type_decl) — applied via ALTER only if the column is absent.
-# input_hash is BLAKE2b-64 over `task_label + first_tool_call_input` (see
-# Slice 2 capture logic). 64 bits is fine for local-scale clustering; a
-# hosted aggregation across projects may later want SHA-256.
 _V2_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_RUNS, _schema.COL_RUN_BATCH_ID, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_ERROR_CODE, "TEXT"),
-    (_schema.TBL_STEPS, _schema.COL_STEP_TOOL_NAME, "TEXT"),
-    (_schema.TBL_STEPS, _schema.COL_STEP_ERROR_CODE, "TEXT"),
-    (_schema.TBL_STEPS, _schema.COL_STEP_ERROR_CATEGORY, "TEXT"),
-    (_schema.TBL_STEPS, _schema.COL_STEP_INPUT_HASH, "TEXT"),
+    ("runs", "batch_id", "TEXT"),
+    ("runs", "error_code", "TEXT"),
+    ("steps", "tool_name", "TEXT"),
+    ("steps", "error_code", "TEXT"),
+    ("steps", "error_category", "TEXT"),
+    ("steps", "input_hash", "TEXT"),
 ]
 
 _V2_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_STEPS_TOOL} "
-    f"ON {_schema.TBL_STEPS}({_schema.COL_STEP_TOOL_NAME});",
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_STEPS_ERROR} "
-    f"ON {_schema.TBL_STEPS}({_schema.COL_STEP_ERROR_CODE});",
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_BATCH} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_BATCH_ID});",
+    "CREATE INDEX IF NOT EXISTS idx_steps_tool ON steps(tool_name);",
+    "CREATE INDEX IF NOT EXISTS idx_steps_error ON steps(error_code);",
+    "CREATE INDEX IF NOT EXISTS idx_runs_batch ON runs(batch_id);",
 ]
 
-
-# Slice 6 (v3): per-object state snapshots. Columns live on `tasks` (the
-# row written by run.step()), with item_id denormalized onto `runs` so the
-# dashboard can list items inside a batch without joining through tasks.
-# Snapshot columns are TEXT + JSON-encoded at the Python layer (see
-# `_encode_snapshot` below).
 _V3_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_TASKS, _schema.COL_TASK_ITEM_ID, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_INPUT_SNAPSHOT, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_OUTPUT_SNAPSHOT, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_ITEM_ID, "TEXT"),
+    ("tasks", "item_id", "TEXT"),
+    ("tasks", "input_snapshot", "TEXT"),
+    ("tasks", "output_snapshot", "TEXT"),
+    ("runs", "item_id", "TEXT"),
 ]
 
 _V3_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_TASKS_ITEM} "
-    f"ON {_schema.TBL_TASKS}({_schema.COL_TASK_ITEM_ID});",
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_ITEM} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_ITEM_ID});",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_item ON tasks(item_id);",
+    "CREATE INDEX IF NOT EXISTS idx_runs_item ON runs(item_id);",
 ]
 
-
-# v4: drop budget/cost/token columns. Budget and cost are cloud-only
-# concepts — enforced by the runtime shim at dispatch time, reconciled
-# against provider usage, and fenced at step-insert on the control plane.
-# The SDK no longer tracks cost locally, so these columns became dead.
-# (table, column) pairs to drop if present.
 _V4_DROP_COLUMNS: list[tuple[str, str]] = [
-    (_schema.TBL_RUNS, "budget_limit_usd"),
-    (_schema.TBL_RUNS, "budget_consumed_usd"),
-    (_schema.TBL_RUNS, "total_input_tokens"),
-    (_schema.TBL_RUNS, "total_output_tokens"),
-    (_schema.TBL_RUNS, "budget_input_tokens"),
-    (_schema.TBL_RUNS, "budget_output_tokens"),
-    (_schema.TBL_TASKS, "cost_usd"),
-    (_schema.TBL_TASKS, "input_tokens"),
-    (_schema.TBL_TASKS, "output_tokens"),
-    (_schema.TBL_STEPS, "input_tokens"),
-    (_schema.TBL_STEPS, "output_tokens"),
-    (_schema.TBL_STEPS, "cost_usd"),
-    (_schema.TBL_BATCHES, "aggregate_cost_usd"),
-    (_schema.TBL_BATCHES, "budget_limit_usd"),
+    ("runs", "budget_limit_usd"),
+    ("runs", "budget_consumed_usd"),
+    ("runs", "total_input_tokens"),
+    ("runs", "total_output_tokens"),
+    ("runs", "budget_input_tokens"),
+    ("runs", "budget_output_tokens"),
+    ("tasks", "cost_usd"),
+    ("tasks", "input_tokens"),
+    ("tasks", "output_tokens"),
+    ("steps", "input_tokens"),
+    ("steps", "output_tokens"),
+    ("steps", "cost_usd"),
+    ("batches", "aggregate_cost_usd"),
+    ("batches", "budget_limit_usd"),
 ]
 
-
-# v5: BYOF observability columns on tasks. All nullable — a non-LLM step
-# (kind is None) writes nulls; an LLM step whose provider shape wasn't
-# recognised writes nulls for the token/model/stop_reason fields and
-# "unknown" for provider_shape. error_category fills only on classified
-# provider exceptions.
 _V5_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_TASKS, _schema.COL_TASK_KIND, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_PROMPT_TOKENS, "INTEGER"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_COMPLETION_TOKENS, "INTEGER"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_TOTAL_TOKENS, "INTEGER"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_MODEL, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_STOP_REASON, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_LLM_PROVIDER_SHAPE, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_ERROR_CATEGORY, "TEXT"),
+    ("tasks", "kind", "TEXT"),
+    ("tasks", "llm_prompt_tokens", "INTEGER"),
+    ("tasks", "llm_completion_tokens", "INTEGER"),
+    ("tasks", "llm_total_tokens", "INTEGER"),
+    ("tasks", "llm_model", "TEXT"),
+    ("tasks", "llm_stop_reason", "TEXT"),
+    ("tasks", "llm_provider_shape", "TEXT"),
+    ("tasks", "error_category", "TEXT"),
 ]
 
-
-# v6: dead-letter-queue primitive on runs. input_snapshot captures the run's
-# replay source at create() time; the three dlq_* columns track triage state
-# for failed runs. All nullable — a successful run never touches them.
 _V6_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_RUNS, _schema.COL_RUN_INPUT_SNAPSHOT, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_DLQ_DISPOSITION, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_DLQ_RESOLVED_AT, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_REPLAYED_FROM, "TEXT"),
+    ("runs", "input_snapshot", "TEXT"),
+    ("runs", "dlq_disposition", "TEXT"),
+    ("runs", "dlq_resolved_at", "TEXT"),
+    ("runs", "replayed_from", "TEXT"),
 ]
 
-# Partial index on unresolved failed runs — the DLQ list query filters
-# status='failed' AND dlq_disposition IS NULL, which this indexes directly.
 _V6_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_DLQ} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_BATCH_ID}, {_schema.COL_RUN_DLQ_DISPOSITION}) "
-    f"WHERE status = 'failed';",
+    "CREATE INDEX IF NOT EXISTS idx_runs_dlq "
+    "ON runs(batch_id, dlq_disposition) WHERE status = 'failed';",
 ]
 
-
-# v7: ADR-0002 #7 — version-tagged lineage. agent_version on runs is the
-# source of truth (set at create() time) and denormalized onto each task
-# row written under the run, so the dashboard can render it on a step
-# without joining. No index — display column, not a filter target.
 _V7_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_RUNS, _schema.COL_RUN_AGENT_VERSION, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_AGENT_VERSION, "TEXT"),
+    ("runs", "agent_version", "TEXT"),
+    ("tasks", "agent_version", "TEXT"),
 ]
 
-
-# v8: ADR-0002 #8 — lineage delivery audit. Two columns on the tasks table
-# track per-row late delivery: delivery_attempts is the total number of
-# CloudStore POST attempts (including the one that finally landed it),
-# journaled_at is the wall-clock time the SDK gave up retrying and dumped
-# the payload into the local journal sidecar.
-#
-# Local SQLiteStore writes leave both NULL — synchronous disk writes have
-# no journal path. The columns exist on the local schema for parity with
-# the hosted side; the dashboard's badge logic queries the same column
-# regardless of backend.
 _V8_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_TASKS, _schema.COL_TASK_DELIVERY_ATTEMPTS, "INTEGER"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_JOURNALED_AT, "TEXT"),
+    ("tasks", "delivery_attempts", "INTEGER"),
+    ("tasks", "journaled_at", "TEXT"),
 ]
 
-
-# v9: partition-key metadata convention. metadata is the JSON blob captured
-# at run() time; partition_key is the extracted indexed value. Denormalized
-# onto tasks so dashboard filters by partition don't need to join through runs.
 _V9_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_RUNS, _schema.COL_RUN_METADATA, "TEXT"),
-    (_schema.TBL_RUNS, _schema.COL_RUN_PARTITION_KEY, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_METADATA, "TEXT"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_PARTITION_KEY, "TEXT"),
+    ("runs", "metadata", "TEXT"),
+    ("runs", "partition_key", "TEXT"),
+    ("tasks", "metadata", "TEXT"),
+    ("tasks", "partition_key", "TEXT"),
 ]
 
 _V9_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_PARTITION} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_PARTITION_KEY});",
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_TASKS_PARTITION} "
-    f"ON {_schema.TBL_TASKS}({_schema.COL_TASK_PARTITION_KEY});",
+    "CREATE INDEX IF NOT EXISTS idx_runs_partition ON runs(partition_key);",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_partition ON tasks(partition_key);",
 ]
 
-
-# v10: sub-runs lineage (Layer 3 #7). Mirrors hosted runs.parent_run_id
-# from control-pane migration 054. Full (not partial) index — SQLite
-# local DBs are small and partial-index syntax differs from Postgres.
 _V10_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_RUNS, _schema.COL_RUN_PARENT_RUN_ID, "TEXT"),
+    ("runs", "parent_run_id", "TEXT"),
 ]
 
 _V10_INDEXES = [
-    f"CREATE INDEX IF NOT EXISTS {_schema.IDX_RUNS_PARENT} "
-    f"ON {_schema.TBL_RUNS}({_schema.COL_RUN_PARENT_RUN_ID});",
+    "CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id);",
 ]
 
-
-# v11: structural outcome accountability (Plan 01). Adds outcome verdict
-# columns on tasks and denormalized worst-outcome aggregates on runs.
-# Both task columns are NOT NULL with sensible defaults so older rows
-# read as 'ok' / NULL after the migration without a backfill.
 _V11_ADD_COLUMNS: list[tuple[str, str, str]] = [
-    (_schema.TBL_TASKS, _schema.COL_TASK_OUTCOME_STATUS, "TEXT NOT NULL DEFAULT 'ok'"),
-    (_schema.TBL_TASKS, _schema.COL_TASK_OUTCOME_REASON, "TEXT"),
-    (_schema.TBL_RUNS,  _schema.COL_RUN_WORST_OUTCOME_STATUS, "TEXT NOT NULL DEFAULT 'ok'"),
-    (_schema.TBL_RUNS,  _schema.COL_RUN_DEGRADED_COUNT, "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "outcome_status", "TEXT NOT NULL DEFAULT 'ok'"),
+    ("tasks", "outcome_reason", "TEXT"),
+    ("runs", "worst_outcome_status", "TEXT NOT NULL DEFAULT 'ok'"),
+    ("runs", "degraded_count", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
-_V11_INDEXES: list[str] = []
+# Pre-v12 index names that the v12 rebuild drops (renamed tables keep their
+# old-named indexes; the legacy `steps` table's indexes die with the table).
+_PRE_V12_INDEXES = [
+    "idx_tasks_run_id",
+    "idx_runs_batch",
+    "idx_tasks_item",
+    "idx_runs_item",
+    "idx_runs_dlq",
+    "idx_runs_partition",
+    "idx_tasks_partition",
+    "idx_runs_parent",
+]
 
 
 def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -433,6 +399,33 @@ def _backup_db(db_path: Path, from_version: str) -> Path | None:
     return backup
 
 
+def _has_meta_table(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_meta'"
+    ).fetchone()
+    return row is not None
+
+
+def _init_schema(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Create-or-migrate the schema on an open connection.
+
+    Fresh databases (no ``_meta`` table yet) are created at
+    ``_SCHEMA_VERSION`` directly — they never enter the migration chain,
+    which is both faster and fixes the backup storm (a fresh DB used to be
+    created at v1 and then chain-migrated, leaving one ``backup-vN`` file
+    per migration step). Existing databases skip the base script entirely
+    (its v12 CREATEs would collide with pre-v12 tables mid-rename) and go
+    through ``_migrate``.
+    """
+    if _has_meta_table(conn):
+        _migrate(conn, db_path)
+        return
+    with conn:
+        conn.executescript(_SCHEMA_SQL)
+        for index_sql in _V12_INDEXES:
+            conn.execute(index_sql)
+
+
 def ensure_migrated(db_path: str | Path) -> None:
     """Open ``db_path``, create the base schema, and run migrations.
 
@@ -450,8 +443,7 @@ def ensure_migrated(db_path: str | Path) -> None:
         # concurrent reader/writer instead of erroring with SQLITE_BUSY.
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=DELETE")
-        conn.executescript(_SCHEMA_SQL)
-        _migrate(conn, file)
+        _init_schema(conn, file)
     finally:
         conn.close()
 
@@ -465,35 +457,35 @@ def _set_schema_version(conn: sqlite3.Connection, version: str) -> None:
 
 def _promote_partial_if_drained(
     conn: sqlite3.Connection,
-    batch_id: str,
+    run_id: str,
     now: str,
 ) -> None:
-    """Promote a 'partial' batch to 'completed' when its DLQ is empty.
+    """Promote a 'partial' run to 'completed' when its DLQ is empty.
 
     Called after any event that could change the unresolved-dead-letter
-    count: a DLQ disposition change, or a new run resolving inside a
-    partial batch. Only transitions 'partial' → 'completed'; 'failed' and
-    'cancelled' batches stay terminal on their own terms.
+    count: a DLQ disposition change, or a new item resolving inside a
+    partial run. Only transitions 'partial' → 'completed'; 'failed' and
+    'cancelled' runs stay terminal on their own terms.
 
-    The NOT EXISTS clause treats each replay's fresh run as part of the
-    batch's active surface — a failed replay keeps the batch 'partial'
+    The NOT EXISTS clause treats each replay's fresh item as part of the
+    run's active surface — a failed replay keeps the run 'partial'
     because there's a new unresolved dead letter, which is what the
     operator would expect.
     """
     conn.execute(
-        f"""UPDATE {_schema.TBL_BATCHES}
-            SET {_schema.COL_BATCH_STATUS} = 'completed',
-                {_schema.COL_BATCH_COMPLETED_AT} =
-                    COALESCE({_schema.COL_BATCH_COMPLETED_AT}, ?)
-            WHERE {_schema.COL_BATCH_ID} = ?
-              AND {_schema.COL_BATCH_STATUS} = 'partial'
+        f"""UPDATE {_schema.TBL_RUNS}
+            SET {_schema.COL_RUN_STATUS} = 'completed',
+                {_schema.COL_RUN_COMPLETED_AT} =
+                    COALESCE({_schema.COL_RUN_COMPLETED_AT}, ?)
+            WHERE {_schema.COL_RUN_ID} = ?
+              AND {_schema.COL_RUN_STATUS} = 'partial'
               AND NOT EXISTS (
-                  SELECT 1 FROM {_schema.TBL_RUNS}
-                  WHERE {_schema.COL_RUN_BATCH_ID} = ?
-                    AND status = 'failed'
-                    AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL
+                  SELECT 1 FROM {_schema.TBL_ITEMS}
+                  WHERE {_schema.COL_ITEM_RUN_ID} = ?
+                    AND {_schema.COL_ITEM_STATUS} = 'failed'
+                    AND {_schema.COL_ITEM_DLQ_DISPOSITION} IS NULL
               )""",
-        (now, batch_id, batch_id),
+        (now, run_id, run_id),
     )
 
 
@@ -612,9 +604,47 @@ def _apply_v10_to_v11(conn: sqlite3.Connection, db_path: Path) -> None:
             if column in _existing_columns(conn, table):
                 continue
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
-        for index_sql in _V11_INDEXES:
-            conn.execute(index_sql)
         _set_schema_version(conn, "11")
+
+
+def _apply_v11_to_v12(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Plan 34 noun consolidation. Order is load-bearing:
+
+    1. drop the dead legacy ``steps`` table (no SDK writer since v2's
+       record_step fell out of the production path; must go first so
+       ``tasks`` can take the name)
+    2. ``runs`` → ``items`` (must precede ``batches`` → ``runs``)
+    3. on ``items``: ``run_id`` → ``id`` BEFORE ``batch_id`` → ``run_id``
+       (reversed order would collide)
+    4. ``batches`` → ``runs`` (+ ``batch_id`` → ``run_id``, + the new
+       ``replayed_from`` column for slice-replay lineage)
+    5. ``tasks`` → ``steps``: customer ``item_id`` → ``customer_item_id``
+       BEFORE the ``run_id`` FK → ``item_id`` (same collision logic)
+    6. drop old-named indexes, build the v12 set
+    """
+    _backup_db(db_path, "11")
+    with conn:
+        # 1. dead legacy steps table
+        conn.execute("DROP TABLE IF EXISTS steps")
+        # 2-3. per-item records
+        conn.execute("ALTER TABLE runs RENAME TO items")
+        conn.execute("ALTER TABLE items RENAME COLUMN run_id TO id")
+        conn.execute("ALTER TABLE items RENAME COLUMN batch_id TO run_id")
+        # 4. invocations
+        conn.execute("ALTER TABLE batches RENAME TO runs")
+        conn.execute("ALTER TABLE runs RENAME COLUMN batch_id TO run_id")
+        if "replayed_from" not in _existing_columns(conn, "runs"):
+            conn.execute("ALTER TABLE runs ADD COLUMN replayed_from TEXT")
+        # 5. trace nodes
+        conn.execute("ALTER TABLE tasks RENAME COLUMN item_id TO customer_item_id")
+        conn.execute("ALTER TABLE tasks RENAME COLUMN run_id TO item_id")
+        conn.execute("ALTER TABLE tasks RENAME TO steps")
+        # 6. indexes
+        for index_name in _PRE_V12_INDEXES:
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        for index_sql in _V12_INDEXES:
+            conn.execute(index_sql)
+        _set_schema_version(conn, "12")
 
 
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
@@ -623,7 +653,7 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     Each migration runs in a single transaction. A mid-migration crash leaves
     the DB at the prior version with no half-applied ALTERs. When more than
     one version gap separates the DB from the SDK, migrations chain in order
-    (e.g. v1 → v2 → … → v8 → v9) so long-dormant local DBs catch up cleanly.
+    (e.g. v1 → v2 → … → v11 → v12) so long-dormant local DBs catch up cleanly.
     """
     current = _get_schema_version(conn)
     while current != _SCHEMA_VERSION:
@@ -657,6 +687,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "10":
             _apply_v10_to_v11(conn, db_path)
             current = "11"
+        elif current == "11":
+            _apply_v11_to_v12(conn, db_path)
+            current = "12"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -682,20 +715,26 @@ class SQLiteStore:
         # concurrent readers instead of failing them with SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA journal_mode=DELETE")
-        self._conn.executescript(_SCHEMA_SQL)
-        _migrate(self._conn, db_file)
+        _init_schema(self._conn, db_file)
 
     # --- CheckpointStore protocol ---
+    #
+    # Protocol note: the ``run_id`` parameter below is the shared
+    # CheckpointStore vocabulary (frozen with the cloud wire until Unit 5).
+    # In this store it addresses an ITEM row — the `items.id` surrogate.
 
     def load(self, run_id: str) -> RunCheckpoint | None:
         row = self._conn.execute(
-            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            f"SELECT * FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?",
+            (run_id,),
         ).fetchone()
         if row is None:
             return None
 
-        task_rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE run_id = ? ORDER BY id", (run_id,)
+        step_rows = self._conn.execute(
+            f"SELECT * FROM {_schema.TBL_STEPS} "
+            f"WHERE {_schema.COL_STEP_ITEM_ID} = ? ORDER BY id",
+            (run_id,),
         ).fetchall()
 
         tasks = [
@@ -704,41 +743,42 @@ class SQLiteStore:
                 result=json.loads(t["result"]) if t["result"] is not None else None,
                 duration_ms=t["duration_ms"],
                 completed_at=t["completed_at"],
-                item_id=t[_schema.COL_TASK_ITEM_ID],
-                input_snapshot=_decode_snapshot(t[_schema.COL_TASK_INPUT_SNAPSHOT]),
-                output_snapshot=_decode_snapshot(t[_schema.COL_TASK_OUTPUT_SNAPSHOT]),
-                kind=t[_schema.COL_TASK_KIND],
-                llm_prompt_tokens=t[_schema.COL_TASK_LLM_PROMPT_TOKENS],
-                llm_completion_tokens=t[_schema.COL_TASK_LLM_COMPLETION_TOKENS],
-                llm_total_tokens=t[_schema.COL_TASK_LLM_TOTAL_TOKENS],
-                llm_model=t[_schema.COL_TASK_LLM_MODEL],
-                llm_stop_reason=t[_schema.COL_TASK_LLM_STOP_REASON],
-                llm_provider_shape=t[_schema.COL_TASK_LLM_PROVIDER_SHAPE],
-                error_category=t[_schema.COL_TASK_ERROR_CATEGORY],
-                agent_version=t[_schema.COL_TASK_AGENT_VERSION],
-                metadata=_decode_metadata(t[_schema.COL_TASK_METADATA]),
-                partition_key=t[_schema.COL_TASK_PARTITION_KEY],
-                outcome_status=t[_schema.COL_TASK_OUTCOME_STATUS],
-                outcome_reason=t[_schema.COL_TASK_OUTCOME_REASON],
+                item_id=t[_schema.COL_STEP_CUSTOMER_ITEM_ID],
+                input_snapshot=_decode_snapshot(t[_schema.COL_STEP_INPUT_SNAPSHOT]),
+                output_snapshot=_decode_snapshot(t[_schema.COL_STEP_OUTPUT_SNAPSHOT]),
+                kind=t[_schema.COL_STEP_KIND],
+                llm_prompt_tokens=t[_schema.COL_STEP_LLM_PROMPT_TOKENS],
+                llm_completion_tokens=t[_schema.COL_STEP_LLM_COMPLETION_TOKENS],
+                llm_total_tokens=t[_schema.COL_STEP_LLM_TOTAL_TOKENS],
+                llm_model=t[_schema.COL_STEP_LLM_MODEL],
+                llm_stop_reason=t[_schema.COL_STEP_LLM_STOP_REASON],
+                llm_provider_shape=t[_schema.COL_STEP_LLM_PROVIDER_SHAPE],
+                error_category=t[_schema.COL_STEP_ERROR_CATEGORY],
+                agent_version=t[_schema.COL_STEP_AGENT_VERSION],
+                metadata=_decode_metadata(t[_schema.COL_STEP_METADATA]),
+                partition_key=t[_schema.COL_STEP_PARTITION_KEY],
+                outcome_status=t[_schema.COL_STEP_OUTCOME_STATUS],
+                outcome_reason=t[_schema.COL_STEP_OUTCOME_REASON],
             )
-            for t in task_rows
+            for t in step_rows
         ]
 
         return RunCheckpoint(
-            run_id=row["run_id"],
+            run_id=row[_schema.COL_ITEM_ID],
             agent=row["agent"],
             tasks=tasks,
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
-            item_id=row[_schema.COL_RUN_ITEM_ID],
-            input_snapshot=_decode_snapshot(row[_schema.COL_RUN_INPUT_SNAPSHOT]),
-            agent_version=row[_schema.COL_RUN_AGENT_VERSION],
-            metadata=_decode_metadata(row[_schema.COL_RUN_METADATA]),
-            partition_key=row[_schema.COL_RUN_PARTITION_KEY],
-            parent_run_id=row[_schema.COL_RUN_PARENT_RUN_ID],
-            worst_outcome_status=row[_schema.COL_RUN_WORST_OUTCOME_STATUS],
-            degraded_count=row[_schema.COL_RUN_DEGRADED_COUNT],
+            item_id=row[_schema.COL_ITEM_ITEM_ID],
+            input_snapshot=_decode_snapshot(row[_schema.COL_ITEM_INPUT_SNAPSHOT]),
+            agent_version=row[_schema.COL_ITEM_AGENT_VERSION],
+            metadata=_decode_metadata(row[_schema.COL_ITEM_METADATA]),
+            partition_key=row[_schema.COL_ITEM_PARTITION_KEY],
+            parent_run_id=row[_schema.COL_ITEM_PARENT_RUN_ID],
+            worst_outcome_status=row[_schema.COL_ITEM_WORST_OUTCOME_STATUS],
+            degraded_count=row[_schema.COL_ITEM_DEGRADED_COUNT],
+            invocation_id=row[_schema.COL_ITEM_RUN_ID],
         )
 
     def save_task(self, run_id: str, entry: TaskEntry) -> None:
@@ -747,35 +787,37 @@ class SQLiteStore:
         output_snapshot_json = _encode_snapshot(entry.output_snapshot)
         with self._conn:
             # Idempotency guard (parity with the control-plane SaveCheckpoint
-            # xmax=0 fix): a re-delivery of the same (run_id, label) must not
-            # insert a duplicate task row or double-count the run aggregates
+            # xmax=0 fix): a re-delivery of the same (item, label) must not
+            # insert a duplicate step row or double-count the item aggregates
             # below. The local step cache normally prevents re-execution, so
             # this is defensive; first-writer-wins matches the cloud path's
             # ON CONFLICT (run_id, label) semantics.
             already = self._conn.execute(
-                "SELECT 1 FROM tasks WHERE run_id = ? AND label = ? LIMIT 1",
+                f"SELECT 1 FROM {_schema.TBL_STEPS} "
+                f"WHERE {_schema.COL_STEP_ITEM_ID} = ? AND label = ? LIMIT 1",
                 (run_id, entry.label),
             ).fetchone()
             if already is not None:
                 return
             self._conn.execute(
-                f"""INSERT INTO tasks (run_id, label, result, duration_ms, completed_at,
-                   {_schema.COL_TASK_ITEM_ID},
-                   {_schema.COL_TASK_INPUT_SNAPSHOT},
-                   {_schema.COL_TASK_OUTPUT_SNAPSHOT},
-                   {_schema.COL_TASK_KIND},
-                   {_schema.COL_TASK_LLM_PROMPT_TOKENS},
-                   {_schema.COL_TASK_LLM_COMPLETION_TOKENS},
-                   {_schema.COL_TASK_LLM_TOTAL_TOKENS},
-                   {_schema.COL_TASK_LLM_MODEL},
-                   {_schema.COL_TASK_LLM_STOP_REASON},
-                   {_schema.COL_TASK_LLM_PROVIDER_SHAPE},
-                   {_schema.COL_TASK_ERROR_CATEGORY},
-                   {_schema.COL_TASK_AGENT_VERSION},
-                   {_schema.COL_TASK_METADATA},
-                   {_schema.COL_TASK_PARTITION_KEY},
-                   {_schema.COL_TASK_OUTCOME_STATUS},
-                   {_schema.COL_TASK_OUTCOME_REASON})
+                f"""INSERT INTO {_schema.TBL_STEPS} ({_schema.COL_STEP_ITEM_ID},
+                   label, result, duration_ms, completed_at,
+                   {_schema.COL_STEP_CUSTOMER_ITEM_ID},
+                   {_schema.COL_STEP_INPUT_SNAPSHOT},
+                   {_schema.COL_STEP_OUTPUT_SNAPSHOT},
+                   {_schema.COL_STEP_KIND},
+                   {_schema.COL_STEP_LLM_PROMPT_TOKENS},
+                   {_schema.COL_STEP_LLM_COMPLETION_TOKENS},
+                   {_schema.COL_STEP_LLM_TOTAL_TOKENS},
+                   {_schema.COL_STEP_LLM_MODEL},
+                   {_schema.COL_STEP_LLM_STOP_REASON},
+                   {_schema.COL_STEP_LLM_PROVIDER_SHAPE},
+                   {_schema.COL_STEP_ERROR_CATEGORY},
+                   {_schema.COL_STEP_AGENT_VERSION},
+                   {_schema.COL_STEP_METADATA},
+                   {_schema.COL_STEP_PARTITION_KEY},
+                   {_schema.COL_STEP_OUTCOME_STATUS},
+                   {_schema.COL_STEP_OUTCOME_REASON})
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
@@ -802,32 +844,34 @@ class SQLiteStore:
                 ),
             )
             self._conn.execute(
-                "UPDATE runs SET updated_at = ? WHERE run_id = ?",
+                f"UPDATE {_schema.TBL_ITEMS} SET updated_at = ? "
+                f"WHERE {_schema.COL_ITEM_ID} = ?",
                 (now, run_id),
             )
-            # Denormalize item_id onto the run on first-writer-wins basis.
-            # Later steps with a different item_id don't overwrite — the
-            # run-level item_id represents the primary record flowing
-            # through this run, not a mutable state field.
+            # Denormalize the customer item_id onto the item row on
+            # first-writer-wins basis. Later steps with a different item_id
+            # don't overwrite — the item-level item_id represents the primary
+            # record flowing through this item, not a mutable state field.
             if entry.item_id is not None:
                 self._conn.execute(
-                    f"""UPDATE runs SET {_schema.COL_RUN_ITEM_ID} = ?
-                       WHERE run_id = ? AND {_schema.COL_RUN_ITEM_ID} IS NULL""",
+                    f"""UPDATE {_schema.TBL_ITEMS} SET {_schema.COL_ITEM_ITEM_ID} = ?
+                       WHERE {_schema.COL_ITEM_ID} = ?
+                         AND {_schema.COL_ITEM_ITEM_ID} IS NULL""",
                     (entry.item_id, run_id),
                 )
-            # Incremental aggregation of the run's worst-outcome severity.
-            # save_task is INSERT-only (no in-place task rewrites) so an
+            # Incremental aggregation of the item's worst-outcome severity.
+            # save_task is INSERT-only (no in-place step rewrites) so an
             # incremental update is sound. Skips the UPDATE when neither
             # value changes to avoid touching the row on the all-'ok' path.
-            run_row = self._conn.execute(
-                f"""SELECT {_schema.COL_RUN_WORST_OUTCOME_STATUS} AS worst,
-                          {_schema.COL_RUN_DEGRADED_COUNT} AS degraded
-                   FROM runs WHERE run_id = ?""",
+            item_row = self._conn.execute(
+                f"""SELECT {_schema.COL_ITEM_WORST_OUTCOME_STATUS} AS worst,
+                          {_schema.COL_ITEM_DEGRADED_COUNT} AS degraded
+                   FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?""",
                 (run_id,),
             ).fetchone()
-            if run_row is not None:
-                cur_status = run_row["worst"]
-                cur_count = run_row["degraded"]
+            if item_row is not None:
+                cur_status = item_row["worst"]
+                cur_count = item_row["degraded"]
                 next_status = (
                     entry.outcome_status
                     if _outcome_severity(entry.outcome_status) > _outcome_severity(cur_status)
@@ -836,99 +880,113 @@ class SQLiteStore:
                 next_count = cur_count + (0 if entry.outcome_status == "ok" else 1)
                 if next_status != cur_status or next_count != cur_count:
                     self._conn.execute(
-                        f"""UPDATE runs SET
-                               {_schema.COL_RUN_WORST_OUTCOME_STATUS} = ?,
-                               {_schema.COL_RUN_DEGRADED_COUNT} = ?
-                           WHERE run_id = ?""",
+                        f"""UPDATE {_schema.TBL_ITEMS} SET
+                               {_schema.COL_ITEM_WORST_OUTCOME_STATUS} = ?,
+                               {_schema.COL_ITEM_DEGRADED_COUNT} = ?
+                           WHERE {_schema.COL_ITEM_ID} = ?""",
                         (next_status, next_count, run_id),
                     )
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
-        """Transition a run's status, and roll up terminal counts to the batch."""
+        """Transition an item's status, and roll up terminal counts to its run."""
         now = datetime.now(timezone.utc).isoformat()
         # Capture prior status before we overwrite it — used below to decide
-        # whether this transition bumps a batch counter.
+        # whether this transition bumps a run counter.
         row = self._conn.execute(
-            f"SELECT status, {_schema.COL_RUN_BATCH_ID} FROM runs WHERE run_id = ?",
+            f"SELECT status, {_schema.COL_ITEM_RUN_ID} AS run_id "
+            f"FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?",
             (run_id,),
         ).fetchone()
 
         with self._conn:
             self._conn.execute(
-                "UPDATE runs SET status = ?, output = ?, updated_at = ? WHERE run_id = ?",
+                f"UPDATE {_schema.TBL_ITEMS} SET status = ?, output = ?, updated_at = ? "
+                f"WHERE {_schema.COL_ITEM_ID} = ?",
                 (status, _serialize.encode_user_value(output) if output is not None else None, now, run_id),
             )
             if (
                 _capture_enabled()
                 and row is not None
-                and row["batch_id"] is not None
+                and row["run_id"] is not None
                 and row["status"] not in ("completed", "failed")
                 and status in ("completed", "failed")
             ):
                 counter = (
-                    _schema.COL_BATCH_COMPLETED
+                    _schema.COL_RUN_COMPLETED
                     if status == "completed"
-                    else _schema.COL_BATCH_FAILED
+                    else _schema.COL_RUN_FAILED
                 )
                 self._conn.execute(
-                    f"""UPDATE {_schema.TBL_BATCHES}
+                    f"""UPDATE {_schema.TBL_RUNS}
                         SET {counter} = {counter} + 1
-                        WHERE {_schema.COL_BATCH_ID} = ?""",
-                    (row["batch_id"],),
+                        WHERE {_schema.COL_RUN_ID} = ?""",
+                    (row["run_id"],),
                 )
-                # Roll the batch to its terminal status once every item has
+                # Roll the run to its terminal status once every item has
                 # resolved. Ternary outcome: zero failures → 'completed';
                 # zero successes → 'failed'; mixed → 'partial'. The DLQ
-                # surface acts on partial-terminal batches to re-drive the
+                # surface acts on partial-terminal runs to re-drive the
                 # failed items; once all dead letters are replayed or
-                # skipped, a later pass should promote the batch from
-                # 'partial' to 'completed'.
+                # skipped, a later pass promotes the run from 'partial'
+                # to 'completed'.
+                #
+                # total_items > 0 guard: an OPEN run (minted by map()/iter()
+                # before the item count is known) carries total_items=0 until
+                # finalize_run seals it — the rollup must not fire while the
+                # invocation is still producing items.
                 self._conn.execute(
-                    f"""UPDATE {_schema.TBL_BATCHES}
-                        SET {_schema.COL_BATCH_STATUS} = CASE
-                                WHEN {_schema.COL_BATCH_FAILED} = 0 THEN 'completed'
-                                WHEN {_schema.COL_BATCH_COMPLETED} = 0 THEN 'failed'
+                    f"""UPDATE {_schema.TBL_RUNS}
+                        SET {_schema.COL_RUN_STATUS} = CASE
+                                WHEN {_schema.COL_RUN_FAILED} = 0 THEN 'completed'
+                                WHEN {_schema.COL_RUN_COMPLETED} = 0 THEN 'failed'
                                 ELSE 'partial'
                             END,
-                            {_schema.COL_BATCH_COMPLETED_AT} = ?
-                        WHERE {_schema.COL_BATCH_ID} = ?
-                          AND {_schema.COL_BATCH_COMPLETED_AT} IS NULL
-                          AND ({_schema.COL_BATCH_COMPLETED} + {_schema.COL_BATCH_FAILED})
-                              >= {_schema.COL_BATCH_TOTAL_ITEMS}""",
-                    (now, row["batch_id"]),
+                            {_schema.COL_RUN_COMPLETED_AT} = ?
+                        WHERE {_schema.COL_RUN_ID} = ?
+                          AND {_schema.COL_RUN_COMPLETED_AT} IS NULL
+                          AND {_schema.COL_RUN_TOTAL_ITEMS} > 0
+                          AND ({_schema.COL_RUN_COMPLETED} + {_schema.COL_RUN_FAILED})
+                              >= {_schema.COL_RUN_TOTAL_ITEMS}""",
+                    (now, row["run_id"]),
                 )
-                # A run resolving inside an already-terminal 'partial' batch
-                # (e.g. a replay's fresh run completing) can drain the DLQ —
-                # re-check and promote if so. No-op when the batch is still
+                # An item resolving inside an already-terminal 'partial' run
+                # (e.g. a replay's fresh item completing) can drain the DLQ —
+                # re-check and promote if so. No-op when the run is still
                 # running or is already in a different terminal state.
-                _promote_partial_if_drained(self._conn, row["batch_id"], now)
+                _promote_partial_if_drained(self._conn, row["run_id"], now)
 
     def create(self, checkpoint: RunCheckpoint) -> None:
-        """Create a run. Auto-wraps in an implicit batch-of-1 when capture is on.
+        """Create an item row.
 
-        The implicit batch ID is ``single-{run_id}`` so the UI can filter
-        single-run work in or out cleanly. Batches created explicitly via
-        ``create_batch`` have their own IDs and the run is linked via the
-        optional ``batch_id`` kwarg path once that lands in the caller.
+        Invocation linkage (Plan 34 Unit 1):
+
+        * ``checkpoint.invocation_id`` set → the caller (``papayya.map`` /
+          ``papayya.iter`` / slice replay) already minted the run row via
+          :meth:`create_run`; link this item to it.
+        * unset → this is a direct call: wrap it in an implicit run-of-one
+          whose id is ``single-{item id}`` (the pre-v12 implicit batch,
+          renamed), when capture is enabled.
         """
-        batch_id: str | None = None
-        if _capture_enabled():
-            batch_id = _single_batch_id(checkpoint.run_id)
+        run_id: str | None = checkpoint.invocation_id
+        if run_id is None and _capture_enabled():
+            run_id = _single_run_id(checkpoint.run_id)
             self._conn.execute(
-                f"""INSERT OR IGNORE INTO {_schema.TBL_BATCHES}
-                    ({_schema.COL_BATCH_ID}, {_schema.COL_BATCH_AGENT},
-                     {_schema.COL_BATCH_STATUS}, {_schema.COL_BATCH_TOTAL_ITEMS},
-                     {_schema.COL_BATCH_CREATED_AT})
+                f"""INSERT OR IGNORE INTO {_schema.TBL_RUNS}
+                    ({_schema.COL_RUN_ID}, {_schema.COL_RUN_AGENT},
+                     {_schema.COL_RUN_STATUS}, {_schema.COL_RUN_TOTAL_ITEMS},
+                     {_schema.COL_RUN_CREATED_AT})
                     VALUES (?, ?, 'running', 1, ?)""",
-                (batch_id, checkpoint.agent, checkpoint.created_at),
+                (run_id, checkpoint.agent, checkpoint.created_at),
             )
 
         self._conn.execute(
-            f"""INSERT INTO runs (run_id, agent, status, created_at, updated_at,
-               batch_id, {_schema.COL_RUN_ITEM_ID}, {_schema.COL_RUN_INPUT_SNAPSHOT},
-               {_schema.COL_RUN_AGENT_VERSION},
-               {_schema.COL_RUN_METADATA}, {_schema.COL_RUN_PARTITION_KEY},
-               {_schema.COL_RUN_PARENT_RUN_ID})
+            f"""INSERT INTO {_schema.TBL_ITEMS} ({_schema.COL_ITEM_ID}, agent, status,
+               created_at, updated_at,
+               {_schema.COL_ITEM_RUN_ID}, {_schema.COL_ITEM_ITEM_ID},
+               {_schema.COL_ITEM_INPUT_SNAPSHOT},
+               {_schema.COL_ITEM_AGENT_VERSION},
+               {_schema.COL_ITEM_METADATA}, {_schema.COL_ITEM_PARTITION_KEY},
+               {_schema.COL_ITEM_PARENT_RUN_ID})
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 checkpoint.run_id,
@@ -936,7 +994,7 @@ class SQLiteStore:
                 checkpoint.status,
                 checkpoint.created_at,
                 checkpoint.updated_at,
-                batch_id,
+                run_id,
                 checkpoint.item_id,
                 _encode_snapshot(checkpoint.input_snapshot),
                 checkpoint.agent_version,
@@ -947,87 +1005,95 @@ class SQLiteStore:
         )
         self._conn.commit()
 
-    # --- Batch entity (Slice 2) ---
+    # --- Run entity (invocations) ---
 
-    def create_batch(
-        self,
-        batch_id: str,
-        agent: str,
-        total_items: int,
-        *,
-        concurrency_cap: int | None = None,
-    ) -> None:
-        """Create an explicit multi-item batch. Caller links runs via batch_id."""
-        now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            f"""INSERT INTO {_schema.TBL_BATCHES}
-                ({_schema.COL_BATCH_ID}, {_schema.COL_BATCH_AGENT},
-                 {_schema.COL_BATCH_STATUS}, {_schema.COL_BATCH_TOTAL_ITEMS},
-                 {_schema.COL_BATCH_CONCURRENCY_CAP},
-                 {_schema.COL_BATCH_CREATED_AT})
-                VALUES (?, ?, 'running', ?, ?, ?)""",
-            (batch_id, agent, total_items, concurrency_cap, now),
-        )
-        self._conn.commit()
-
-    # --- Step-level capture (beyond CheckpointStore) ---
-
-    def record_step(
+    def create_run(
         self,
         run_id: str,
+        agent: str,
+        total_items: int = 0,
         *,
-        task_label: str | None = None,
-        model: str = "unknown",
-        duration_ms: int = 0,
-        tool_calls: list[dict[str, Any]] | None = None,
-        response_text: str | None = None,
-        error_message: str | None = None,
+        concurrency_cap: int | None = None,
+        replayed_from: str | None = None,
     ) -> None:
-        """Record an individual LLM call step for observability.
+        """Create an explicit run row (one invocation). Items link via
+        ``RunCheckpoint.invocation_id``.
 
-        When ``error_message`` is supplied, it is classified via
-        ``_errors.classify_error`` into ``(error_code, error_category)`` and
-        persisted so the dashboard can cluster and colour failures.
+        ``total_items=0`` creates an OPEN run: the caller doesn't know the
+        item count up front (``map()``/``iter()`` over a generator). Open
+        runs are exempt from the terminal-status rollup until
+        :meth:`finalize_run` seals them with the real count.
+
+        (Renamed from the pre-v12 ``create_batch``, which had no callers.)
         """
         now = datetime.now(timezone.utc).isoformat()
-        step_index = self._conn.execute(
-            "SELECT COALESCE(MAX(step_index), -1) + 1 FROM steps WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()[0]
-
-        capture_on = _capture_enabled()
-        tool_name = _extract_tool_name(tool_calls) if capture_on else None
-        input_hash = (
-            _compute_input_hash(task_label, tool_calls) if capture_on else None
-        )
-        error_code, error_category = (
-            _errors.classify_error(error_message) if capture_on else (None, None)
-        )
-
         self._conn.execute(
-            f"""INSERT INTO steps (run_id, task_label, step_index, model,
-               duration_ms, tool_calls, response_text, created_at,
-               {_schema.COL_STEP_TOOL_NAME},
-               {_schema.COL_STEP_ERROR_CODE},
-               {_schema.COL_STEP_ERROR_CATEGORY},
-               {_schema.COL_STEP_INPUT_HASH})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                run_id,
-                task_label,
-                step_index,
-                model,
-                duration_ms,
-                json.dumps(tool_calls) if tool_calls is not None else None,
-                response_text,
-                now,
-                tool_name,
-                error_code,
-                error_category,
-                input_hash,
-            ),
+            f"""INSERT INTO {_schema.TBL_RUNS}
+                ({_schema.COL_RUN_ID}, {_schema.COL_RUN_AGENT},
+                 {_schema.COL_RUN_STATUS}, {_schema.COL_RUN_TOTAL_ITEMS},
+                 {_schema.COL_RUN_CONCURRENCY_CAP},
+                 {_schema.COL_RUN_CREATED_AT},
+                 {_schema.COL_RUN_REPLAYED_FROM})
+                VALUES (?, ?, 'running', ?, ?, ?, ?)""",
+            (run_id, agent, total_items, concurrency_cap, now, replayed_from),
         )
         self._conn.commit()
+
+    def finalize_run(self, run_id: str) -> None:
+        """Seal an OPEN run: set ``total_items`` to the actual item count and
+        apply the terminal-status rollup if every item has already resolved.
+
+        Called by ``map()``/``iter()`` when the iteration finishes (normally
+        or via unwind). Idempotent; a run whose items are still in flight
+        keeps status 'running' and rolls up on the last item's set_status.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                f"""UPDATE {_schema.TBL_RUNS}
+                    SET {_schema.COL_RUN_TOTAL_ITEMS} = (
+                        SELECT COUNT(*) FROM {_schema.TBL_ITEMS}
+                        WHERE {_schema.COL_ITEM_RUN_ID} = ?
+                    )
+                    WHERE {_schema.COL_RUN_ID} = ?""",
+                (run_id, run_id),
+            )
+            self._conn.execute(
+                f"""UPDATE {_schema.TBL_RUNS}
+                    SET {_schema.COL_RUN_STATUS} = CASE
+                            WHEN {_schema.COL_RUN_FAILED} = 0 THEN 'completed'
+                            WHEN {_schema.COL_RUN_COMPLETED} = 0 THEN 'failed'
+                            ELSE 'partial'
+                        END,
+                        {_schema.COL_RUN_COMPLETED_AT} = ?
+                    WHERE {_schema.COL_RUN_ID} = ?
+                      AND {_schema.COL_RUN_COMPLETED_AT} IS NULL
+                      AND {_schema.COL_RUN_TOTAL_ITEMS} > 0
+                      AND ({_schema.COL_RUN_COMPLETED} + {_schema.COL_RUN_FAILED})
+                          >= {_schema.COL_RUN_TOTAL_ITEMS}""",
+                (now, run_id),
+            )
+            # A sealed zero-item run (map() over an empty iterable) has
+            # nothing left to wait for — close it out as completed rather
+            # than leaving it 'running' forever.
+            self._conn.execute(
+                f"""UPDATE {_schema.TBL_RUNS}
+                    SET {_schema.COL_RUN_STATUS} = 'completed',
+                        {_schema.COL_RUN_COMPLETED_AT} = ?
+                    WHERE {_schema.COL_RUN_ID} = ?
+                      AND {_schema.COL_RUN_TOTAL_ITEMS} = 0
+                      AND {_schema.COL_RUN_COMPLETED_AT} IS NULL""",
+                (now, run_id),
+            )
+            _promote_partial_if_drained(self._conn, run_id, now)
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        """Read one run (invocation) row as a plain dict, or None."""
+        row = self._conn.execute(
+            f"SELECT * FROM {_schema.TBL_RUNS} WHERE {_schema.COL_RUN_ID} = ?",
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     # --- Dead letter queue (v6) ---
 
@@ -1038,15 +1104,15 @@ class SQLiteStore:
         *,
         replayed_from: str | None = None,
     ) -> None:
-        """Record an operator's triage decision for a failed run.
+        """Record an operator's triage decision for a failed item.
 
         ``disposition`` must be one of the constants in ``_schema`` —
         ``DLQ_REPLAYED``, ``DLQ_SKIPPED``, ``DLQ_ACKNOWLEDGED``. A replay
-        transitions the *old* run to ``DLQ_REPLAYED`` and should be paired
-        with a freshly created run carrying ``replayed_from=<old_run_id>``
+        transitions the *old* item to ``DLQ_REPLAYED`` and should be paired
+        with a freshly created item carrying ``replayed_from=<old id>``
         so the chain is discoverable.
 
-        Write is a no-op if the run is already resolved — double-clicks
+        Write is a no-op if the item is already resolved — double-clicks
         on the dashboard should not silently overwrite disposition.
         """
         if disposition not in (
@@ -1059,26 +1125,36 @@ class SQLiteStore:
             )
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
-            batch_row = self._conn.execute(
-                f"SELECT {_schema.COL_RUN_BATCH_ID} FROM {_schema.TBL_RUNS} "
-                f"WHERE run_id = ?",
+            parent_row = self._conn.execute(
+                f"SELECT {_schema.COL_ITEM_RUN_ID} AS run_id FROM {_schema.TBL_ITEMS} "
+                f"WHERE {_schema.COL_ITEM_ID} = ?",
                 (run_id,),
             ).fetchone()
             self._conn.execute(
-                f"""UPDATE {_schema.TBL_RUNS}
-                    SET {_schema.COL_RUN_DLQ_DISPOSITION} = ?,
-                        {_schema.COL_RUN_DLQ_RESOLVED_AT} = ?,
-                        {_schema.COL_RUN_REPLAYED_FROM} = COALESCE(?, {_schema.COL_RUN_REPLAYED_FROM}),
+                f"""UPDATE {_schema.TBL_ITEMS}
+                    SET {_schema.COL_ITEM_DLQ_DISPOSITION} = ?,
+                        {_schema.COL_ITEM_DLQ_RESOLVED_AT} = ?,
+                        {_schema.COL_ITEM_REPLAYED_FROM} = COALESCE(?, {_schema.COL_ITEM_REPLAYED_FROM}),
                         updated_at = ?
-                    WHERE run_id = ?
+                    WHERE {_schema.COL_ITEM_ID} = ?
                       AND status = 'failed'
-                      AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL""",
+                      AND {_schema.COL_ITEM_DLQ_DISPOSITION} IS NULL""",
                 (disposition, now, replayed_from, now, run_id),
             )
-            if batch_row is not None and batch_row["batch_id"] is not None:
+            if parent_row is not None and parent_row["run_id"] is not None:
                 _promote_partial_if_drained(
-                    self._conn, batch_row["batch_id"], now
+                    self._conn, parent_row["run_id"], now
                 )
+
+    def set_item_replayed_from(self, item_id: str, source_item_id: str) -> None:
+        """Link a freshly-created item to the item it re-drives (slice replay)."""
+        with self._conn:
+            self._conn.execute(
+                f"""UPDATE {_schema.TBL_ITEMS}
+                    SET {_schema.COL_ITEM_REPLAYED_FROM} = ?
+                    WHERE {_schema.COL_ITEM_ID} = ?""",
+                (source_item_id, item_id),
+            )
 
     def close(self) -> None:
         self._conn.close()

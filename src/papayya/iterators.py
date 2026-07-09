@@ -24,7 +24,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
-from papayya.durable import PapayyaRun
+from papayya.durable import Item, PapayyaRun
 from papayya.durable.types import DurableRunConfig, TaskEntry
 from papayya.outcomes import OutcomeVerdict
 
@@ -46,17 +46,18 @@ _ACTIVE_RUN: ContextVar["PapayyaRun | None"] = ContextVar(
 def iter(
     items: Iterable[T],
     *,
-    workload: str,
+    agent: str | None = None,
     item_id: Callable[[T], str],
     partition_key: Callable[[T], str],
     store: Any | None = None,
+    workload: str | None = None,
 ) -> Iterator[T]:
-    """Wrap an iterable so each yielded item runs inside its own PapayyaRun.
+    """Wrap an iterable so each yielded item runs inside its own :class:`Item`.
 
     Required kwargs:
-      ``workload`` — workload slug for the loop (string, not a lambda).
-        Maps to ``DurableRunConfig.agent`` in v1; Plan 11 introduces a
-        parallel workload field with explicit semantics.
+      ``agent`` — agent slug for the loop (string, not a lambda).
+        (``workload=`` is the pre-Plan-34 spelling, accepted as a silent
+        alias for one release.)
       ``item_id`` — callable extracting a stable per-item identifier.
         Required; explicit attribution is the whole point.
       ``partition_key`` — callable extracting the per-item partition key
@@ -64,21 +65,27 @@ def iter(
       ``store`` — optional checkpoint store. When omitted, the same store
         the ``@agent`` / client path uses is resolved automatically
         (SQLiteStore locally, CloudStore when an API key is present), so
-        iter-runs persist and show up in ``papayya dev`` like any other run.
-        Pass an explicit store to point a batch at a specific database.
+        iter-items persist and show up in ``papayya dev`` like any other.
+        Pass an explicit store to point an invocation at a specific database.
 
     Behavior:
 
-    * For each item: open a ``PapayyaRun``, install it as the active run
-      via contextvar, yield the item to the caller's loop body.
-    * On body return: ``run.complete()``, reset the contextvar.
-    * On body exception: write a synthetic ``failed`` TaskEntry, call
-      ``run.fail(error=str(exc))``, reset the contextvar, re-raise the
-      original exception.
-    * The active-run contextvar is :func:`mark_degraded` /
-      :func:`mark_outcome`'s source of truth.
+    * One ``iter()`` call is ONE RUN: a single run row is minted up front
+      (on stores that support it) and every item this loop processes links
+      to it, so a 1,000-item loop shows up as one run of 1,000 items —
+      not 1,000 separate runs.
+    * For each item: open an ``Item`` record, install it as the active
+      item via contextvar, yield the item to the caller's loop body.
+    * On body return: ``complete()``, reset the contextvar.
+    * On body exception: write a synthetic ``failed`` TaskEntry, mark the
+      item failed, reset the contextvar, re-raise the original exception.
+    * The active-item contextvar is :func:`mark_degraded` /
+      :func:`mark_outcome` / :func:`active_item`'s source of truth.
     """
-    return _iter_gen(items, workload, item_id, partition_key, store)
+    resolved_agent = agent or workload
+    if resolved_agent is None:
+        raise TypeError("papayya.iter() requires the agent= keyword argument")
+    return _iter_gen(items, resolved_agent, item_id, partition_key, store)
 
 
 def map(
@@ -87,31 +94,39 @@ def map(
     *,
     item_id: Callable[[T], str],
     partition_key: Callable[[T], str],
-    workload: str | None = None,
+    agent: str | None = None,
     store: Any | None = None,
+    workload: str | None = None,
 ) -> list:
-    """Eager fan-out: run ``fn`` once per item, each inside its own run.
+    """Eager fan-out: run ``fn`` once per item, all inside ONE run.
 
     The eager sibling of :func:`iter` and the documented lead entrypoint.
     Equivalent to
-    ``[fn(x) for x in papayya.iter(items, workload=…, item_id=…, partition_key=…)]``.
+    ``[fn(x) for x in papayya.iter(items, agent=…, item_id=…, partition_key=…)]``.
+    One ``map()`` call mints one run row; each processed item is one item
+    row inside it.
 
     ``fn`` may be an ordinary function — its ambient ``@papayya.llm`` /
-    ``mark_degraded`` calls resolve against the per-item run ``map`` opens — or
-    an ``@papayya.durable`` / ``@agent`` function, which detects the active run
-    and reuses it rather than opening a second. Either way attribution comes
-    from ``map``'s explicit ``item_id`` / ``partition_key`` (callables over the
-    item), not the decorator's weaker first-argument guess — which is why
-    ``map`` is the correct-attribution path for rich items.
+    ``mark_degraded`` calls resolve against the per-item record ``map``
+    opens — or an ``@papayya.durable`` / ``@agent`` function, which detects
+    the active item and reuses it rather than opening a second. Either way
+    attribution comes from ``map``'s explicit ``item_id`` / ``partition_key``
+    (callables over the item), not the decorator's weaker first-argument
+    guess — which is why ``map`` is the correct-attribution path for rich
+    items.
 
-    ``workload`` defaults to the function's registered agent name, else its
-    ``__name__``. As with :func:`iter`, a failing item marks its run failed and
-    the exception propagates; wrap the body for per-item error isolation.
+    ``agent`` defaults to the function's registered agent name, else its
+    ``__name__``. (``workload=`` is the pre-Plan-34 spelling, accepted as a
+    silent alias for one release.) As with :func:`iter`, a failing item is
+    marked failed and the exception propagates; wrap the body for per-item
+    error isolation.
     """
     reg = getattr(fn, "_papayya_agent", None)
-    resolved_workload = workload or getattr(reg, "name", None) or getattr(fn, "__name__", "workload")
+    resolved_agent = (
+        agent or workload or getattr(reg, "name", None) or getattr(fn, "__name__", "agent")
+    )
     results: list = []
-    for item in _iter_gen(items, resolved_workload, item_id, partition_key, store):
+    for item in _iter_gen(items, resolved_agent, item_id, partition_key, store):
         results.append(fn(item))
     return results
 
@@ -133,80 +148,126 @@ def _resolve_default_store() -> Any:
         return None
 
 
+def _mint_invocation(store: Any, agent: str) -> str | None:
+    """Mint ONE run row (invocation) for a map()/iter() call.
+
+    Returns the run row's id, or None when the store has no invocation
+    surface (MemoryStore/FileStore, and CloudStore until the Unit 5 wire
+    lands — the durable HTTP contract is frozen at the old shape, so
+    hosted invocation rows are minted server-side later).
+    """
+    if store is None or not hasattr(store, "create_run"):
+        return None
+    run_id = str(uuid.uuid4())
+    try:
+        # total_items=0 marks the run OPEN: the item count isn't known up
+        # front (the iterable may be a generator). finalize_run seals it.
+        store.create_run(run_id, agent, 0)
+    except Exception:
+        log.exception("papayya.iter: could not mint the run row; items run unlinked")
+        return None
+    return run_id
+
+
+def _finalize_invocation(store: Any, run_id: str | None) -> None:
+    if run_id is None:
+        return
+    try:
+        store.finalize_run(run_id)
+    except Exception:
+        log.exception("papayya.iter: finalize_run raised; run row left open")
+
+
 def _iter_gen(
     items: Iterable[T],
-    workload: str,
+    agent: str,
     item_id_fn: Callable[[T], str],
     partition_key_fn: Callable[[T], str],
     store: Any | None = None,
+    invocation_id: str | None = None,
 ) -> Iterator[T]:
     resolved_store = store if store is not None else _resolve_default_store()
-    # Use builtins.iter inside this module so the public name doesn't
-    # shadow it for our own implementation. The for-loop below already
-    # uses iteration protocol, so this is defense-in-depth — anything
-    # that accepts Iterable[T] is fine.
-    for item in builtins.iter(items):
-        run = PapayyaRun(
-            DurableRunConfig(
-                agent=workload,
-                item_id=str(item_id_fn(item)),
-                partition_key=str(partition_key_fn(item)),
-                store=resolved_store,
-                # Capture the item as the run's input_snapshot at the item
-                # boundary we already cross. This is the only write needed
-                # for item-replay: the run row now carries the exact payload
-                # that produced it, so a failed iter-run can be re-driven
-                # from its run_id. Zero added hot-path latency — store.create
-                # already writes the row; this just fills a column that was
-                # NULL before (the @agent path captures args via decorator,
-                # which iter has no equivalent of).
-                input_snapshot=item,
-            )
-        )
-        run.init()
-        token = _ACTIVE_RUN.set(run)
-        try:
-            try:
-                yield item
-            except BaseException:
-                # When the for-loop body raises, Python sends
-                # ``GeneratorExit`` into the suspended yield as part of
-                # generator cleanup — the original exception propagates
-                # independently up the stack (it is NOT chained onto
-                # GeneratorExit.__context__). So ``BaseException as exc``
-                # here gets GeneratorExit, not the customer's exception,
-                # and we can't carry the original message into run.fail.
-                #
-                # What we CAN do — and what matters for the wedge — is mark
-                # the run as failed (status flip in the store) and write a
-                # synthetic TaskEntry whose ``outcome_reason`` makes the
-                # cause visible in the audit trail. Operators see "this
-                # item's run failed because the loop body raised" without
-                # us inventing a fake error string.
-                _write_synthetic_entry(
-                    run,
-                    OutcomeVerdict("failed", "loop_body_exception"),
+    # Plan 34 Unit 1: one map()/iter() call is ONE run. Mint the run row up
+    # front and thread its id into every per-item create() below, so a
+    # 1,000-item loop is one run of 1,000 items rather than 1,000 implicit
+    # runs-of-one. Slice replay passes an already-minted invocation_id in.
+    owns_invocation = invocation_id is None
+    if owns_invocation:
+        invocation_id = _mint_invocation(resolved_store, agent)
+    try:
+        # Use builtins.iter inside this module so the public name doesn't
+        # shadow it for our own implementation. The for-loop below already
+        # uses iteration protocol, so this is defense-in-depth — anything
+        # that accepts Iterable[T] is fine.
+        for item in builtins.iter(items):
+            run = Item(
+                DurableRunConfig(
+                    agent=agent,
+                    item_id=str(item_id_fn(item)),
+                    partition_key=str(partition_key_fn(item)),
+                    store=resolved_store,
+                    invocation_id=invocation_id,
+                    # Capture the item as the record's input_snapshot at the
+                    # item boundary we already cross. This is the only write
+                    # needed for item-replay: the item row now carries the
+                    # exact payload that produced it, so a failed iter-item
+                    # can be re-driven from its id. Zero added hot-path
+                    # latency — store.create already writes the row; this
+                    # just fills a column that was NULL before (the @agent
+                    # path captures args via decorator, which iter has no
+                    # equivalent of).
+                    input_snapshot=item,
                 )
+            )
+            run.init()
+            token = _ACTIVE_RUN.set(run)
+            try:
                 try:
-                    run.fail(error="loop_body_exception")
-                except Exception:
-                    log.exception(
-                        "papayya.iter: run.fail() raised while handling loop-body exception"
+                    yield item
+                except BaseException:
+                    # When the for-loop body raises, Python sends
+                    # ``GeneratorExit`` into the suspended yield as part of
+                    # generator cleanup — the original exception propagates
+                    # independently up the stack (it is NOT chained onto
+                    # GeneratorExit.__context__). So ``BaseException as exc``
+                    # here gets GeneratorExit, not the customer's exception,
+                    # and we can't carry the original message into run.fail.
+                    #
+                    # What we CAN do — and what matters for the wedge — is
+                    # mark the item as failed (status flip in the store) and
+                    # write a synthetic TaskEntry whose ``outcome_reason``
+                    # makes the cause visible in the audit trail. Operators
+                    # see "this item failed because the loop body raised"
+                    # without us inventing a fake error string.
+                    _write_synthetic_entry(
+                        run,
+                        OutcomeVerdict("failed", "loop_body_exception"),
                     )
-                # Re-raise the GeneratorExit so the generator unwinds
-                # cleanly; the original customer exception continues
-                # propagating to the caller via Python's normal stack
-                # unwind, untouched.
-                raise
-            else:
-                try:
-                    run.complete()
-                except Exception:
-                    log.exception(
-                        "papayya.iter: run.complete() raised at item boundary"
-                    )
-        finally:
-            _ACTIVE_RUN.reset(token)
+                    try:
+                        run.fail(error="loop_body_exception")
+                    except Exception:
+                        log.exception(
+                            "papayya.iter: run.fail() raised while handling loop-body exception"
+                        )
+                    # Re-raise the GeneratorExit so the generator unwinds
+                    # cleanly; the original customer exception continues
+                    # propagating to the caller via Python's normal stack
+                    # unwind, untouched.
+                    raise
+                else:
+                    try:
+                        run.complete()
+                    except Exception:
+                        log.exception(
+                            "papayya.iter: run.complete() raised at item boundary"
+                        )
+            finally:
+                _ACTIVE_RUN.reset(token)
+    finally:
+        # Seal the run row (set the real total_items, roll up terminal
+        # status) whether the loop finished, raised, or was abandoned.
+        if owns_invocation:
+            _finalize_invocation(resolved_store, invocation_id)
 
 
 class _LazyIsolate:
@@ -513,11 +574,25 @@ def _leaf_decorator(fn: Callable | None, *, label: str | None, kind: str):
     return decorate(fn) if fn is not None else decorate
 
 
-def active_run_id() -> str | None:
-    """Return the id of the active ``papayya.iter`` run, or ``None`` outside one.
+def active_item() -> "Item | None":
+    """Return the active :class:`Item` handle, or ``None`` outside one.
 
-    Useful for correlating an item with the outcome Papayya recorded for it
-    (e.g. ``store.load(papayya.active_run_id()).worst_outcome_status``).
+    The handle exposes ``.id`` (the record's surrogate uuid — useful for
+    correlating an item with the outcome Papayya recorded for it, e.g.
+    ``store.load(papayya.active_item().id).worst_outcome_status``) plus the
+    full step surface (``.step`` / ``.llm_step``).
+
+    :func:`active_run_id` is the pre-Plan-34 spelling; it returns just the
+    id string and is kept as a deprecated alias.
+    """
+    return _resolve_run()
+
+
+def active_run_id() -> str | None:
+    """Deprecated pre-Plan-34 alias: id of the active item, or ``None``.
+
+    Use ``active_item().id`` instead — "run" now names the whole
+    invocation, not the per-item record this returns.
     """
     run = _resolve_run()
     return run.run_id if run is not None else None
@@ -567,4 +642,4 @@ def _write_synthetic_entry(run: "PapayyaRun", verdict: OutcomeVerdict) -> None:
 # the builtin in any callsite using ``from papayya.iterators import *``,
 # which is a surprise the customer should opt into via the qualified
 # ``papayya.iter`` form.
-__all__ = ["mark_degraded", "mark_outcome", "llm", "step", "active_run_id"]
+__all__ = ["mark_degraded", "mark_outcome", "llm", "step", "active_item", "active_run_id"]

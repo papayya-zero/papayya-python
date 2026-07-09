@@ -214,7 +214,7 @@ def _replay_with_handler(
     try:
         for item in iterators.iter(
             [snapshot],
-            workload=workload,
+            agent=workload,
             item_id=lambda _it: item_id,
             partition_key=lambda _it: partition_key,
             store=run_store,
@@ -306,11 +306,11 @@ def replay(
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute(
-            f"""SELECT run_id, agent, status,
-                       {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
-                       {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot,
-                       {_schema.COL_RUN_AGENT_VERSION} AS agent_version
-                FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
+            f"""SELECT {_schema.COL_ITEM_ID} AS run_id, agent, status,
+                       {_schema.COL_ITEM_DLQ_DISPOSITION} AS disp,
+                       {_schema.COL_ITEM_INPUT_SNAPSHOT} AS input_snapshot,
+                       {_schema.COL_ITEM_AGENT_VERSION} AS agent_version
+                FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?""",
             (run_id,),
         ).fetchone()
     finally:
@@ -443,4 +443,203 @@ def replay(
     return result
 
 
-__all__ = ["replay", "ReplayError", "consume_replay_hydration"]
+def replay_slice(
+    run_id: str,
+    *,
+    tenant: str | None = None,
+    handler: Callable[[Any], Any] | None = None,
+    agent_module: str | Path | None = None,
+    db_path: str | Path | None = None,
+    latest: bool = False,
+) -> dict[str, Any]:
+    """Replay a RUN's not-ok slice: open a new run over the items of
+    ``run_id`` whose ``worst_outcome_status != 'ok'`` (Plan 34 Unit 2b).
+
+    This is the recovery verb of the acceptance sentence: *"you can replay
+    the ones that didn't work."* Selection, minting and linkage:
+
+    * selects the run's items where ``worst_outcome_status != 'ok'``;
+      ``tenant=`` narrows the slice to one ``partition_key`` value
+    * mints a NEW run row whose ``replayed_from`` is the source run's id
+    * re-drives each selected item into the new run; every fresh item row
+      carries ``replayed_from = <source item id>``
+    * source items that were ``failed`` and untriaged are marked
+      ``disposition='replayed'`` (degraded-but-completed sources have no
+      DLQ state to update — the item-level ``replayed_from`` chain is the
+      link)
+
+    ``handler=`` / ``agent_module=`` resolve the callable exactly like
+    :func:`replay` (handler for ``papayya.iter`` items, ``@agent``
+    discovery otherwise, mutually exclusive). Unlike single-item replay,
+    a raising item does NOT abort the slice — recovery over N items keeps
+    going and the failures land as fresh dead letters in the new run.
+    Items without a captured ``input_snapshot`` are skipped and counted.
+
+    Returns a summary dict: ``{new_run_id, agent, selected, replayed_ok,
+    replay_failed, skipped_no_snapshot}``.
+
+    Single-item replay (:func:`replay`) is unchanged and remains available
+    for one record at a time.
+    """
+    db_path = Path(db_path) if db_path is not None else _resolve_db_path()
+    if not db_path.exists():
+        raise ReplayError(f"No local database at {db_path.resolve()}")
+    if handler is not None and agent_module is not None:
+        raise ReplayError(
+            "Pass either handler= (re-drive items through your own callable) "
+            "or agent_module= (discover an @agent registration), not both."
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        run_row = conn.execute(
+            f"SELECT * FROM {_schema.TBL_RUNS} WHERE {_schema.COL_RUN_ID} = ?",
+            (run_id,),
+        ).fetchone()
+        if run_row is None:
+            raise ReplayError(f"Run '{run_id}' not found in {db_path}")
+
+        query = f"""SELECT {_schema.COL_ITEM_ID} AS id, agent, status,
+                           {_schema.COL_ITEM_ITEM_ID} AS item_id,
+                           {_schema.COL_ITEM_PARTITION_KEY} AS partition_key,
+                           {_schema.COL_ITEM_INPUT_SNAPSHOT} AS input_snapshot,
+                           {_schema.COL_ITEM_AGENT_VERSION} AS agent_version,
+                           {_schema.COL_ITEM_DLQ_DISPOSITION} AS disp
+                    FROM {_schema.TBL_ITEMS}
+                    WHERE {_schema.COL_ITEM_RUN_ID} = ?
+                      AND {_schema.COL_ITEM_WORST_OUTCOME_STATUS} != 'ok'"""
+        args: list[Any] = [run_id]
+        if tenant is not None:
+            query += f" AND {_schema.COL_ITEM_PARTITION_KEY} = ?"
+            args.append(tenant)
+        query += " ORDER BY created_at"
+        item_rows = [dict(r) for r in conn.execute(query, args).fetchall()]
+    finally:
+        conn.close()
+
+    if not item_rows:
+        scope = f" for tenant {tenant!r}" if tenant is not None else ""
+        raise ReplayError(
+            f"Run '{run_id}' has no items with worst_outcome_status != 'ok'"
+            f"{scope} — nothing to replay."
+        )
+
+    agent_name = run_row["agent"]
+
+    # Resolve the callable once for the whole slice.
+    if handler is not None:
+        invoke: Callable[[Any], Any] = handler
+    else:
+        if agent_module is None:
+            if Path("agent.py").exists():
+                agent_module = "agent.py"
+            else:
+                raise ReplayError(
+                    "No agent.py in cwd. Pass agent_module= to point at "
+                    "the agent module, or handler= for papayya.iter items."
+                )
+        registrations = _discover_agents(agent_module)
+        matching = next((r for r in registrations if r.name == agent_name), None)
+        if matching is None:
+            names = ", ".join(r.name for r in registrations) or "(none)"
+            raise ReplayError(
+                f"No @agent with name {agent_name!r} found in {agent_module}. "
+                f"Registered agents: {names}"
+            )
+        if not latest:
+            captured_versions = {
+                r["agent_version"] for r in item_rows if r["agent_version"] is not None
+            }
+            mismatched = captured_versions - {matching.agent_version}
+            if mismatched:
+                raise ReplayError(
+                    f"Run {run_id!r} has items captured at agent_version(s) "
+                    f"{sorted(mismatched)!r}; current registration is at "
+                    f"{matching.agent_version!r}. Replay would run different "
+                    "code than the original. Pass latest=True (SDK) or "
+                    "--latest (CLI) to replay on the current version."
+                )
+        invoke = lambda payload: _replay_invoke(matching.fn, payload)  # noqa: E731
+
+    # Lazy imports — iterators imports papayya.durable, so a module-level
+    # import here would recurse through the package init.
+    from papayya import iterators
+    from papayya.durable.run import Item
+    from papayya.durable.types import DurableRunConfig
+    from papayya.outcomes import OutcomeVerdict
+
+    store = SQLiteStore(str(db_path))
+    new_run_id = str(uuid.uuid4())
+    replayed_ok = 0
+    replay_failed = 0
+    skipped_no_snapshot = 0
+    try:
+        store.create_run(
+            new_run_id,
+            agent_name,
+            sum(1 for r in item_rows if r["input_snapshot"] is not None),
+            replayed_from=run_id,
+        )
+        for source in item_rows:
+            raw = source["input_snapshot"]
+            if raw is None:
+                skipped_no_snapshot += 1
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                payload = raw
+
+            fresh = Item(
+                DurableRunConfig(
+                    agent=agent_name,
+                    item_id=source["item_id"],
+                    partition_key=source["partition_key"],
+                    store=store,
+                    invocation_id=new_run_id,
+                    input_snapshot=payload,
+                )
+            )
+            fresh.init()
+            store.set_item_replayed_from(fresh.run_id, source["id"])
+            token = iterators._ACTIVE_RUN.set(fresh)
+            try:
+                invoke(payload)
+            except Exception as exc:  # noqa: BLE001 — customer code, class unknown
+                replay_failed += 1
+                iterators._write_synthetic_entry(
+                    fresh, OutcomeVerdict("failed", "replay_body_exception")
+                )
+                try:
+                    fresh.fail(error=str(exc))
+                except Exception:
+                    pass
+            else:
+                replayed_ok += 1
+                try:
+                    fresh.complete()
+                except Exception:
+                    pass
+            finally:
+                iterators._ACTIVE_RUN.reset(token)
+
+            # Source item leaves the DLQ once it has been re-driven. Only
+            # failed+untriaged items carry DLQ state; degraded-but-completed
+            # sources are linked via replayed_from alone.
+            if source["status"] == "failed" and source["disp"] is None:
+                store.mark_dlq_disposition(source["id"], _schema.DLQ_REPLAYED)
+    finally:
+        store.close()
+
+    return {
+        "new_run_id": new_run_id,
+        "agent": agent_name,
+        "selected": len(item_rows),
+        "replayed_ok": replayed_ok,
+        "replay_failed": replay_failed,
+        "skipped_no_snapshot": skipped_no_snapshot,
+    }
+
+
+__all__ = ["replay", "replay_slice", "ReplayError", "consume_replay_hydration"]

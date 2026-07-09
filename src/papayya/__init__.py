@@ -4,7 +4,7 @@ from papayya.agent import Agent, agent, get_registry, get_agent
 from papayya.papayya import Papayya
 from papayya.client import Client, RunResult
 from papayya.tools import tool
-from papayya.durable import papayya, PapayyaRun
+from papayya.durable import papayya, Item, PapayyaRun
 from papayya.errors import CreditExhausted, BudgetExceeded
 from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 
@@ -17,7 +17,8 @@ from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 # level name is ``papayya.iter``.
 
 def __getattr__(name: str):
-    if name in ("iter", "map", "mark_degraded", "mark_outcome", "llm", "step", "active_run_id"):
+    if name in ("iter", "map", "mark_degraded", "mark_outcome", "llm", "step",
+                "active_item", "active_run_id"):
         from papayya.iterators import (
             iter as _iter,
             map as _map,
@@ -25,6 +26,7 @@ def __getattr__(name: str):
             mark_outcome as _mark_outcome,
             llm as _llm,
             step as _step,
+            active_item as _active_item,
             active_run_id as _active_run_id,
         )
         return {
@@ -34,6 +36,7 @@ def __getattr__(name: str):
             "mark_outcome": _mark_outcome,
             "llm": _llm,
             "step": _step,
+            "active_item": _active_item,
             "active_run_id": _active_run_id,
         }[name]
     if name in ("schedule", "trigger"):
@@ -50,9 +53,9 @@ __all__ = [
     "agent", "durable", "get_registry", "get_agent",
     "schedule", "trigger",
     "Papayya", "Client", "RunResult",
-    "papayya", "PapayyaRun",
+    "papayya", "Item", "PapayyaRun",
     "CreditExhausted", "BudgetExceeded",
     "is_credit_exhaustion_error", "classify_provider_error",
     "iter", "map", "mark_degraded", "mark_outcome",
-    "llm", "step", "active_run_id",
+    "llm", "step", "active_item", "active_run_id",
 ]

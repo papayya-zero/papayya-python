@@ -3,6 +3,15 @@
 Serves a static dashboard UI and a JSON API that reads from the local
 SQLite database. Uses only Python stdlib — no frameworks.
 
+Plan 34 noun consolidation, PR-1 scope: the queries below read the v12
+schema (``runs`` = invocations, ``items`` = per-item records, ``steps`` =
+trace nodes) while the ROUTES and the JSON field names keep the pre-v12
+wire shape the shipped static UI reads (``/api/batches`` lists
+invocations, ``/api/runs`` lists per-item records, item rows carry
+``run_id``/``batch_id``). The Unit 3 pass renames the routes/nav and does
+the keyspace redesign; endpoints here emit old field names (plus the new
+``id`` on item rows) for one release.
+
 The route table maps URL paths to handler functions. Handlers are short,
 take a ``(conn, params)`` pair, and return a JSON-serialisable value.
 Errors bubble up as ``_ApiError(status, message)`` and are translated to
@@ -11,8 +20,8 @@ input.
 
 The server uses ``ThreadingHTTPServer`` so a slow query on one tab does
 not block other requests. Writes remain single-writer via the SDK; the
-dashboard's only state-mutating endpoint is batch cancel, which is
-localhost-gated and no-ops for terminal batches.
+dashboard's only state-mutating endpoint is run cancel, which is
+localhost-gated and no-ops for terminal runs.
 """
 
 from __future__ import annotations
@@ -72,155 +81,231 @@ def _require_int(params: dict[str, str], key: str, default: int, *, maximum: int
 
 
 # --------------------------------------------------------------------------- #
+#  Wire-compat row translation (one release; Unit 3 replaces this)             #
+# --------------------------------------------------------------------------- #
+
+
+def _item_json(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """v12 items row → the pre-v12 per-item wire shape (+ new ``id``).
+
+    The shipped static UI reads ``run_id`` as "the per-item record's id"
+    and ``batch_id`` as "the invocation it belongs to". Those keys collide
+    with the v12 column meanings, so the OLD meanings win on this wire for
+    one release and the new surrogate is additionally exposed as ``id``.
+    """
+    d = dict(row)
+    d["batch_id"] = d.get("run_id")
+    d["run_id"] = d.get("id")
+    return d
+
+
+def _run_json(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """v12 runs (invocation) row → the pre-v12 batch wire shape.
+
+    Emits both the new ``run_id`` and the old ``batch_id`` alias (same
+    value — no meaning collision on this row type).
+    """
+    d = dict(row)
+    d["batch_id"] = d.get("run_id")
+    return d
+
+
+def _step_json(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """v12 steps row → the pre-v12 task wire shape (+ new names).
+
+    Old wire: ``run_id`` = the per-item record's id, ``item_id`` = the
+    CUSTOMER identity. New columns keep flowing through under their v12
+    names (``customer_item_id``), so both generations of readers work.
+    """
+    d = dict(row)
+    d["run_id"] = d.get("item_id")
+    d["item_id"] = d.get("customer_item_id")
+    return d
+
+
+# --------------------------------------------------------------------------- #
 #  Handlers                                                                    #
 # --------------------------------------------------------------------------- #
 
 
 def _h_stats(conn: sqlite3.Connection, _: dict[str, str]) -> dict[str, Any]:
+    items_total = conn.execute(f"SELECT COUNT(*) FROM {_schema.TBL_ITEMS}").fetchone()[0]
+    items_completed = conn.execute(
+        f"SELECT COUNT(*) FROM {_schema.TBL_ITEMS} WHERE status='completed'"
+    ).fetchone()[0]
+    items_failed = conn.execute(
+        f"SELECT COUNT(*) FROM {_schema.TBL_ITEMS} WHERE status='failed'"
+    ).fetchone()[0]
+    runs_total = conn.execute(f"SELECT COUNT(*) FROM {_schema.TBL_RUNS}").fetchone()[0]
+    runs_completed = conn.execute(
+        f"SELECT COUNT(*) FROM {_schema.TBL_RUNS} WHERE status='completed'"
+    ).fetchone()[0]
+    runs_running = conn.execute(
+        f"SELECT COUNT(*) FROM {_schema.TBL_RUNS} WHERE status='running'"
+    ).fetchone()[0]
     return {
-        "total_runs":      conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
-        "completed_runs":  conn.execute("SELECT COUNT(*) FROM runs WHERE status='completed'").fetchone()[0],
-        "failed_runs":     conn.execute("SELECT COUNT(*) FROM runs WHERE status='failed'").fetchone()[0],
-        "total_batches":       conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
-        "batches_completed":   conn.execute("SELECT COUNT(*) FROM batches WHERE status='completed'").fetchone()[0],
-        "batches_in_progress": conn.execute("SELECT COUNT(*) FROM batches WHERE status='running'").fetchone()[0],
+        # New-noun keys.
+        "items_total": items_total,
+        "items_completed": items_completed,
+        "items_failed": items_failed,
+        "runs_total": runs_total,
+        "runs_completed": runs_completed,
+        "runs_in_progress": runs_running,
+        # Pre-v12 keys the shipped UI reads (old "run" = item, old
+        # "batch" = run). Kept for one release.
+        "total_runs": items_total,
+        "completed_runs": items_completed,
+        "failed_runs": items_failed,
+        "total_batches": runs_total,
+        "batches_completed": runs_completed,
+        "batches_in_progress": runs_running,
     }
 
 
 def _h_runs_list(conn: sqlite3.Connection, params: dict[str, str]) -> list[dict[str, Any]]:
     limit = _require_int(params, "limit", 100, maximum=_MAX_LIMIT)
     rows = conn.execute(
-        "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+        f"SELECT * FROM {_schema.TBL_ITEMS} ORDER BY created_at DESC LIMIT ?", (limit,)
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_item_json(r) for r in rows]
 
 
 def _h_run_detail(conn: sqlite3.Connection, run_id: str, _: dict[str, str]) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    row = conn.execute(
+        f"SELECT * FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?", (run_id,)
+    ).fetchone()
     if row is None:
         raise _ApiError(404, "run not found")
-    return dict(row)
+    return _item_json(row)
 
 
 def _h_run_tasks(conn: sqlite3.Connection, run_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM tasks WHERE run_id = ? ORDER BY id", (run_id,)
+        f"SELECT * FROM {_schema.TBL_STEPS} WHERE {_schema.COL_STEP_ITEM_ID} = ? ORDER BY id",
+        (run_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_step_json(r) for r in rows]
 
 
 def _h_run_steps(conn: sqlite3.Connection, run_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT * FROM steps WHERE run_id = ? ORDER BY step_index", (run_id,)
-    ).fetchall()
-    return [dict(r) for r in rows]
+    """Pre-v12 the legacy `steps` table held raw LLM-call rows written by
+    `record_step` — a surface with no production writer, dropped in v12.
+    The endpoint stays (the shipped run page still fetches it) and always
+    returns []; the item's real trace lives at ``/api/runs/:id/tasks``.
+    """
+    return []
 
 
 def _h_item_detail(conn: sqlite3.Connection, item_id: str, _: dict[str, str]) -> dict[str, Any]:
     """Timeline of everything that happened to one record.
 
-    Joins across runs and tasks by `item_id` so a single record's lifecycle
-    — potentially spanning multiple runs — surfaces as one ordered list of
-    steps with input/output snapshots attached. The response is rendered
-    as a lineage view; the per-step diff is computed client-side.
+    Keyed by CUSTOMER item_id (the ``items.item_id`` /
+    ``steps.customer_item_id`` value) across all runs — the lineage view.
+    Per-record detail is ``/api/runs/:id``. Two endpoints, two keyspaces —
+    that split is deliberate (Plan 34 Unit 3 keyspace decision).
     """
-    runs = conn.execute(
-        f"""SELECT * FROM runs
-            WHERE {_schema.COL_RUN_ITEM_ID} = ?
-               OR run_id IN (
-                   SELECT DISTINCT run_id FROM tasks WHERE {_schema.COL_TASK_ITEM_ID} = ?
+    items = conn.execute(
+        f"""SELECT * FROM {_schema.TBL_ITEMS}
+            WHERE {_schema.COL_ITEM_ITEM_ID} = ?
+               OR {_schema.COL_ITEM_ID} IN (
+                   SELECT DISTINCT {_schema.COL_STEP_ITEM_ID}
+                   FROM {_schema.TBL_STEPS}
+                   WHERE {_schema.COL_STEP_CUSTOMER_ITEM_ID} = ?
                )
             ORDER BY created_at""",
         (item_id, item_id),
     ).fetchall()
 
-    tasks = conn.execute(
-        f"""SELECT t.*, r.agent AS run_agent, r.{_schema.COL_RUN_BATCH_ID} AS batch_id
-            FROM tasks t JOIN runs r USING (run_id)
-            WHERE t.{_schema.COL_TASK_ITEM_ID} = ?
-               OR (r.{_schema.COL_RUN_ITEM_ID} = ? AND t.{_schema.COL_TASK_ITEM_ID} IS NULL)
-            ORDER BY t.completed_at, t.id""",
+    steps = conn.execute(
+        f"""SELECT s.*, i.agent AS run_agent,
+                   i.{_schema.COL_ITEM_RUN_ID} AS batch_id
+            FROM {_schema.TBL_STEPS} s
+            JOIN {_schema.TBL_ITEMS} i ON s.{_schema.COL_STEP_ITEM_ID} = i.{_schema.COL_ITEM_ID}
+            WHERE s.{_schema.COL_STEP_CUSTOMER_ITEM_ID} = ?
+               OR (i.{_schema.COL_ITEM_ITEM_ID} = ?
+                   AND s.{_schema.COL_STEP_CUSTOMER_ITEM_ID} IS NULL)
+            ORDER BY s.completed_at, s.id""",
         (item_id, item_id),
     ).fetchall()
 
-    if not runs and not tasks:
+    if not items and not steps:
         raise _ApiError(404, "item not found")
 
     return {
         "item_id": item_id,
-        "runs": [dict(r) for r in runs],
-        "tasks": [dict(t) for t in tasks],
+        "runs": [_item_json(r) for r in items],
+        "tasks": [_step_json(t) for t in steps],
     }
 
 
 def _h_batches_list(conn: sqlite3.Connection, params: dict[str, str]) -> list[dict[str, Any]]:
     limit = _require_int(params, "limit", 100, maximum=_MAX_LIMIT)
     rows = conn.execute(
-        f"SELECT * FROM {_schema.TBL_BATCHES} ORDER BY {_schema.COL_BATCH_CREATED_AT} DESC LIMIT ?",
+        f"SELECT * FROM {_schema.TBL_RUNS} ORDER BY {_schema.COL_RUN_CREATED_AT} DESC LIMIT ?",
         (limit,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [_run_json(r) for r in rows]
 
 
 def _h_batch_detail(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> dict[str, Any]:
     row = conn.execute(
-        f"SELECT * FROM {_schema.TBL_BATCHES} WHERE {_schema.COL_BATCH_ID} = ?",
+        f"SELECT * FROM {_schema.TBL_RUNS} WHERE {_schema.COL_RUN_ID} = ?",
         (batch_id,),
     ).fetchone()
     if row is None:
         raise _ApiError(404, "batch not found")
-    return dict(row)
+    return _run_json(row)
 
 
-def _h_batch_runs(conn: sqlite3.Connection, batch_id: str, params: dict[str, str]) -> list[dict[str, Any]]:
-    # Ensure the batch exists so a typo returns 404, not an empty array
+def _require_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
     exists = conn.execute(
-        f"SELECT 1 FROM {_schema.TBL_BATCHES} WHERE {_schema.COL_BATCH_ID} = ?",
-        (batch_id,),
+        f"SELECT 1 FROM {_schema.TBL_RUNS} WHERE {_schema.COL_RUN_ID} = ?",
+        (run_id,),
     ).fetchone()
     if exists is None:
         raise _ApiError(404, "batch not found")
+
+
+def _h_batch_runs(conn: sqlite3.Connection, batch_id: str, params: dict[str, str]) -> list[dict[str, Any]]:
+    # Ensure the run exists so a typo returns 404, not an empty array
+    _require_run_exists(conn, batch_id)
 
     limit = _require_int(params, "limit", 100, maximum=_MAX_LIMIT)
     offset = _require_int(params, "offset", 0)
     status = params.get("status")
 
-    query = f"SELECT * FROM runs WHERE {_schema.COL_RUN_BATCH_ID} = ?"
+    query = f"SELECT * FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_RUN_ID} = ?"
     args: list[Any] = [batch_id]
     if status:
         query += " AND status = ?"
         args.append(status)
     query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
     args.extend([limit, offset])
-    return [dict(r) for r in conn.execute(query, args).fetchall()]
+    return [_item_json(r) for r in conn.execute(query, args).fetchall()]
 
 
 def _h_batch_items(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
-    """Per-item aggregates for the batch-detail 'Items' tab.
+    """Per-record aggregates for the detail page's 'Items' tab.
 
-    Groups by the run-level item_id (denormalized onto runs for this query).
-    Runs without an item_id are omitted — this view is the lineage surface,
-    not a general run list.
+    Groups by the CUSTOMER item_id (denormalized onto item rows). Records
+    without a customer item_id are omitted — this view is the lineage
+    surface, not a general list.
     """
-    exists = conn.execute(
-        f"SELECT 1 FROM {_schema.TBL_BATCHES} WHERE {_schema.COL_BATCH_ID} = ?",
-        (batch_id,),
-    ).fetchone()
-    if exists is None:
-        raise _ApiError(404, "batch not found")
+    _require_run_exists(conn, batch_id)
 
     rows = conn.execute(
-        f"""SELECT r.{_schema.COL_RUN_ITEM_ID} AS item_id,
-                   COUNT(DISTINCT r.run_id) AS run_count,
-                   COUNT(t.id) AS step_count,
-                   MIN(r.created_at) AS first_seen,
-                   MAX(r.updated_at) AS last_seen,
-                   SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed_runs
-            FROM runs r
-            LEFT JOIN tasks t USING (run_id)
-            WHERE r.{_schema.COL_RUN_BATCH_ID} = ?
-              AND r.{_schema.COL_RUN_ITEM_ID} IS NOT NULL
-            GROUP BY r.{_schema.COL_RUN_ITEM_ID}
+        f"""SELECT i.{_schema.COL_ITEM_ITEM_ID} AS item_id,
+                   COUNT(DISTINCT i.{_schema.COL_ITEM_ID}) AS run_count,
+                   COUNT(s.id) AS step_count,
+                   MIN(i.created_at) AS first_seen,
+                   MAX(i.updated_at) AS last_seen,
+                   SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END) AS failed_runs
+            FROM {_schema.TBL_ITEMS} i
+            LEFT JOIN {_schema.TBL_STEPS} s
+                ON s.{_schema.COL_STEP_ITEM_ID} = i.{_schema.COL_ITEM_ID}
+            WHERE i.{_schema.COL_ITEM_RUN_ID} = ?
+              AND i.{_schema.COL_ITEM_ITEM_ID} IS NOT NULL
+            GROUP BY i.{_schema.COL_ITEM_ITEM_ID}
             ORDER BY last_seen DESC
             LIMIT ?""",
         (batch_id, _DEFAULT_LIMIT),
@@ -229,30 +314,26 @@ def _h_batch_items(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -
 
 
 def _h_batch_dlq(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
-    """Dead letter queue: unresolved failed runs for this batch.
+    """Dead letter queue: unresolved failed items for this run.
 
-    A dead letter is a run with ``status='failed'`` whose
+    A dead letter is an item with ``status='failed'`` whose
     ``dlq_disposition`` is still null — the operator hasn't decided what
     to do with it yet. The response carries the replay source
     (``input_snapshot``) and the recorded error so the UI can present a
     triage row without additional round-trips.
     """
-    exists = conn.execute(
-        f"SELECT 1 FROM {_schema.TBL_BATCHES} WHERE {_schema.COL_BATCH_ID} = ?",
-        (batch_id,),
-    ).fetchone()
-    if exists is None:
-        raise _ApiError(404, "batch not found")
+    _require_run_exists(conn, batch_id)
 
     rows = conn.execute(
-        f"""SELECT run_id, agent, created_at, updated_at,
+        f"""SELECT {_schema.COL_ITEM_ID} AS run_id, agent, created_at, updated_at,
                    output AS error,
-                   {_schema.COL_RUN_ITEM_ID} AS item_id,
-                   {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot
-            FROM {_schema.TBL_RUNS}
-            WHERE {_schema.COL_RUN_BATCH_ID} = ?
+                   {_schema.COL_ITEM_ITEM_ID} AS item_id,
+                   {_schema.COL_ITEM_INPUT_SNAPSHOT} AS input_snapshot,
+                   {_schema.COL_ITEM_ID} AS id
+            FROM {_schema.TBL_ITEMS}
+            WHERE {_schema.COL_ITEM_RUN_ID} = ?
               AND status = 'failed'
-              AND {_schema.COL_RUN_DLQ_DISPOSITION} IS NULL
+              AND {_schema.COL_ITEM_DLQ_DISPOSITION} IS NULL
             ORDER BY created_at DESC""",
         (batch_id,),
     ).fetchall()
@@ -260,17 +341,24 @@ def _h_batch_dlq(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> 
 
 
 def _h_batch_clusters(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
+    """Failure clusters for a run.
+
+    Pre-v12 this clustered the legacy LLM-call log on (error_code,
+    input_hash); that table is gone (no production writer). Clusters now
+    group the run's step rows by ``error_category`` — same response keys
+    so the shipped UI renders unchanged (``input_hash`` is always null).
+    """
     rows = conn.execute(
-        f"""SELECT s.{_schema.COL_STEP_ERROR_CODE} AS error_code,
-                   s.{_schema.COL_STEP_INPUT_HASH} AS input_hash,
+        f"""SELECT s.{_schema.COL_STEP_ERROR_CATEGORY} AS error_code,
+                   NULL AS input_hash,
                    COUNT(*) AS count,
-                   MIN(s.task_label) AS sample_label,
-                   MIN(s.response_text) AS sample_response
-            FROM steps s
-            JOIN runs r USING (run_id)
-            WHERE r.{_schema.COL_RUN_BATCH_ID} = ?
-              AND s.{_schema.COL_STEP_ERROR_CODE} IS NOT NULL
-            GROUP BY s.{_schema.COL_STEP_ERROR_CODE}, s.{_schema.COL_STEP_INPUT_HASH}
+                   MIN(s.label) AS sample_label,
+                   MIN(s.{_schema.COL_STEP_OUTCOME_REASON}) AS sample_response
+            FROM {_schema.TBL_STEPS} s
+            JOIN {_schema.TBL_ITEMS} i ON s.{_schema.COL_STEP_ITEM_ID} = i.{_schema.COL_ITEM_ID}
+            WHERE i.{_schema.COL_ITEM_RUN_ID} = ?
+              AND s.{_schema.COL_STEP_ERROR_CATEGORY} IS NOT NULL
+            GROUP BY s.{_schema.COL_STEP_ERROR_CATEGORY}
             ORDER BY count DESC
             LIMIT ?""",
         (batch_id, _DEFAULT_LIMIT),
@@ -279,18 +367,19 @@ def _h_batch_clusters(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]
 
 
 def _h_batch_outliers(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]) -> list[dict[str, Any]]:
-    """Top 10 longest-running items in a batch — the local-dash outlier view.
+    """Top 10 longest-running items in a run — the local-dash outlier view.
 
     Ranked by wall-clock duration (``updated_at - created_at``) across all
-    runs in the batch. In-flight runs count toward the top of the list
+    items in the run. In-flight items count toward the top of the list
     because their ``updated_at`` keeps advancing until terminal.
     """
     rows = conn.execute(
-        f"""SELECT run_id, agent, status, created_at, updated_at,
+        f"""SELECT {_schema.COL_ITEM_ID} AS run_id, agent, status, created_at, updated_at,
+                   {_schema.COL_ITEM_ID} AS id,
                    (julianday(updated_at) - julianday(created_at)) * 24 * 60 * 60 * 1000
                      AS duration_ms
-            FROM runs
-            WHERE {_schema.COL_RUN_BATCH_ID} = ?
+            FROM {_schema.TBL_ITEMS}
+            WHERE {_schema.COL_ITEM_RUN_ID} = ?
             ORDER BY duration_ms DESC
             LIMIT 10""",
         (batch_id,),
@@ -299,65 +388,56 @@ def _h_batch_outliers(conn: sqlite3.Connection, batch_id: str, _: dict[str, str]
 
 
 def _h_steps_search(conn: sqlite3.Connection, params: dict[str, str]) -> list[dict[str, Any]]:
+    """Search step rows. Pre-v12 this searched the legacy LLM-call log by
+    tool_name/error_code/input_hash; v12 searches the real trace table.
+    ``error_code`` maps onto ``error_category``; ``tool_name`` has no v12
+    column and matches nothing (the Unit 3 pass redesigns this page).
+    """
     tool_name = params.get("tool_name")
     error_code = params.get("error_code")
     date_from = params.get("from")
     date_to = params.get("to")
     limit = _require_int(params, "limit", 200, maximum=_MAX_LIMIT)
 
-    query = "SELECT * FROM steps WHERE 1=1"
-    args: list[Any] = []
     if tool_name:
-        query += f" AND {_schema.COL_STEP_TOOL_NAME} = ?"
-        args.append(tool_name)
+        return []
+
+    query = f"SELECT * FROM {_schema.TBL_STEPS} WHERE 1=1"
+    args: list[Any] = []
     if error_code:
-        query += f" AND {_schema.COL_STEP_ERROR_CODE} = ?"
+        query += f" AND {_schema.COL_STEP_ERROR_CATEGORY} = ?"
         args.append(error_code)
     if date_from:
-        query += " AND created_at >= ?"
+        query += " AND completed_at >= ?"
         args.append(date_from)
     if date_to:
-        query += " AND created_at <= ?"
+        query += " AND completed_at <= ?"
         args.append(date_to)
-    query += " ORDER BY created_at DESC LIMIT ?"
+    query += " ORDER BY completed_at DESC LIMIT ?"
     args.append(limit)
-    return [dict(r) for r in conn.execute(query, args).fetchall()]
+    return [_step_json(r) for r in conn.execute(query, args).fetchall()]
 
 
 def _h_thrashing(conn: sqlite3.Connection, params: dict[str, str]) -> list[dict[str, Any]]:
+    """Repeated-identical-call detection.
+
+    Fed by the legacy LLM-call log's (tool_name, input_hash) columns,
+    which had no production writer and were dropped in v12. Returns []
+    until the Unit 3 pass rebuilds it on step rows; the endpoint survives
+    so the shipped UI doesn't 404/500.
+    """
     run_id = params.get("run_id")
     batch_id = params.get("batch_id")
     if not run_id and not batch_id:
         raise _ApiError(400, "thrashing requires run_id or batch_id")
-
-    if run_id:
-        scope = "WHERE s.run_id = ?"
-        arg: str = run_id
-    else:
-        scope = f"JOIN runs r USING (run_id) WHERE r.{_schema.COL_RUN_BATCH_ID} = ?"
-        arg = batch_id  # type: ignore[assignment]
-
-    query = f"""
-        SELECT s.run_id,
-               s.{_schema.COL_STEP_TOOL_NAME} AS tool_name,
-               s.{_schema.COL_STEP_INPUT_HASH} AS input_hash,
-               COUNT(*) AS repeat_count
-        FROM steps s
-        {scope}
-          AND s.{_schema.COL_STEP_TOOL_NAME} IS NOT NULL
-          AND s.{_schema.COL_STEP_INPUT_HASH} IS NOT NULL
-        GROUP BY s.run_id, s.{_schema.COL_STEP_TOOL_NAME}, s.{_schema.COL_STEP_INPUT_HASH}
-        HAVING repeat_count > 3
-        ORDER BY repeat_count DESC
-    """
-    return [dict(r) for r in conn.execute(query, (arg,)).fetchall()]
+    return []
 
 
 def _h_projection(conn: sqlite3.Connection, _: dict[str, str]) -> dict[str, Any]:
     """Rolling 30-day usage summary, used by the upgrade page's tier recommender.
 
-    Duration is derived from ``updated_at - created_at`` on completed runs
-    only — in-flight runs have a meaningless ``updated_at``. Timestamps
+    Duration is derived from ``updated_at - created_at`` on completed items
+    only — in-flight items have a meaningless ``updated_at``. Timestamps
     are UTC ISO strings; we compare lexicographically against a 30-day
     cutoff the server computes once per call.
 
@@ -370,43 +450,48 @@ def _h_projection(conn: sqlite3.Connection, _: dict[str, str]) -> dict[str, Any]
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
 
     totals = conn.execute(
-        """SELECT COUNT(*) AS total_runs
-           FROM runs
+        f"""SELECT COUNT(*) AS total_items
+           FROM {_schema.TBL_ITEMS}
            WHERE created_at >= ?""",
         (cutoff,),
     ).fetchone()
 
-    # Compute-minutes: only completed runs have a meaningful duration.
+    # Compute-minutes: only completed items have a meaningful duration.
     duration = conn.execute(
-        """SELECT COALESCE(SUM(
+        f"""SELECT COALESCE(SUM(
              (julianday(updated_at) - julianday(created_at)) * 24 * 60
            ), 0) AS compute_minutes
-           FROM runs
+           FROM {_schema.TBL_ITEMS}
            WHERE created_at >= ? AND status = 'completed'""",
         (cutoff,),
     ).fetchone()
 
-    batches = conn.execute(
-        f"""SELECT COUNT(*) AS total_batches,
-                   COALESCE(MAX({_schema.COL_BATCH_TOTAL_ITEMS}), 0) AS largest_batch
-            FROM {_schema.TBL_BATCHES}
-            WHERE {_schema.COL_BATCH_CREATED_AT} >= ?""",
+    runs = conn.execute(
+        f"""SELECT COUNT(*) AS total_runs,
+                   COALESCE(MAX({_schema.COL_RUN_TOTAL_ITEMS}), 0) AS largest_run
+            FROM {_schema.TBL_RUNS}
+            WHERE {_schema.COL_RUN_CREATED_AT} >= ?""",
         (cutoff,),
     ).fetchone()
 
     return {
         "window_days": 30,
-        "total_runs": totals["total_runs"],
-        "total_batches": batches["total_batches"],
-        "largest_batch": batches["largest_batch"],
+        # New-noun keys.
+        "total_items": totals["total_items"],
+        "runs_total": runs["total_runs"],
+        "largest_run": runs["largest_run"],
         "compute_minutes": duration["compute_minutes"],
+        # Pre-v12 keys (old "run" = item, old "batch" = run).
+        "total_runs": totals["total_items"],
+        "total_batches": runs["total_runs"],
+        "largest_batch": runs["largest_run"],
     }
 
 
 def _h_tier_recommendation(conn: sqlite3.Connection, _: dict[str, str]) -> dict[str, Any]:
     """Pair the 30-day projection with a tier recommendation.
 
-    Peak concurrency locally is a crude proxy: the max number of runs
+    Peak concurrency locally is a crude proxy: the max number of items
     started within any single minute of the window. At laptop scale this
     is usually 1–2 and matches the experience a user would have on the
     hosted product's concurrency ceiling.
@@ -415,13 +500,13 @@ def _h_tier_recommendation(conn: sqlite3.Connection, _: dict[str, str]) -> dict[
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
 
-    # Minute-bucketed run starts — max count across buckets is our proxy.
+    # Minute-bucketed item starts — max count across buckets is our proxy.
     # ISO 8601 strings sort lexicographically, so substr to the minute works.
     row = conn.execute(
-        """SELECT COALESCE(MAX(c), 0) AS peak
+        f"""SELECT COALESCE(MAX(c), 0) AS peak
            FROM (
              SELECT COUNT(*) AS c
-             FROM runs
+             FROM {_schema.TBL_ITEMS}
              WHERE created_at >= ?
              GROUP BY substr(created_at, 1, 16)
            )""",
@@ -449,20 +534,20 @@ def _h_dlq_disposition(
 ) -> dict[str, Any]:
     """Mark a dead letter as skipped / acknowledged / replayed.
 
-    Replay is only half-done here: this marks the original run as
+    Replay is only half-done here: this marks the original item as
     ``replayed`` but does NOT execute the replay — that's the
     ``papayya replay`` subprocess. Callers of this endpoint for the
     ``replayed`` disposition are therefore expected to have already
-    created (or be about to create) the new run with
-    ``replayed_from=<run_id>``.
+    created (or be about to create) the new item with
+    ``replayed_from=<id>``.
 
     Idempotent by design: re-posting the same disposition on an already-
-    resolved run is a no-op at the store layer.
+    resolved item is a no-op at the store layer.
     """
     row = conn.execute(
-        f"""SELECT status, {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
-                   {_schema.COL_RUN_BATCH_ID} AS batch_id
-            FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
+        f"""SELECT status, {_schema.COL_ITEM_DLQ_DISPOSITION} AS disp,
+                   {_schema.COL_ITEM_RUN_ID} AS batch_id
+            FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?""",
         (run_id,),
     ).fetchone()
     if row is None:
@@ -484,11 +569,11 @@ def _h_dlq_disposition(
 
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        f"""UPDATE {_schema.TBL_RUNS}
-            SET {_schema.COL_RUN_DLQ_DISPOSITION} = ?,
-                {_schema.COL_RUN_DLQ_RESOLVED_AT} = ?,
+        f"""UPDATE {_schema.TBL_ITEMS}
+            SET {_schema.COL_ITEM_DLQ_DISPOSITION} = ?,
+                {_schema.COL_ITEM_DLQ_RESOLVED_AT} = ?,
                 updated_at = ?
-            WHERE run_id = ?""",
+            WHERE {_schema.COL_ITEM_ID} = ?""",
         (disposition, now, now, run_id),
     )
     _promote_partial_if_drained(conn, batch_id, now)
@@ -504,6 +589,9 @@ def _h_dlq_replay(
 ) -> dict[str, Any]:
     """Spawn ``papayya replay --run <id>`` and wait for it.
 
+    The id sent here is a per-ITEM id; the CLI's --run flag detects that
+    and runs single-item replay (its slice mode applies to run ids).
+
     Runs the CLI in a subprocess from the dashboard server's cwd — which is
     the user's project dir, where their agent module lives. Times out at
     120s: LLM replays are almost always <30s, and a longer-running replay
@@ -512,15 +600,15 @@ def _h_dlq_replay(
     their terminal directly.
 
     Validates DLQ state before dispatching so the subprocess doesn't waste
-    cycles discovering the run is already resolved.
+    cycles discovering the item is already resolved.
     """
     import subprocess
 
     row = conn.execute(
-        f"""SELECT status, {_schema.COL_RUN_DLQ_DISPOSITION} AS disp,
-                   {_schema.COL_RUN_BATCH_ID} AS batch_id,
-                   {_schema.COL_RUN_INPUT_SNAPSHOT} AS input_snapshot
-            FROM {_schema.TBL_RUNS} WHERE run_id = ?""",
+        f"""SELECT status, {_schema.COL_ITEM_DLQ_DISPOSITION} AS disp,
+                   {_schema.COL_ITEM_RUN_ID} AS batch_id,
+                   {_schema.COL_ITEM_INPUT_SNAPSHOT} AS input_snapshot
+            FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?""",
         (run_id,),
     ).fetchone()
     if row is None:
@@ -566,18 +654,18 @@ def _h_dlq_replay(
 
 def _h_batch_cancel(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
     row = conn.execute(
-        f"SELECT {_schema.COL_BATCH_STATUS} FROM {_schema.TBL_BATCHES} "
-        f"WHERE {_schema.COL_BATCH_ID} = ?",
+        f"SELECT {_schema.COL_RUN_STATUS} FROM {_schema.TBL_RUNS} "
+        f"WHERE {_schema.COL_RUN_ID} = ?",
         (batch_id,),
     ).fetchone()
     if row is None:
         raise _ApiError(404, "batch not found")
-    if row[_schema.COL_BATCH_STATUS] in ("completed", "cancelled", "failed", "partial"):
-        return {"noop": True, "status": row[_schema.COL_BATCH_STATUS]}
+    if row[_schema.COL_RUN_STATUS] in ("completed", "cancelled", "failed", "partial"):
+        return {"noop": True, "status": row[_schema.COL_RUN_STATUS]}
 
     conn.execute(
-        f"UPDATE {_schema.TBL_BATCHES} SET {_schema.COL_BATCH_STATUS} = 'cancelled' "
-        f"WHERE {_schema.COL_BATCH_ID} = ?",
+        f"UPDATE {_schema.TBL_RUNS} SET {_schema.COL_RUN_STATUS} = 'cancelled' "
+        f"WHERE {_schema.COL_RUN_ID} = ?",
         (batch_id,),
     )
     conn.commit()
@@ -810,9 +898,9 @@ def serve(host: str = "127.0.0.1", port: int = 8585, db_path: str = ".papayya/lo
         )
         sys.exit(1)
 
-    # A DB written by an older SDK may still be at schema v1. The dashboard
-    # opens raw sqlite3 connections and has no migration path of its own,
-    # so upgrade once here before we start serving.
+    # A DB written by an older SDK may still be at a pre-v12 schema. The
+    # dashboard opens raw sqlite3 connections and has no migration path of
+    # its own, so upgrade once here before we start serving.
     from ..durable.sqlite_store import ensure_migrated
     ensure_migrated(db.resolve())
 
