@@ -30,7 +30,7 @@ def _write_yaml(tmp_path: Path, body: str) -> None:
 
 
 def _invoke(*args: str) -> tuple[int, str, str]:
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()  # click>=8.2: stderr is separate by default
     result = runner.invoke(cli_module.main, list(args))
     return result.exit_code, result.stdout, result.stderr
 
