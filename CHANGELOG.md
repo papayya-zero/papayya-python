@@ -2,6 +2,82 @@
 
 All notable changes to the `papayya` Python package.
 
+## Unreleased (0.3.0)
+
+Plan 34 noun consolidation — one vocabulary everywhere:
+
+> An **agent** is loaded once by the worker pool; each **run** processes
+> **items**; every item shows what it did and what it cost, and you can
+> **replay** the ones that didn't work.
+
+The shift-by-one: what the SDK used to call a *batch* is now a **run**
+(one invocation — one `map()` call, one cron fire); what it used to call
+a *run* is now an **item** (one record processed); a *task* is a **step**
+(one node in an item's trace).
+
+### BREAKING
+
+These names persist with NEW semantics — they could not be aliased:
+
+- `Papayya().runs` was the per-item resource; it is now the invocation
+  surface (the old `.batches` submission methods). Per-item access moved
+  to `Papayya().items` (same methods, same frozen HTTP endpoints).
+- `papayya.Client` (deprecated in 0.2.x with a removal notice) is removed
+  as a distinct class; the name now aliases `Papayya`. The v1 trigger
+  methods (`run(agent_id, input)`, `run_sync`, `get_status`, `get_steps`)
+  are gone — their endpoints retired with the v1 DROP. Use
+  `Papayya().items.*` / `Papayya().runs.create(...)`.
+- Local SQLite schema migrates v11 → v12: `batches`→`runs`,
+  `runs`→`items` (PK `run_id`→`id`, FK `batch_id`→`run_id`),
+  `tasks`→`steps` (customer `item_id`→`customer_item_id`, FK
+  `run_id`→`item_id`); the dead legacy `steps` LLM-call log (no
+  production writer since v2) is dropped. A one-time
+  `local.db.backup-v11` sibling file is written before migrating.
+
+### Added
+
+- **Invocation minting**: `papayya.map()` / `papayya.iter()` mint ONE run
+  row per call and link every processed item to it — a 1,000-item map()
+  is one run of 1,000 items, not 1,000 runs-of-one. Direct calls keep the
+  implicit run-of-one (`single-…`) wrapping.
+- **Slice replay**: `papayya replay --run <run_id>` now replays a run's
+  not-ok slice — the items whose `worst_outcome_status != 'ok'` — into a
+  NEW run linked via `replayed_from` (run- and item-level). `--tenant`
+  narrows the slice to one `partition_key`. SDK:
+  `papayya.durable.replay_slice(run_id, tenant=…, handler=…/agent_module=…)`.
+  Single-item replay stays available as `papayya replay --item <id>`
+  (and `--run <old per-item id>` still falls back to it).
+- `papayya().item(...)` returning `Item` — the rename of
+  `papayya().run(...)` / `PapayyaRun`; old names kept as silent aliases.
+  `Item.id` is the record's surrogate uuid (`item_id` stays reserved for
+  customer identity).
+- `papayya.active_item()` returns the active item handle;
+  `active_run_id()` kept as a deprecated alias.
+- `agent=` keyword on `map()`/`iter()`; `workload=` accepted as a silent
+  alias for one release.
+- OTel baggage/span attributes dual-emit `papayya.agent` alongside
+  `papayya.workload` (old key drops one release after the control-pane
+  reads the new one).
+
+### Fixed
+
+- **Backup storm on fresh databases**: a brand-new local DB used to be
+  created at schema v1 and chain-migrated to head, leaving one
+  `backup-vN` file per migration step. Fresh DBs are now created at the
+  current schema version directly, with no backups.
+- `map()`/`iter()` over an empty iterable no longer strands a
+  forever-'running' run row.
+
+### Unchanged (wire freezes)
+
+- The durable checkpoint HTTP contract is frozen at the old paths and
+  field names (`/v1/durable/runs/{run_id}`, `run_id`/`item_id`/
+  `parent_run_id`) until the control-pane renames (Plan 34 Unit 5).
+- The runtime lease protocol (dispatcher/worker) is frozen likewise.
+- `papayya dev` API routes and JSON field names keep the pre-v12 wire
+  shape (plus new-name fields where non-colliding) for one release; the
+  UI-facing rename lands with the dev-dashboard pass.
+
 ## 0.2.1 — 2026-05-14
 
 ### Documentation
