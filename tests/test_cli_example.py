@@ -26,7 +26,16 @@ def test_example_scaffolds_file(tmp_path: Path) -> None:
         assert target.exists()
         contents = target.read_text()
         assert contents == LOCAL_DEMO_AGENT_SOURCE
-        assert "@papayya.durable" in contents
+        # Beginner-facing ambient tier: papayya.map + @papayya.llm.
+        assert "@papayya.llm" in contents
+        assert "papayya.map(" in contents
+        # The wedge must be visible on the first run: the canned data
+        # produces degraded outcomes (a refusal on a 200).
+        assert "refusal" in contents
+        # No hardcoded db path — the run must land in .papayya/local.db,
+        # where `papayya dev` reads (the documented handoff).
+        assert "PAPAYYA_LOCAL_DB_PATH" not in contents
+        assert "/tmp/" not in contents
     assert "Wrote agent.py" in result.output
     assert "papayya dev" in result.output
 

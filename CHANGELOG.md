@@ -33,6 +33,17 @@ These names persist with NEW semantics — they could not be aliased:
   `run_id`→`item_id`); the dead legacy `steps` LLM-call log (no
   production writer since v2) is dropped. A one-time
   `local.db.backup-v11` sibling file is written before migrating.
+- `papayya runs` CLI group: was hosted per-item verbs; `runs list` now
+  lists LOCAL runs (invocations, with the outcome rollup) and
+  `runs submit` is the old `batch submit`. Per-item verbs moved to
+  `papayya items` (`list`, `get`, `stream`); `runs stream` is gone —
+  same word could not carry both meanings.
+- `papayya dev` item rows emit `run_id` with the NEW meaning (the
+  invocation); the record uuid is `id` everywhere. The pre-0.3.0 dev API
+  used `run_id` for the record uuid — one key could not carry both. The
+  `/api/runs/<record>/steps` [] stub is removed with the page that
+  fetched it. (`/api/batches*` aliases and old page paths survive one
+  release; `/api/runs/<record>` falls back to per-record detail.)
 
 ### Added
 
@@ -58,6 +69,32 @@ These names persist with NEW semantics — they could not be aliased:
 - OTel baggage/span attributes dual-emit `papayya.agent` alongside
   `papayya.workload` (old key drops one release after the control-pane
   reads the new one).
+
+- **`papayya dev` speaks the vocabulary and shows the wedge** (Unit 3):
+  nav is Agents → Runs → Items; the runs list renders
+  `worst_outcome_status` and "N of M degraded" (+ degraded-tenant count
+  and token totals) per run, so a degradation incident is visible
+  without clicking anything. Run detail adds a per-tenant blast-radius
+  table; items and steps carry worked/degraded/failed badges with
+  outcome reasons. Two item keyspaces split into two pages: `/record`
+  (one record in one run, by surrogate uuid) and `/item` (customer
+  identity over time). Thrashing detection rebuilt on v12 step rows
+  (same bare label + same input, occurrence-suffix aware); step search
+  filters by label / error category / outcome.
+- **Tiered CLI help** (Unit 4): `papayya --help` lists the rung-0 loop
+  (`init`, `example`, `dev`, `deploy`, `replay`, `login`) first, then
+  run/inspect commands, then platform ops.
+- `papayya triggers` group (create/list/delete) — the rename of
+  `webhooks`; the old group name survives one release as a hidden alias.
+  `papayya.yaml` accepts `triggers:` alongside the legacy `webhooks:`
+  key (same schema; merged, duplicate names rejected).
+- `papayya batch submit` survives as a hidden alias of `runs submit`.
+- `papayya example` scaffold rewritten as a quickstart: `papayya.map` +
+  `@papayya.llm` over canned tickets across two tenants, with two items
+  coming back degraded (a refusal on a 200) so `papayya dev` shows
+  ran-vs-worked on the very first run. The hardcoded
+  `PAPAYYA_LOCAL_DB_PATH=/tmp/...` is gone — the run lands in
+  `.papayya/local.db`, where `papayya dev` reads.
 
 ### Fixed
 

@@ -178,3 +178,69 @@ def test_partition_key_non_string_rejected(tmp_path: Path) -> None:
     path = _write(tmp_path, "version: 1\npartition_key: 42\n")
     with pytest.raises(PapayyaYamlError):
         load_yaml(path)
+
+
+# ---------------------------------------------------------------------------
+# Plan 34: `triggers:` is the documented key; `webhooks:` accepted as the
+# pre-0.3.0 alias. Both merge into AgentSpec.webhooks (what reconcile reads).
+# ---------------------------------------------------------------------------
+
+
+def test_triggers_key_accepted(tmp_path: Path) -> None:
+    cfg = load_yaml(_write(
+        tmp_path,
+        """\
+        version: 1
+        envs:
+          prod:
+            agents:
+              triager:
+                triggers:
+                  - name: github-issues
+                    secret_env: GITHUB_TRIGGER_SECRET
+        """,
+    ))
+    agent = cfg.envs["prod"].agents["triager"]
+    assert [w.name for w in agent.webhooks] == ["github-issues"]
+    assert agent.webhooks[0].secret_env == "GITHUB_TRIGGER_SECRET"
+
+
+def test_triggers_and_webhooks_merge(tmp_path: Path) -> None:
+    cfg = load_yaml(_write(
+        tmp_path,
+        """\
+        version: 1
+        envs:
+          prod:
+            agents:
+              triager:
+                webhooks:
+                  - name: legacy-hook
+                    secret_env: LEGACY_SECRET
+                triggers:
+                  - name: new-trigger
+                    secret_env: NEW_SECRET
+        """,
+    ))
+    agent = cfg.envs["prod"].agents["triager"]
+    assert [w.name for w in agent.webhooks] == ["legacy-hook", "new-trigger"]
+
+
+def test_same_name_under_both_keys_rejected(tmp_path: Path) -> None:
+    with pytest.raises(PapayyaYamlError, match="both"):
+        load_yaml(_write(
+            tmp_path,
+            """\
+            version: 1
+            envs:
+              prod:
+                agents:
+                  triager:
+                    webhooks:
+                      - name: dupe
+                        secret_env: A
+                    triggers:
+                      - name: dupe
+                        secret_env: B
+            """,
+        ))

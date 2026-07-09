@@ -1,4 +1,10 @@
-"""Tests for the ``papayya webhooks`` CLI group."""
+"""Tests for the ``papayya triggers`` CLI group (webhook → trigger).
+
+Plan 34: `triggers` is the documented group; `webhooks` survives one
+release as a hidden alias sharing the same command objects. The SDK
+resource underneath stays ``client.webhooks`` until the control-pane
+rename (Unit 5).
+"""
 
 from __future__ import annotations
 
@@ -62,7 +68,7 @@ def _run(args: list[str]) -> Any:
 
 def test_create_forwards_args(fake_client: _FakeClient) -> None:
     result = _run([
-        "webhooks", "create",
+        "triggers", "create",
         "--agent", "agent-1",
         "--name", "Slack delivery",
         "--description", "fires on terminal status",
@@ -78,7 +84,7 @@ def test_create_forwards_args(fake_client: _FakeClient) -> None:
 
 def test_list_outputs_ndjson(fake_client: _FakeClient) -> None:
     fake_client.webhooks.list_return = [{"id": "wh-1"}, {"id": "wh-2"}]
-    result = _run(["webhooks", "list", "agent-1"])
+    result = _run(["triggers", "list", "agent-1"])
     assert result.exit_code == 0, result.output
     assert ("list", {"agent_id": "agent-1"}) in fake_client.webhooks.calls
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
@@ -86,7 +92,22 @@ def test_list_outputs_ndjson(fake_client: _FakeClient) -> None:
 
 
 def test_delete_calls_sdk(fake_client: _FakeClient) -> None:
-    result = _run(["webhooks", "delete", "wh-1"])
+    result = _run(["triggers", "delete", "wh-1"])
     assert result.exit_code == 0, result.output
     assert ("delete", {"webhook_id": "wh-1"}) in fake_client.webhooks.calls
     assert "deleted" in result.output
+
+
+def test_webhooks_hidden_alias_still_works(fake_client: _FakeClient) -> None:
+    """`papayya webhooks ...` keeps working one release, hidden from help."""
+    fake_client.webhooks.list_return = [{"id": "wh-1"}]
+    result = _run(["webhooks", "list", "agent-1"])
+    assert result.exit_code == 0, result.output
+    assert ("list", {"agent_id": "agent-1"}) in fake_client.webhooks.calls
+
+
+def test_webhooks_group_is_hidden_from_help() -> None:
+    result = _run(["--help"])
+    assert result.exit_code == 0
+    assert "\n  webhooks " not in result.output
+    assert "\n  triggers " in result.output

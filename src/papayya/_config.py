@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +53,25 @@ class WebhookSpec(_Strict):
 
 class AgentSpec(_Strict):
     schedules: list[ScheduleSpec] = Field(default_factory=list)
+    # Plan 34: `triggers:` is the documented key (a trigger is an inbound
+    # invocation hook; webhook survives as the transport detail).
+    # `webhooks:` is the pre-0.3.0 spelling, accepted as an alias — both
+    # keys merge into `webhooks`, which downstream reconcile code reads.
     webhooks: list[WebhookSpec] = Field(default_factory=list)
+    triggers: list[WebhookSpec] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _merge_triggers_into_webhooks(self) -> "AgentSpec":
+        if self.triggers:
+            names = {w.name for w in self.webhooks}
+            dupes = sorted(names & {t.name for t in self.triggers})
+            if dupes:
+                raise ValueError(
+                    f"trigger name(s) {dupes} declared under both `webhooks:` "
+                    "and `triggers:` — use one key per trigger"
+                )
+            self.webhooks = [*self.webhooks, *self.triggers]
+        return self
 
 
 class EnvSpec(_Strict):

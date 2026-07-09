@@ -1341,38 +1341,132 @@ def replay_cmd(
 
 
 # ---------------------------------------------------------------------------
-# runs — hosted run ops (list, stream)
+# runs — run (invocation) ops, and items — per-item inspection
 #
 # Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
-# stays unchanged. `runs` is the resource group for read verbs that mirror
-# client.runs.* one-for-one. v1→v2 cutover: cancel and replay-from-step
-# retired with the v1 DROP (their durable endpoints are gone).
+# stays unchanged. BREAKING (0.3.0, Plan 34): `papayya runs` used to be the
+# hosted per-ITEM surface; a run is now one INVOCATION (one map() call, one
+# cron fire, one submitted file of items). Per-item verbs moved to
+# `papayya items` — the old name persists with new semantics, so it could
+# not be aliased.
 # ---------------------------------------------------------------------------
 
 @main.group()
 def runs() -> None:
-    """Operate on hosted runs (list, stream)."""
+    """Runs — one invocation each (list local, submit hosted).
+
+    A run is one invocation of an agent: one map() call, one cron fire,
+    one submitted batch of items. `list` reads the local ledger;
+    `submit` sends a JSONL file to the hosted control plane.
+
+    BREAKING (0.3.0): this group used to operate on per-item records;
+    per-item inspection moved to `papayya items`.
+    """
 
 
 @runs.command("list")
+@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
+              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
+@click.option("--limit", type=int, default=50, show_default=True,
+              help="Newest-first row cap")
+def runs_list(db: str, limit: int) -> None:
+    """List local runs, newest first (NDJSON, one run per line).
+
+    Each line carries the outcome rollup — item counts, degraded/failed
+    items, worst_outcome_status — so a degradation incident is visible
+    from the terminal. Reads the same ledger `papayya dev` serves.
+    """
+    import sqlite3 as _sqlite
+    from pathlib import Path as _Path
+
+    db_file = _Path(db)
+    if not db_file.exists():
+        click.echo(f"Error: No local database at {db_file.resolve()}", err=True)
+        sys.exit(1)
+
+    from papayya.durable import _schema as _s
+    from papayya.durable.sqlite_store import ensure_migrated as _ensure_migrated
+    _ensure_migrated(db_file.resolve())
+
+    conn = _sqlite.connect(str(db_file))
+    conn.row_factory = _sqlite.Row
+    try:
+        rows = conn.execute(
+            f"""SELECT r.*, COALESCE(a.item_count, 0) AS item_count,
+                       COALESCE(a.degraded_items, 0) AS degraded_items,
+                       COALESCE(a.failed_items, 0) AS failed_items
+                FROM {_s.TBL_RUNS} r
+                LEFT JOIN (
+                    SELECT {_s.COL_ITEM_RUN_ID} AS rid, COUNT(*) AS item_count,
+                           SUM(CASE WHEN {_s.COL_ITEM_WORST_OUTCOME_STATUS} = 'degraded'
+                                    THEN 1 ELSE 0 END) AS degraded_items,
+                           SUM(CASE WHEN status = 'failed'
+                                     OR {_s.COL_ITEM_WORST_OUTCOME_STATUS} = 'failed'
+                                    THEN 1 ELSE 0 END) AS failed_items
+                    FROM {_s.TBL_ITEMS} GROUP BY {_s.COL_ITEM_RUN_ID}
+                ) a ON a.rid = r.{_s.COL_RUN_ID}
+                ORDER BY r.{_s.COL_RUN_CREATED_AT} DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        d = dict(row)
+        if d["failed_items"] > 0:
+            d["worst_outcome_status"] = "failed"
+        elif d["degraded_items"] > 0:
+            d["worst_outcome_status"] = "degraded"
+        else:
+            d["worst_outcome_status"] = "ok"
+        click.echo(json.dumps(d))
+
+
+# ---------------------------------------------------------------------------
+# items — hosted per-item inspection (the pre-0.3.0 `runs` verbs, renamed)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def items() -> None:
+    """Inspect hosted items — one record each (list, get, stream)."""
+
+
+@items.command("list")
 @click.pass_context
-def runs_list(ctx: click.Context) -> None:
-    """List hosted runs (NDJSON, one run per line)."""
+def items_list(ctx: click.Context) -> None:
+    """List hosted items (NDJSON, one item per line)."""
     client = _make_papayya_client(ctx)
     try:
-        items = client.items.list()
+        rows = client.items.list()
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     finally:
         client.close()
 
-    for run in items:
-        click.echo(json.dumps(run))
+    for row in rows:
+        click.echo(json.dumps(row))
 
 
-@runs.command("stream")
-@click.argument("run_id")
+@items.command("get")
+@click.argument("item_id")
+@click.pass_context
+def items_get(ctx: click.Context, item_id: str) -> None:
+    """Fetch one hosted item by id."""
+    client = _make_papayya_client(ctx)
+    try:
+        row = client.items.get(item_id)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    click.echo(json.dumps(row, indent=2))
+
+
+@items.command("stream")
+@click.argument("item_id")
 @click.option(
     "--from-step",
     type=int,
@@ -1380,16 +1474,16 @@ def runs_list(ctx: click.Context) -> None:
     help="Resume from this step (use the highest step number already observed)",
 )
 @click.pass_context
-def runs_stream(ctx: click.Context, run_id: str, from_step: int | None) -> None:
-    """Tail steps for a hosted run via SSE (NDJSON output).
+def items_stream(ctx: click.Context, item_id: str, from_step: int | None) -> None:
+    """Tail steps for a hosted item via SSE (NDJSON output).
 
     Yields one JSON object per server-sent event: ``{"event": "step" |
     "terminal" | "error", "data": {...}, "id": <step_number>}``. The
-    stream exits when the run reaches a terminal status.
+    stream exits when the item reaches a terminal status.
     """
     client = _make_papayya_client(ctx)
     try:
-        for event in client.items.stream(run_id, from_step=from_step):
+        for event in client.items.stream(item_id, from_step=from_step):
             click.echo(json.dumps(event))
             sys.stdout.flush()
     except PapayyaAPIError as e:
@@ -1718,23 +1812,30 @@ def schedules_disable(ctx: click.Context, schedule_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# webhooks — outgoing webhooks per agent
+# triggers — inbound invocation hooks per agent (Plan 34: webhook → trigger;
+# webhook survives only as the transport detail). The SDK resource stays
+# `client.webhooks` until the control-pane rename (Unit 5).
 # ---------------------------------------------------------------------------
 
 @main.group()
-def webhooks() -> None:
-    """Manage outgoing webhooks (create, list, delete)."""
+def triggers() -> None:
+    """Manage triggers — inbound invocation hooks (create, list, delete).
+
+    A trigger fires a run of an agent from an HTTP call (transport:
+    signed webhook). Pre-0.3.0 spelling: `papayya webhooks` — kept as a
+    hidden alias.
+    """
 
 
-@webhooks.command("create")
-@click.option("--agent", "agent_id", required=True, help="Agent the webhook belongs to")
+@triggers.command("create")
+@click.option("--agent", "agent_id", required=True, help="Agent the trigger belongs to")
 @click.option("--name", required=True, help="Display name")
 @click.option("--description", default=None, help="Optional description")
 @click.pass_context
-def webhooks_create(
+def triggers_create(
     ctx: click.Context, agent_id: str, name: str, description: str | None
 ) -> None:
-    """Create a webhook on an agent. Returns the webhook with its signing secret."""
+    """Create a trigger on an agent. Returns the trigger with its signing secret."""
     client = _make_papayya_client(ctx)
     try:
         hook = client.webhooks.create(agent_id, name, description=description)
@@ -1747,11 +1848,11 @@ def webhooks_create(
     click.echo(json.dumps(hook, indent=2))
 
 
-@webhooks.command("list")
+@triggers.command("list")
 @click.argument("agent_id")
 @click.pass_context
-def webhooks_list(ctx: click.Context, agent_id: str) -> None:
-    """List webhooks on an agent (NDJSON)."""
+def triggers_list(ctx: click.Context, agent_id: str) -> None:
+    """List triggers on an agent (NDJSON)."""
     client = _make_papayya_client(ctx)
     try:
         hooks = client.webhooks.list(agent_id)
@@ -1765,21 +1866,33 @@ def webhooks_list(ctx: click.Context, agent_id: str) -> None:
         click.echo(json.dumps(hook))
 
 
-@webhooks.command("delete")
-@click.argument("webhook_id")
+@triggers.command("delete")
+@click.argument("trigger_id")
 @click.pass_context
-def webhooks_delete(ctx: click.Context, webhook_id: str) -> None:
-    """Delete a webhook."""
+def triggers_delete(ctx: click.Context, trigger_id: str) -> None:
+    """Delete a trigger."""
     client = _make_papayya_client(ctx)
     try:
-        client.webhooks.delete(webhook_id)
+        client.webhooks.delete(trigger_id)
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     finally:
         client.close()
 
-    click.echo(f"Webhook {webhook_id} deleted")
+    click.echo(f"Trigger {trigger_id} deleted")
+
+
+# Deprecated alias (webhook → trigger): shared command objects, hidden
+# from --help, removed one release after 0.3.0.
+webhooks = click.Group(
+    "webhooks",
+    hidden=True,
+    help="Deprecated alias of `papayya triggers` (webhook → trigger in 0.3.0).",
+)
+for _name, _cmd in triggers.commands.items():
+    webhooks.add_command(_cmd, _name)
+main.add_command(webhooks)
 
 
 # ---------------------------------------------------------------------------
@@ -2682,21 +2795,16 @@ def _iter_jsonl_items(path: str) -> Iterator[dict[str, Any]]:
                 sys.exit(1)
 
 
-@main.group()
-def batch() -> None:
-    """Submit and manage batches of runs."""
-
-
-@batch.command("submit")
+@runs.command("submit")
 @click.option("--agent", "agent_id", required=True, help="Agent ID to run each item against")
 @click.option("--file", "file_path", required=True, type=click.Path(exists=False), help="JSONL file — one item per line, e.g. {\"input\": ..., \"metadata\"?: ...}")
-@click.option("--budget", "budget_dollars", type=float, default=None, help="Total batch budget in whole dollars (converted to cents)")
-@click.option("--concurrency", "concurrency_cap", type=int, default=None, help="Max concurrent runs the dispatcher will launch")
-@click.option("--name", "name", default=None, help="Human-readable batch label")
-@click.option("--callback-url", "callback_url", default=None, help="Webhook URL invoked on terminal batch status")
+@click.option("--budget", "budget_dollars", type=float, default=None, help="Total run budget in whole dollars (converted to cents)")
+@click.option("--concurrency", "concurrency_cap", type=int, default=None, help="Max concurrent items the dispatcher will launch")
+@click.option("--name", "name", default=None, help="Human-readable run label")
+@click.option("--callback-url", "callback_url", default=None, help="Trigger URL invoked on terminal run status")
 @click.option("--idempotency-key", "idempotency_key", default=None, help="Client-supplied key to dedupe duplicate submissions")
 @click.pass_context
-def batch_submit(
+def runs_submit(
     ctx: click.Context,
     agent_id: str,
     file_path: str,
@@ -2706,16 +2814,17 @@ def batch_submit(
     callback_url: str | None,
     idempotency_key: str | None,
 ) -> None:
-    """Submit a batch of runs from a JSONL file.
+    """Submit a hosted run over the items in a JSONL file.
 
     Always uses the NDJSON streaming path — no item ceiling, only a 1 GiB
-    byte guard enforced by the backend. Prints the batch ID on success.
+    byte guard enforced by the backend. Prints the run ID on success.
+    (Pre-0.3.0 spelling: `papayya batch submit` — kept as a hidden alias.)
     """
     budget_cents_cap = int(round(budget_dollars * 100)) if budget_dollars is not None else None
 
     client = _make_papayya_client(ctx)
     try:
-        result = client.batches.create_stream(
+        result = client.runs.create_stream(
             agent_id=agent_id,
             items=_iter_jsonl_items(file_path),
             name=name,
@@ -2730,10 +2839,40 @@ def batch_submit(
     finally:
         client.close()
 
-    click.echo(f"Batch submitted: {result.get('id', '?')}")
+    click.echo(f"Run submitted: {result.get('id', '?')}")
     status_val = result.get("status")
     if status_val:
         click.echo(f"  Status: {status_val}")
     total = result.get("total_items")
     if total is not None:
         click.echo(f"  Items:  {total}")
+
+
+# Deprecated alias (Plan 34: batch → run): `papayya batch submit` keeps
+# working, hidden from --help. The command object is shared, so behavior
+# can never drift from `runs submit`.
+batch = click.Group(
+    "batch",
+    hidden=True,
+    help="Deprecated alias of `papayya runs` (batch → run in 0.3.0).",
+)
+batch.add_command(runs_submit, "submit")
+main.add_command(batch)
+
+
+# ---------------------------------------------------------------------------
+# Tiered --help (Plan 34 Unit 4). Rung-0 — the free local loop — reads
+# first, as a quickstart; hosted/ops groups sit below. Anything new that
+# isn't registered here lands in a trailing "Other commands" bucket
+# (see TieredGroup) rather than disappearing from help.
+# ---------------------------------------------------------------------------
+
+main.sections = [
+    ("Getting started", ["init", "example", "dev", "deploy", "replay", "login"]),
+    ("Run agents & inspect results",
+     ["run", "runs", "items", "status", "logs", "agents", "schedules",
+      "triggers", "triage"]),
+    ("Account & platform ops",
+     ["signup", "logout", "envs", "secrets", "projects", "project",
+      "deployments", "api-keys", "usage", "rate-card"]),
+]

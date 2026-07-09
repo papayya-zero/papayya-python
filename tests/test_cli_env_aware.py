@@ -218,7 +218,7 @@ def test_rate_card_show_uses_env_credentials(
 
 
 # ---------------------------------------------------------------------------
-# batch — via _make_papayya_client / Papayya SDK
+# runs submit — via _make_papayya_client / Papayya SDK
 # ---------------------------------------------------------------------------
 
 
@@ -231,7 +231,7 @@ class _SpyPapayya:
         self.closed = False
         _SpyPapayya.instances.append(self)
 
-        class _Batches:
+        class _Runs:
             def __init__(self) -> None:
                 self.calls: list[tuple[str, tuple, dict]] = []
 
@@ -240,13 +240,13 @@ class _SpyPapayya:
                 self.calls.append(("create_stream", (), kwargs))
                 return {"id": "b-1", "status": "queued", "total_items": 1}
 
-        self.batches = _Batches()
+        self.runs = _Runs()
 
     def close(self) -> None:
         self.closed = True
 
 
-def test_batch_submit_uses_env_credentials(
+def test_runs_submit_uses_env_credentials(
     two_env_config: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _SpyPapayya.instances.clear()
@@ -259,7 +259,7 @@ def test_batch_submit_uses_env_credentials(
     items.write_text('{"input": "x"}\n', encoding="utf-8")
 
     code, out = _invoke(
-        "--env", "staging", "batch", "submit", "--agent", "a", "--file", str(items)
+        "--env", "staging", "runs", "submit", "--agent", "a", "--file", str(items)
     )
     assert code == 0, out
     assert _SpyPapayya.instances, "Papayya client was not instantiated"
