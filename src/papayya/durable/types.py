@@ -170,6 +170,11 @@ class DurableRunConfig:
     # store's default (env PAPAYYA_PAUSE_AFTER_DEGRADED, else 3). Local/SQLite
     # only; the hosted path resolves K from per-agent config server-side.
     pause_after_degraded: int | None = None
+    # Plan 35: run-scoped custom outcome checks (three-tier entry point —
+    # module-level/session/workflow). Merged with the @agent registration's
+    # checks in PapayyaRun.init(); both run in _post_call_success alongside
+    # the built-in inspectors. None/[] means built-in inspectors only.
+    checks: list | None = None
 
 
 @dataclass

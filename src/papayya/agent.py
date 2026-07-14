@@ -190,6 +190,11 @@ class AgentRegistration:
     # synthesise the EnvSpec the reconciler consumes.
     schedules: list[ScheduleSpec] = field(default_factory=list)
     webhooks: list[WebhookSpec] = field(default_factory=list)
+    # Plan 35 — customer outcome checks (deterministic callables and/or
+    # llm_judge scaffolds). They run in the same _post_call_success pipeline
+    # as the built-in inspectors on every step this agent's runs execute; the
+    # worst verdict wins the run's worst_outcome_status. Empty by default.
+    checks: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +413,7 @@ def agent(
     agent_version: str | None = None,
     concurrency_per_key: int | None = None,
     rate_limit: str | None = None,
+    checks: list | None = None,
 ) -> Callable:
     """Decorator that registers a function as a deployable agent.
 
@@ -453,6 +459,12 @@ def agent(
             (Layer 3 #2). Format: ``"N/min"`` or ``"N/sec"``. Sliding
             window enforced server-side; uses the same bucket key as
             ``concurrency_per_key``. None disables the cap.
+        checks: Customer outcome checks (Plan 35) — deterministic callables
+            ``Callable[[result], papayya.CheckVerdict | None]`` and/or
+            :func:`papayya.llm_judge` scaffolds. They run in the same outcome
+            pipeline as the built-in inspectors on every step; the worst
+            verdict wins the run's outcome. A broken/slow check is a contained
+            pass (an observer never fails the run).
     """
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise ValueError(
@@ -677,6 +689,7 @@ def agent(
             agent_version=resolved_version,
             concurrency_per_key=concurrency_per_key,
             rate_limit_per_min=rate_limit_per_min,
+            checks=checks or [],
         )
         # Attach metadata so callers can inspect without the registry
         wrapper._papayya_agent = registration

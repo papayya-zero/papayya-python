@@ -147,6 +147,11 @@ class Item:
         # Plan 33: per-run override for the local run-level auto-pause fence
         # (None = store default). Registered with the store in init().
         self._pause_after_degraded: int | None = config.pause_after_degraded
+        # Plan 35: custom outcome checks. Config-supplied checks (run-scoped);
+        # the @agent registration's checks are merged in init(). Both run in
+        # _post_call_success alongside the built-in inspectors.
+        self._config_checks: list | None = config.checks
+        self._checks: list = []
         self._cache: dict[str, TaskEntry] = {}
         self._task_call_order: list[str] = []
         self._initialized = False
@@ -208,6 +213,19 @@ class Item:
             _setter = getattr(self._store, "set_run_fence", None)
             if callable(_setter):
                 _setter(self.run_id, self._pause_after_degraded)
+
+        # Plan 35: resolve custom outcome checks — run-scoped config checks
+        # first, then the @agent registration's checks. Resolved on both fresh
+        # and replay paths, since a step re-executed after a resume point still
+        # runs checks in _post_call_success.
+        from papayya.agent import get_agent as _get_agent
+
+        self._checks = list(self._config_checks or [])
+        _reg = _get_agent(self.agent)
+        if _reg is not None:
+            _reg_checks = getattr(_reg, "checks", None)
+            if _reg_checks:
+                self._checks.extend(_reg_checks)
 
         existing = self._store.load(self.run_id)
         if existing is not None:
@@ -678,11 +696,18 @@ class Item:
             # automatically inside the store on save_task.
             if outcomes.ENABLE_STRUCTURAL_DETECTION:
                 verdict = outcomes.inspect_result(result, usage=usage)
-                outcome_status = verdict.status
-                outcome_reason = verdict.reason
             else:
-                outcome_status = "ok"
-                outcome_reason = None
+                verdict = outcomes.OK
+            # Plan 35: fold customer checks into the same verdict — worst
+            # severity across built-in + custom wins (one pipeline, Decision 3).
+            # run_checks contains every check (a raise/timeout is a pass) and
+            # namespaces custom reasons under user: for the dashboard histogram.
+            if self._checks:
+                from papayya.checks import run_checks
+
+                verdict = run_checks(self._checks, result, verdict, self.run_id)
+            outcome_status = verdict.status
+            outcome_reason = verdict.reason
 
             # Snapshots only populate when an item_id is in effect — the
             # lineage view has no home for snapshots that aren't attached
