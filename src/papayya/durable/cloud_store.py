@@ -111,6 +111,13 @@ class CloudStore:
             timeout=config.timeout,
         )
         self._journal = LineageJournal(resolve_journal_path())
+        # Plan 33: pause reason per run_id, set from a SaveCheckpoint response
+        # whose run_status came back 'paused' (a server fence tripped). Read by
+        # PapayyaRun._pre_call at the next step boundary. Keyed by run_id so a
+        # process-shared store never leaks one run's pause onto another's steps.
+        # Journaled/offline saves never set it — degraded-mode behavior is
+        # "keep working", correct for a reliability product.
+        self._pending_pause: dict[str, str] = {}
 
     # --- public store surface ----------------------------------------- #
 
@@ -349,7 +356,30 @@ class CloudStore:
         """
         resp = self._client.request(method, url, json=payload)
         resp.raise_for_status()
+        self._note_pause_from_response(url, resp)
         return resp
+
+    def _note_pause_from_response(self, url: str, resp: httpx.Response) -> None:
+        """Record a server-signalled pause riding a SaveCheckpoint response
+        (Plan 33 Decision 2). The pause is on the save *response*, not a
+        rejection — the checkpoint was accepted. Best effort: a non-JSON or
+        unexpected body just leaves no pending pause (keep working)."""
+        if not url.endswith("/checkpoints"):
+            return
+        try:
+            body = resp.json()
+        except Exception:
+            return
+        if not isinstance(body, dict) or body.get("run_status") != "paused":
+            return
+        run_id = body.get("run_id")
+        if run_id:
+            self._pending_pause[run_id] = body.get("pause_reason") or "paused"
+
+    def pending_pause(self, run_id: str) -> str | None:
+        """The pause reason a fence set for this run, or None. Consulted by
+        PapayyaRun._pre_call before resolving the next step."""
+        return self._pending_pause.get(run_id)
 
 
 # Type-checkers want CheckpointStore conformance at the module surface,

@@ -26,10 +26,23 @@ class CreditExhausted(Exception):
     pass
 
 
-class BudgetExceeded(Exception):
-    """Raised when a run exceeds its per-run budget cap.
+class WorkloadPaused(Exception):
+    """Raised at a step boundary when a fence has paused the run (Plan 33).
 
-    Enforced at the control-plane side (InsertStep) and, when enabled,
-    proactively by the shim interceptor via pre-call reservations.
+    The system stopped spending on your behalf — a degraded-output streak, a
+    budget breach, or a workload-level degraded-rate threshold — after the
+    just-completed step was safely checkpointed. This is not a failure: the
+    run's server-side (or local) status is ``paused``, in-flight work is
+    preserved, and an operator resume + replay picks up exactly where the
+    pause landed. Named and catchable so a customer body can special-case it
+    (e.g. log and exit cleanly) instead of treating it as a crash.
+
+    ``reason`` carries the trigger detail ("3 consecutive degraded steps:
+    llm_empty_content", "budget", "11 of last 20 runs degraded"); ``run_id``
+    is the paused run.
     """
-    pass
+
+    def __init__(self, reason: str, run_id: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.run_id = run_id

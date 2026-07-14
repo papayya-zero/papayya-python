@@ -50,6 +50,17 @@ def _capture_enabled() -> bool:
     return os.environ.get("PAPAYYA_LOCAL_CAPTURE_V2", "true").lower() != "false"
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env knob, falling back to default on unset/garbage."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _single_run_id(item_id: str) -> str:
     """Sentinel run ID for the implicit run-of-one around a direct call.
 
@@ -717,6 +728,77 @@ class SQLiteStore:
         self._conn.execute("PRAGMA journal_mode=DELETE")
         _init_schema(self._conn, db_file)
 
+        # Plan 33 local fences (Decision 6) — so `papayya dev` demos auto-pause
+        # with zero cloud dependency. Run-level: pause after K consecutive
+        # degraded steps (env override wins; else the per-run kwarg via
+        # set_run_fence; else 3; 0 disables). Workload-level: pause the agent
+        # when >= Pct% of its last Window terminal items degraded, with a
+        # MinDegraded floor. State lives in memory — a local demo, not a
+        # durable control plane; a process restart clears it.
+        self._pending_pause: dict[str, str] = {}    # run_id (item) -> reason
+        self._workload_paused: dict[str, str] = {}  # agent -> reason
+        self._run_fence: dict[str, int] = {}        # run_id -> K override
+        _env_k = os.environ.get("PAPAYYA_PAUSE_AFTER_DEGRADED")
+        self._env_pause_after_degraded: int | None = (
+            _env_int("PAPAYYA_PAUSE_AFTER_DEGRADED", 3) if _env_k not in (None, "") else None
+        )
+        self._workload_pause_pct = _env_int("PAPAYYA_WORKLOAD_PAUSE_PCT", 50)
+        self._workload_pause_window = _env_int("PAPAYYA_WORKLOAD_PAUSE_WINDOW", 20)
+        self._workload_pause_min = _env_int("PAPAYYA_WORKLOAD_PAUSE_MIN_DEGRADED", 5)
+
+    # --- Plan 33 auto-pause fences (local parity, Decision 6) ---
+
+    def set_run_fence(self, run_id: str, pause_after_degraded: int) -> None:
+        """Register a per-run run-level K (from DurableRunConfig). The env
+        override, when set, still wins over this."""
+        self._run_fence[run_id] = pause_after_degraded
+
+    def _resolve_k(self, run_id: str) -> int:
+        if self._env_pause_after_degraded is not None:
+            return self._env_pause_after_degraded
+        return self._run_fence.get(run_id, 3)
+
+    def pending_pause(self, run_id: str) -> str | None:
+        """Run-level pause reason for this item, or None. Read by
+        PapayyaRun._pre_call before the next step."""
+        return self._pending_pause.get(run_id)
+
+    def clear_pending_pause(self, run_id: str) -> None:
+        """Clear a run-level pause — the local resume surface for a paused run.
+        After clearing, a replay of the same run_id skips saved steps and
+        continues from exactly where the pause landed."""
+        self._pending_pause.pop(run_id, None)
+
+    def workload_paused(self, agent: str) -> str | None:
+        """Workload-level pause reason for this agent, or None. Read by
+        iter/map before minting the next item's run."""
+        return self._workload_paused.get(agent)
+
+    def resume_workload(self, agent: str) -> None:
+        """Clear the workload-level pause — the local resume surface."""
+        self._workload_paused.pop(agent, None)
+
+    def _evaluate_workload_fence(self, agent: str | None) -> None:
+        """Pause the agent if its recent terminal items degraded past the
+        threshold. Called on each item completion; idempotent once paused."""
+        if agent is None or agent in self._workload_paused:
+            return
+        rows = self._conn.execute(
+            f"SELECT {_schema.COL_ITEM_WORST_OUTCOME_STATUS} AS w "
+            f"FROM {_schema.TBL_ITEMS} "
+            f"WHERE {_schema.COL_ITEM_AGENT} = ? "
+            f"  AND {_schema.COL_ITEM_STATUS} IN ('completed', 'failed') "
+            f"ORDER BY {_schema.COL_ITEM_CREATED_AT} DESC LIMIT ?",
+            (agent, self._workload_pause_window),
+        ).fetchall()
+        total = len(rows)
+        degraded = sum(1 for r in rows if r["w"] != "ok")
+        if total == 0 or degraded < self._workload_pause_min:
+            return
+        if degraded * 100 < self._workload_pause_pct * total:
+            return
+        self._workload_paused[agent] = f"{degraded} of last {total} runs degraded"
+
     # --- CheckpointStore protocol ---
     #
     # Protocol note: the ``run_id`` parameter below is the shared
@@ -886,6 +968,22 @@ class SQLiteStore:
                            WHERE {_schema.COL_ITEM_ID} = ?""",
                         (next_status, next_count, run_id),
                     )
+            # Plan 33 local run-level fence: pause after K consecutive degraded
+            # steps. A streak can only complete on a non-ok step, so only check
+            # then; the last K step rows by id are this run's most recent steps
+            # (save_task is INSERT-only). Sets pending_pause — PapayyaRun._pre_call
+            # raises WorkloadPaused before the next step. Once set, don't recompute.
+            k = self._resolve_k(run_id)
+            if k > 0 and entry.outcome_status != "ok" and run_id not in self._pending_pause:
+                recent = self._conn.execute(
+                    f"SELECT {_schema.COL_STEP_OUTCOME_STATUS} AS s "
+                    f"FROM {_schema.TBL_STEPS} WHERE {_schema.COL_STEP_ITEM_ID} = ? "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (run_id, k),
+                ).fetchall()
+                if len(recent) == k and all(r["s"] != "ok" for r in recent):
+                    detail = entry.outcome_reason or entry.outcome_status
+                    self._pending_pause[run_id] = f"{k} consecutive degraded steps: {detail}"
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
         """Transition an item's status, and roll up terminal counts to its run."""
@@ -893,7 +991,7 @@ class SQLiteStore:
         # Capture prior status before we overwrite it — used below to decide
         # whether this transition bumps a run counter.
         row = self._conn.execute(
-            f"SELECT status, {_schema.COL_ITEM_RUN_ID} AS run_id "
+            f"SELECT status, {_schema.COL_ITEM_RUN_ID} AS run_id, {_schema.COL_ITEM_AGENT} AS agent "
             f"FROM {_schema.TBL_ITEMS} WHERE {_schema.COL_ITEM_ID} = ?",
             (run_id,),
         ).fetchone()
@@ -954,6 +1052,11 @@ class SQLiteStore:
                 # re-check and promote if so. No-op when the run is still
                 # running or is already in a different terminal state.
                 _promote_partial_if_drained(self._conn, row["run_id"], now)
+                # Plan 33 local workload-level fence: this item just reached a
+                # terminal state, so re-check the agent's recent degraded rate.
+                # Enforced at the next run-open in iter/map, which reads
+                # workload_paused before minting the next item's run.
+                self._evaluate_workload_fence(row["agent"])
 
     def create(self, checkpoint: RunCheckpoint) -> None:
         """Create an item row.

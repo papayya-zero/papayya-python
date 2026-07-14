@@ -5,7 +5,7 @@ from papayya.papayya import Papayya
 from papayya.client import Client, RunResult
 from papayya.tools import tool
 from papayya.durable import papayya, Item, PapayyaRun
-from papayya.errors import CreditExhausted, BudgetExceeded
+from papayya.errors import CreditExhausted, WorkloadPaused
 from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 
 # Plan 10: wrapper-shaped adoption surface. Import deferred until first
@@ -54,7 +54,7 @@ __all__ = [
     "schedule", "trigger",
     "Papayya", "Client", "RunResult",
     "papayya", "Item", "PapayyaRun",
-    "CreditExhausted", "BudgetExceeded",
+    "CreditExhausted", "WorkloadPaused",
     "is_credit_exhaustion_error", "classify_provider_error",
     "iter", "map", "mark_degraded", "mark_outcome",
     "llm", "step", "active_item", "active_run_id",

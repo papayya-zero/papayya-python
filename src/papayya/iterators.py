@@ -19,6 +19,7 @@ import builtins
 import functools
 import inspect
 import logging
+import sys
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -26,7 +27,15 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from papayya.durable import Item, PapayyaRun
 from papayya.durable.types import DurableRunConfig, TaskEntry
+from papayya.errors import CreditExhausted, WorkloadPaused
 from papayya.outcomes import OutcomeVerdict
+
+# Plan 33: signals that mean "stop spending, work preserved" — NOT body
+# failures. The ambient lifecycle must let these propagate untouched: no
+# synthetic failed entry, no run.fail() terminal flip. The run's status
+# (paused server-side/locally; provider-stop for credit) is the record; a
+# terminal flip would falsify both the status and the audit trail.
+_PASS_THROUGH_SIGNALS = (WorkloadPaused, CreditExhausted)
 
 log = logging.getLogger("papayya.iter")
 
@@ -200,6 +209,17 @@ def _iter_gen(
         # uses iteration protocol, so this is defense-in-depth — anything
         # that accepts Iterable[T] is fine.
         for item in builtins.iter(items):
+            # Plan 33 local workload-level fence (Decision 6): if a prior item
+            # tripped the agent's degraded-rate threshold, stop before minting
+            # this item's run. Completed items stay intact, remaining items are
+            # never started — the pause covenant, locally. Raised here (before
+            # the run is created and before the yield's try/except), so it
+            # propagates cleanly without a synthetic failed entry.
+            _wp = getattr(resolved_store, "workload_paused", None)
+            if callable(_wp):
+                _reason = _wp(agent)
+                if _reason is not None:
+                    raise WorkloadPaused(_reason, invocation_id or agent)
             run = Item(
                 DurableRunConfig(
                     agent=agent,
@@ -225,6 +245,15 @@ def _iter_gen(
                 try:
                     yield item
                 except BaseException:
+                    # Plan 33: exempt pause/credit signals. The body's original
+                    # exception isn't handed to us (see below), but during the
+                    # unwind it is the currently-propagating exception, so
+                    # sys.exc_info() surfaces it best-effort. When it's a
+                    # WorkloadPaused/CreditExhausted, re-raise without flipping
+                    # this item to failed — the run is paused, not failed.
+                    _propagating = sys.exc_info()[1]
+                    if isinstance(_propagating, _PASS_THROUGH_SIGNALS):
+                        raise
                     # When the for-loop body raises, Python sends
                     # ``GeneratorExit`` into the suspended yield as part of
                     # generator cleanup — the original exception propagates
@@ -405,6 +434,12 @@ def drive_ambient_sync(
     try:
         try:
             result = body()
+        except _PASS_THROUGH_SIGNALS:
+            # Plan 33: pause/credit signals are not body failures — propagate
+            # untouched. No synthetic 'agent_body_exception' entry, no
+            # run.fail(): the run's status (paused / provider-stop) is the
+            # record, and a terminal flip would falsify it and the audit trail.
+            raise
         except BaseException as exc:
             if iso.run is not None and own_completion:
                 _write_synthetic_entry(iso.run, OutcomeVerdict("failed", "agent_body_exception"))
@@ -438,6 +473,10 @@ async def drive_ambient_async(
     try:
         try:
             result = await body()
+        except _PASS_THROUGH_SIGNALS:
+            # Plan 33 — see drive_ambient_sync: pause/credit signals propagate
+            # untouched, no synthetic failed entry, no run.fail() terminal flip.
+            raise
         except BaseException as exc:
             if iso.run is not None and own_completion:
                 _write_synthetic_entry(iso.run, OutcomeVerdict("failed", "agent_body_exception"))

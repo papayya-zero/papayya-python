@@ -20,7 +20,7 @@ from typing import Any, Callable, TypeVar, overload
 from papayya import outcomes
 from papayya._serialize import build_input_snapshot
 from papayya.classify import classify_provider_error
-from papayya.errors import CreditExhausted
+from papayya.errors import CreditExhausted, WorkloadPaused
 from papayya.llm_extract import LlmUsage, extract_llm_usage
 from papayya.runtime_context import get_current_reporter
 
@@ -81,6 +81,24 @@ def _label_for_warning(label_or_fn: Any, fn: Any) -> str:
     return "<unknown>"
 
 
+def _store_pending_pause(store: Any, run_id: str) -> str | None:
+    """Ask the store whether a fence has paused this run (Plan 33).
+
+    Duck-typed on ``pending_pause(run_id)`` so the check stays store-agnostic:
+    CloudStore sets it from the SaveCheckpoint response, SQLiteStore from its
+    local run-level fence, and stores without the method (MemoryStore) never
+    pause. Any error reading it is swallowed — telemetry must never crash a
+    step, and a reliability product keeps working under a flaky signal.
+    """
+    fn = getattr(store, "pending_pause", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(run_id)
+    except Exception:
+        return None
+
+
 class Item:
     """A durable per-item record that wraps functions as checkpoint-able steps.
 
@@ -126,6 +144,9 @@ class Item:
         # (the store wraps those in an implicit run-of-one at create time).
         self._invocation_id: str | None = config.invocation_id
         self._store: CheckpointStore = config.store or MemoryStore()
+        # Plan 33: per-run override for the local run-level auto-pause fence
+        # (None = store default). Registered with the store in init().
+        self._pause_after_degraded: int | None = config.pause_after_degraded
         self._cache: dict[str, TaskEntry] = {}
         self._task_call_order: list[str] = []
         self._initialized = False
@@ -179,6 +200,14 @@ class Item:
         if self._initialized:
             return
         self._initialized = True
+
+        # Plan 33: register the per-run fence threshold with a store that
+        # supports it (local SQLite). Duck-typed so cloud/memory stores, whose
+        # K is server-side or absent, are unaffected.
+        if self._pause_after_degraded is not None:
+            _setter = getattr(self._store, "set_run_fence", None)
+            if callable(_setter):
+                _setter(self.run_id, self._pause_after_degraded)
 
         existing = self._store.load(self.run_id)
         if existing is not None:
@@ -501,6 +530,18 @@ class Item:
             """
             self.init()
             self._throw_if_finished()
+
+            # Plan 33: a fence may have paused this run on the previous save
+            # (server-signalled for the cloud store, locally-evaluated for
+            # SQLite). The just-completed step is already checkpointed; stop
+            # here before starting the next one. Raising a named, catchable
+            # exception unwinds the body cleanly; on resume, replay skips every
+            # saved step and picks up exactly here. Store-agnostic: any store
+            # exposing pending_pause(run_id) participates; those that don't
+            # (MemoryStore) simply never pause.
+            _pending = _store_pending_pause(self._store, self.run_id)
+            if _pending is not None:
+                raise WorkloadPaused(_pending, self.run_id)
 
             # Each call consumes an occurrence of the bare label: call 1
             # keys the clean label, call N keys "label#N". Cache hits

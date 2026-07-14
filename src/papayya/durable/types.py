@@ -165,6 +165,11 @@ class DurableRunConfig:
     # None for direct calls — the store wraps those in an implicit
     # run-of-one. See RunCheckpoint.invocation_id for the naming note.
     invocation_id: str | None = None
+    # Plan 33 (Decision 6): per-run override for the local run-level auto-pause
+    # fence — pause after this many consecutive degraded steps. None leaves the
+    # store's default (env PAPAYYA_PAUSE_AFTER_DEGRADED, else 3). Local/SQLite
+    # only; the hosted path resolves K from per-agent config server-side.
+    pause_after_degraded: int | None = None
 
 
 @dataclass
