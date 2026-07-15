@@ -163,6 +163,23 @@ class Items:
         ``cancelled``. 409 if the run is not currently in quarantine."""
         return self._api._request("POST", f"/v1/durable/runs/{run_id}/discard")
 
+    # Auto-pause (Plan 33) — the system-initiated counterpart to the
+    # operator-initiated quarantine lane above. A run a degradation/budget
+    # fence paused is resumed here; replay skips already-saved steps.
+
+    def resume(self, run_id: str) -> dict[str, Any]:
+        """Resume a run auto-paused by a degradation/budget fence (Plan 33).
+        paused→running; replay picks up exactly where the pause landed. 409 if
+        the run is not paused."""
+        return self._api._request("POST", f"/v1/durable/runs/{run_id}/resume")
+
+    def clusters(self, partition_key: str | None = None) -> dict[str, Any]:
+        """Degraded/failed runs grouped by (reason, prompt-prefix) — the
+        silent-failure clustering the dashboard's failure view renders.
+        Optional ``partition_key`` narrows to one tenant."""
+        params = {"partition_key": partition_key} if partition_key else {}
+        return self._api._request("GET", "/v1/durable/runs/clusters", params=params)
+
 
 def _parse_sse(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
     """Parse the SSE wire format into ``{event, data, id?}`` dicts.
