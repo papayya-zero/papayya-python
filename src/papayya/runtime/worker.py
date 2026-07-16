@@ -367,9 +367,18 @@ class Worker:
         # it can't shadow the selected store.
         os.environ.pop("PAPAYYA_API_KEY", None)
         if self._durable_api_base is not None:
+            # make_runtime_store() wants the control-plane ROOT (it appends
+            # the /v1/runtime/runs path itself), so strip the WHOLE
+            # /v1/runtime prefix off dispatcher_url — NOT just /runtime.
+            # Leaving a stray /v1 makes httpx concatenate a doubled
+            # /v1/v1/runtime/... path that 404s every checkpoint write
+            # (Plan 37 Unit 1 regression). Fall back to stripping a bare
+            # /runtime for a non-versioned dispatcher prefix.
             runtime_store_base = self.dispatcher_url
-            if runtime_store_base.endswith("/runtime"):
-                runtime_store_base = runtime_store_base[: -len("/runtime")]
+            for suffix in ("/v1/runtime", "/runtime"):
+                if runtime_store_base.endswith(suffix):
+                    runtime_store_base = runtime_store_base[: -len(suffix)]
+                    break
             os.environ["PAPAYYA_RUNTIME_STORE_BASE"] = runtime_store_base
             if self._api_key:
                 os.environ["PAPAYYA_PLATFORM_WORKER_KEY"] = self._api_key

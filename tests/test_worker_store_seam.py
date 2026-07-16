@@ -61,7 +61,9 @@ def test_hosted_worker_seam_selects_runtime_store():
         os.environ["PAPAYYA_API_KEY"] = "cpk_stray"  # must not survive
         _make_worker("http://control-pane-api:8090/v1/runtime")
 
-        assert os.environ["PAPAYYA_RUNTIME_STORE_BASE"] == "http://control-pane-api:8090/v1"
+        # The ROOT, not …/v1 — make_runtime_store() re-adds the /v1/runtime
+        # path, so leaving a stray /v1 here doubles it into /v1/v1 (Plan 37).
+        assert os.environ["PAPAYYA_RUNTIME_STORE_BASE"] == "http://control-pane-api:8090"
         assert os.environ["PAPAYYA_PLATFORM_WORKER_KEY"] == "plat-secret"
         assert "PAPAYYA_LOCAL_DB_PATH" not in os.environ
         assert "PAPAYYA_API_KEY" not in os.environ  # popped so it can't shadow
@@ -71,6 +73,19 @@ def test_hosted_worker_seam_selects_runtime_store():
         store = Papayya()._auto_store()
         assert isinstance(store, CloudStore)
         assert store._runs_base == "/v1/runtime/runs"
+
+        # Cross the seam: compose the base_url the worker actually wired up
+        # with the store's route and assert the request hits the REAL
+        # control-plane path — no doubled /v1. This is the assertion the
+        # original tests lacked: they checked the env var and _runs_base in
+        # isolation, so the /v1/v1 404 slipped through green (Plan 37 Unit 1).
+        req = store._client.build_request(
+            "POST", f"{store._runs_base}/run-1/checkpoints"
+        )
+        assert (
+            str(req.url)
+            == "http://control-pane-api:8090/v1/runtime/runs/run-1/checkpoints"
+        )
 
 
 def test_local_worker_seam_keeps_sqlite():
