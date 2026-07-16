@@ -14,6 +14,13 @@ from click.testing import CliRunner
 from papayya import cli as cli_module
 from papayya._demo import LOCAL_DEMO_AGENT_SOURCE
 
+# Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
+# CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
+# file is skipped rather than deleted — unskip when the local surface is revived.
+import pytest as _pytest
+pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
+
+
 
 def test_example_scaffolds_file(tmp_path: Path) -> None:
     runner = CliRunner()

@@ -20,6 +20,13 @@ import papayya
 from papayya import cli as cli_module
 from papayya.durable import _schema
 from papayya.durable._replay import ReplayError, replay_slice
+
+# Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
+# CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
+# file is skipped rather than deleted — unskip when the local surface is revived.
+import pytest as _pytest
+pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
+
 from papayya.durable.sqlite_store import SQLiteStore
 
 

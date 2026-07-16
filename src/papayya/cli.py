@@ -296,7 +296,10 @@ def init() -> None:
 # example
 # ---------------------------------------------------------------------------
 
-@main.command()
+# Plan 37: `papayya example` scaffolds a KEYLESS `python agent.py` demo — the
+# "second app" onboarding. DEACTIVATED (standalone, not registered on `main`)
+# until the cloud-first deploy→run scaffold replaces it; body retained.
+@click.command()
 @click.option(
     "--print",
     "print_only",
@@ -1025,7 +1028,11 @@ def _print_apply_result(result, *, api_base_url: str) -> None:
         click.echo(f"\nApplied {result.applied} of {result.total} operations.")
 
 
-@main.command()
+# Plan 37: `papayya dev` (the local SQLite dashboard) is DEACTIVATED — the
+# dashboard is the Next.js app pointed at a control-plane. Detached from
+# `main` (standalone command, not registered) so `papayya dev` is unknown;
+# body retained for self-host / revival.
+@click.command()
 @click.option("--port", default=8585, help="Port for the dev dashboard")
 @click.option("--host", default="127.0.0.1", help="Host to bind to")
 @click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
@@ -1364,7 +1371,11 @@ def runs() -> None:
     """
 
 
-@runs.command("list")
+# Plan 37: `papayya runs list` reads the local SQLite ledger — DEACTIVATED
+# (standalone, not registered on the `runs` group). The cloud equivalent
+# (SDK Runs.list over GET /v1/durable/runs) is the follow-up wiring; body
+# retained.
+@click.command("list")
 @click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
               help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
 @click.option("--limit", type=int, default=50, show_default=True,
@@ -2134,7 +2145,10 @@ def usage_breakdown(ctx: click.Context, from_date: str | None, to_date: str | No
         click.echo(json.dumps(row))
 
 
-@main.group()
+# Plan 37: the `project` group manages the LOCAL project history (export /
+# import of the SQLite ledger) — DEACTIVATED. Not registered on `main`; the
+# group + its export/import subcommands are retained for revival.
+@click.group()
 def project() -> None:
     """Manage local project history (export, import)."""
 
@@ -2867,12 +2881,14 @@ main.add_command(batch)
 # (see TieredGroup) rather than disappearing from help.
 # ---------------------------------------------------------------------------
 
+# Plan 37: `example`, `dev`, and `project` (local ledger export/import) are
+# deactivated local surfaces — dropped from the help tiers.
 main.sections = [
-    ("Getting started", ["init", "example", "dev", "deploy", "replay", "login"]),
+    ("Getting started", ["init", "deploy", "replay", "login"]),
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
       "triggers", "triage"]),
     ("Account & platform ops",
-     ["signup", "logout", "envs", "secrets", "projects", "project",
+     ["signup", "logout", "envs", "secrets", "projects",
       "deployments", "api-keys", "usage", "rate-card"]),
 ]

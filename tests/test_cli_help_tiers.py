@@ -34,7 +34,8 @@ def test_rung_zero_commands_lead() -> None:
     result = _help()
     out = result.output
     started = out[out.index("Getting started:"):out.index("Run agents & inspect results:")]
-    for cmd in ("init", "example", "dev", "deploy", "replay", "login"):
+    # Plan 37: `example` + `dev` deactivated (local surface hidden).
+    for cmd in ("init", "deploy", "replay", "login"):
         assert re.search(rf"^  {cmd}\b", started, flags=re.M), f"{cmd} missing from Getting started"
     # Ops commands must NOT be in the first section.
     for cmd in ("envs", "secrets", "rate-card", "usage"):
@@ -45,7 +46,8 @@ def test_ops_groups_listed_below() -> None:
     result = _help()
     out = result.output
     ops = out[out.index("Account & platform ops:"):]
-    for cmd in ("envs", "secrets", "projects", "project", "deployments",
+    # Plan 37: `project` (local ledger export/import) deactivated.
+    for cmd in ("envs", "secrets", "projects", "deployments",
                 "api-keys", "usage", "rate-card"):
         assert re.search(rf"^  {cmd}\b", ops, flags=re.M), f"{cmd} missing from ops tier"
 

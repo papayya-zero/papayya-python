@@ -50,7 +50,7 @@ from papayya._config import (
     load_yaml,
 )
 from papayya._defaults import DEFAULT_BASE_URL
-from papayya.api import APIClient, resolve_config
+from papayya.api import APIClient, PapayyaAPIError, resolve_config
 from papayya.resources.agents import Agents
 from papayya.resources.api_keys import ApiKeys
 from papayya.resources.deployments import Deployments
@@ -200,7 +200,17 @@ class Papayya:
              including the per-step token/cost trace — from the first run.
           2. CloudStore — when a real ``cpk_`` project key is resolvable
              (non-worker in-process clients).
-          3. SQLiteStore — local dev fallback (removed in Plan 37 Unit 4).
+          3. SQLiteStore — ONLY when an explicit ``PAPAYYA_LOCAL_DB_PATH`` is
+             set. This is internal plumbing (the test harness + the retired
+             local worker path), NOT a product surface: local dev is
+             deactivated (Plan 37) — `papayya dev`, the keyless demo, and
+             `map`/`iter` are all hidden — so nothing user-facing sets this.
+
+        With none of the above resolvable the keyless local default is GONE
+        (Plan 37): rather than silently writing to ``.papayya/local.db`` — the
+        "second app" whose drift was the whole reason to collapse — this
+        raises so work can only land on a control-plane (cloud or the
+        docker-compose stack).
         """
         from papayya.durable.cloud_store import CloudStore, CloudStoreConfig
         from papayya.durable.sqlite_store import SQLiteStore
@@ -221,7 +231,11 @@ class Papayya:
         db_path = os.environ.get("PAPAYYA_LOCAL_DB_PATH")
         if db_path:
             return SQLiteStore(db_path)
-        return SQLiteStore()
+        raise PapayyaAPIError(
+            401,
+            "No API key resolvable and local dev is deactivated. Set "
+            "PAPAYYA_API_KEY (cloud) or run against the docker-compose stack.",
+        )
 
     # --- durable runtime ---------------------------------------------- #
 

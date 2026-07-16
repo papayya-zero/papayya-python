@@ -18,11 +18,16 @@ from papayya.checks import CheckVerdict, llm_judge
 # level name is ``papayya.iter``.
 
 def __getattr__(name: str):
-    if name in ("iter", "map", "mark_degraded", "mark_outcome", "llm", "step",
+    # Plan 37: local in-process fan-out (`papayya.iter` / `papayya.map`) is
+    # DEACTIVATED — it drove the keyless "second app" whose drift we're
+    # collapsing. The functions still live in papayya.iterators (retained for
+    # self-host / revival, and imported directly by their own tests), they're
+    # just no longer part of the public surface. The AMBIENT verbs below stay
+    # exported: they run INSIDE worker-executed @agent code (fed by
+    # _AMBIENT_ISOLATE, not iter/map) and are core to the cloud path.
+    if name in ("mark_degraded", "mark_outcome", "llm", "step",
                 "active_item", "active_run_id"):
         from papayya.iterators import (
-            iter as _iter,
-            map as _map,
             mark_degraded as _mark_degraded,
             mark_outcome as _mark_outcome,
             llm as _llm,
@@ -31,8 +36,6 @@ def __getattr__(name: str):
             active_run_id as _active_run_id,
         )
         return {
-            "iter": _iter,
-            "map": _map,
             "mark_degraded": _mark_degraded,
             "mark_outcome": _mark_outcome,
             "llm": _llm,
@@ -58,6 +61,7 @@ __all__ = [
     "CreditExhausted", "WorkloadPaused",
     "is_credit_exhaustion_error", "classify_provider_error",
     "CheckVerdict", "llm_judge",
-    "iter", "map", "mark_degraded", "mark_outcome",
+    # iter/map deactivated (Plan 37) — see __getattr__.
+    "mark_degraded", "mark_outcome",
     "llm", "step", "active_item", "active_run_id",
 ]

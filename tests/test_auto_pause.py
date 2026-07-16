@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 import papayya
+from papayya import iterators  # Plan 37: iter/map deactivated on the public surface; test the retained internals
 from papayya import WorkloadPaused, CreditExhausted
 from papayya.durable import _schema
 from papayya.durable.run import Item
@@ -157,7 +158,7 @@ def test_map_pauses_at_item_boundary(tmp_path, monkeypatch):
             return item
 
         with pytest.raises(WorkloadPaused):
-            papayya.map(process, list(range(10)), agent="wl",
+            iterators.map(process, list(range(10)), agent="wl",
                         item_id=str, partition_key=lambda x: "t", store=store)
 
         # Trips after the 3rd degraded item completes; the 4th item's run is
@@ -194,6 +195,8 @@ def _step_reasons_and_item_statuses(db_path):
 
 def test_ambient_workload_paused_not_flipped_to_failed(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # auto-resolved store lands under tmp_path/.papayya
+    # Plan 37: keyless silent-SQLite default removed — resolve the store path.
+    monkeypatch.setenv("PAPAYYA_LOCAL_DB_PATH", str(tmp_path / ".papayya" / "local.db"))
 
     def body():
         papayya.mark_degraded("some_reason")  # mints the isolate run
@@ -209,6 +212,8 @@ def test_ambient_workload_paused_not_flipped_to_failed(tmp_path, monkeypatch):
 
 def test_ambient_credit_exhausted_also_exempt(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    # Plan 37: keyless silent-SQLite default removed — resolve the store path.
+    monkeypatch.setenv("PAPAYYA_LOCAL_DB_PATH", str(tmp_path / ".papayya" / "local.db"))
 
     def body():
         papayya.mark_degraded("some_reason")
@@ -226,6 +231,10 @@ def test_ambient_normal_exception_still_flips_to_failed(tmp_path, monkeypatch):
     # Control: the exemption is targeted — an ordinary body exception STILL
     # writes the synthetic entry and fails the run.
     monkeypatch.chdir(tmp_path)
+    # Plan 37: the keyless silent-SQLite default is gone; the ambient run's
+    # store must be resolved explicitly. Point it at the same ledger path the
+    # assertion below reads.
+    monkeypatch.setenv("PAPAYYA_LOCAL_DB_PATH", str(tmp_path / ".papayya" / "local.db"))
 
     def body():
         papayya.mark_degraded("some_reason")

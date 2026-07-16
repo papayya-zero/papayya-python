@@ -13,6 +13,7 @@ import asyncio
 import inspect
 
 import papayya
+from papayya import iterators  # Plan 37: iter/map deactivated on the public surface; test the retained internals
 from papayya.durable.sqlite_store import SQLiteStore
 
 
@@ -37,7 +38,7 @@ def _ok(text):
 
 def _drive(call, item, store):
     rid = None
-    for it in papayya.iter(
+    for it in iterators.iter(
         [item],
         workload="w",
         item_id=lambda i: i["id"],
@@ -107,7 +108,7 @@ def test_leaf_async_llm_detects_degraded_and_stays_a_coroutine(tmp_path):
         assert inspect.iscoroutinefunction(acall)
 
         rid = None
-        for it in papayya.iter(
+        for it in iterators.iter(
             [{"id": "a", "t": "acme"}],
             workload="w",
             item_id=lambda i: i["id"],
@@ -135,7 +136,7 @@ def test_leaf_multiple_calls_per_item_are_distinct_steps(tmp_path):
     try:
         decorated = papayya.llm(_ok)
         rid = None
-        for it in papayya.iter(
+        for it in iterators.iter(
             [{"id": "a", "t": "acme"}],
             workload="w",
             item_id=lambda i: i["id"],

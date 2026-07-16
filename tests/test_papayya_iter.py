@@ -23,6 +23,13 @@ import pytest
 
 import papayya
 from papayya import iterators
+
+# Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
+# CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
+# file is skipped rather than deleted — unskip when the local surface is revived.
+import pytest as _pytest
+pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
+
 from papayya.durable import PapayyaRun
 from papayya.durable.sqlite_store import SQLiteStore
 from papayya.durable.types import DurableRunConfig

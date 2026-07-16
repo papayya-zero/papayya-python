@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 import papayya
+from papayya import iterators  # Plan 37: iter/map deactivated on the public surface; test the retained internals
 from papayya.durable.sqlite_store import SQLiteStore
 
 
@@ -87,7 +88,7 @@ def test_map_composes_one_run_per_item_with_attribution(db):
         {"id": "co_1", "name": "Stripe", "tenant": "t1"},
         {"id": "co_2", "name": "Vercel", "tenant": "t2"},
     ]
-    out = papayya.map(
+    out = iterators.map(
         enrich, companies,
         item_id=lambda c: c["id"],
         partition_key=lambda c: c["tenant"],
