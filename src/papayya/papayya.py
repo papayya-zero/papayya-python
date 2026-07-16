@@ -191,11 +191,26 @@ class Papayya:
     def _auto_store(self) -> Any:
         """Auto-select a CheckpointStore for durable runs.
 
-        CloudStore when an API key is resolvable, SQLiteStore otherwise.
-        Mirrors the legacy `papayya.durable.client._auto_store` shape.
+        Selection order:
+          1. Runtime store — when the hosted worker set
+             ``PAPAYYA_RUNTIME_STORE_BASE`` + ``PAPAYYA_PLATFORM_WORKER_KEY``.
+             Customer @agent code running in-process on the worker pool writes
+             its checkpoints through the platform-authed ``/v1/runtime`` lane
+             (Plan 37 Unit 1), so hosted runs are visible in the dashboard —
+             including the per-step token/cost trace — from the first run.
+          2. CloudStore — when a real ``cpk_`` project key is resolvable
+             (non-worker in-process clients).
+          3. SQLiteStore — local dev fallback (removed in Plan 37 Unit 4).
         """
         from papayya.durable.cloud_store import CloudStore, CloudStoreConfig
         from papayya.durable.sqlite_store import SQLiteStore
+
+        runtime_base = os.environ.get("PAPAYYA_RUNTIME_STORE_BASE")
+        runtime_key = os.environ.get("PAPAYYA_PLATFORM_WORKER_KEY")
+        if runtime_base and runtime_key:
+            from papayya.durable.cloud_store import make_runtime_store
+
+            return make_runtime_store(runtime_base, runtime_key)
 
         resolved_key = _resolve_durable_api_key(self._api_key)
         if resolved_key:

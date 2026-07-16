@@ -348,13 +348,34 @@ class Worker:
             rss_percent_provider or _default_rss_percent_provider
         )
 
-        # Point the customer's papayya() client at our shared SQLite. Must be
-        # set BEFORE importing the agent module — the customer code may
-        # call `papayya()` at module top-level (rare but legal).
-        os.environ["PAPAYYA_LOCAL_DB_PATH"] = store_path
-        # Ensure CloudStore isn't picked up if a stray PAPAYYA_API_KEY is in
-        # env from the parent shell.
+        # Point the customer's in-process papayya() client at the right
+        # CheckpointStore BEFORE importing the agent module (customer code may
+        # call papayya() at module top-level). Two modes:
+        #
+        #   Hosted worker pool (dispatcher_url carries the /v1/runtime prefix,
+        #   so _durable_api_base is set) → the platform-authed runtime lane.
+        #   Every checkpoint — including the per-step token/cost trace — is
+        #   POSTed to /v1/runtime/runs/{id}/checkpoints with the shared
+        #   platform worker key, so hosted runs are visible in the dashboard
+        #   from the first run (Plan 37 Unit 1). The control-plane resolves
+        #   the tenant off the pre-created run row.
+        #
+        #   Local prototype (LocalDispatcher, no /runtime prefix) → worker-
+        #   local SQLite, kept until Plan 37 Unit 4 removes SQLite.
+        #
+        # A stray PAPAYYA_API_KEY from the parent shell is popped either way so
+        # it can't shadow the selected store.
         os.environ.pop("PAPAYYA_API_KEY", None)
+        if self._durable_api_base is not None:
+            runtime_store_base = self.dispatcher_url
+            if runtime_store_base.endswith("/runtime"):
+                runtime_store_base = runtime_store_base[: -len("/runtime")]
+            os.environ["PAPAYYA_RUNTIME_STORE_BASE"] = runtime_store_base
+            if self._api_key:
+                os.environ["PAPAYYA_PLATFORM_WORKER_KEY"] = self._api_key
+            os.environ.pop("PAPAYYA_LOCAL_DB_PATH", None)
+        else:
+            os.environ["PAPAYYA_LOCAL_DB_PATH"] = store_path
 
         if agent_module_path is not None:
             self._import_agent_module(agent_module_path)
@@ -848,16 +869,20 @@ class Worker:
 
     def _mark_run_running(self, run_id: str) -> None:
         """Best-effort flip the durable run queued→running on lease pickup
-        (v1→v2 cutover). PATCH /v1/durable/runs/{run_id} {status:running};
-        the server guards the transition (only 'queued' rows move, output
-        untouched). Never raises: a transient failure just leaves the run
-        'queued' until the SDK writes its terminal status, so it must not
-        block execution. No-op when there's no durable base (local dev)."""
+        (v1→v2 cutover). PATCH /v1/runtime/runs/{run_id} {status:running} on
+        the platform-authed runtime lane — the worker holds the shared
+        platform key (no tenant scope), so the tenant-scoped /v1/durable PATCH
+        silently no-ops for it (Plan 37 Unit 1). The server guards the
+        transition (only 'queued' rows move, output untouched) and resolves
+        the tenant off the run row. Never raises: a transient failure just
+        leaves the run 'queued' until the SDK writes its terminal status, so
+        it must not block execution. No-op when there's no runtime base
+        (local dev)."""
         if not self._durable_api_base:
             return
         data = json.dumps({"status": "running"}).encode("utf-8")
         req = urllib_request.Request(
-            f"{self._durable_api_base}/runs/{run_id}",
+            f"{self.dispatcher_url}/runs/{run_id}",
             data=data,
             headers={"Content-Type": "application/json", **self._auth_headers()},
             method="PATCH",

@@ -88,6 +88,14 @@ class CloudStoreConfig:
     api_key: str
     base_url: str = DEFAULT_BASE_URL
     timeout: float = 15.0
+    # Route prefix for run + checkpoint writes. Defaults to the tenant-scoped
+    # durable API (cpk_ project keys). The hosted worker pool overrides it to
+    # "/v1/runtime/runs" — the platform-authed lane (Plan 37 Unit 1) that
+    # resolves the tenant off the pre-created run row instead of the key.
+    runs_base: str = "/v1/durable/runs"
+    # Send the key as X-Api-Key regardless of prefix. The platform worker key
+    # isn't a cpk_ key but auth.go matches it in the X-Api-Key header.
+    platform_auth: bool = False
 
 
 class CloudStore:
@@ -100,11 +108,12 @@ class CloudStore:
 
     def __init__(self, config: CloudStoreConfig) -> None:
         headers: dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
-        if config.api_key.startswith("cpk_"):
+        if config.platform_auth or config.api_key.startswith("cpk_"):
             headers["X-Api-Key"] = config.api_key
         else:
             headers["Authorization"] = f"Bearer {config.api_key}"
 
+        self._runs_base = config.runs_base.rstrip("/")
         self._client = httpx.Client(
             base_url=config.base_url,
             headers=headers,
@@ -125,7 +134,7 @@ class CloudStore:
         # Reads have no journal path: a load that can't reach the server
         # is a fundamentally different failure mode (the *replay-from*
         # data isn't there yet). Surface the error to the caller.
-        resp = self._client.get(f"/v1/durable/runs/{run_id}")
+        resp = self._client.get(f"{self._runs_base}/{run_id}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -183,7 +192,7 @@ class CloudStore:
         self._execute(
             kind="create",
             method="POST",
-            url="/v1/durable/runs",
+            url=self._runs_base,
             payload=payload,
             idempotency_key=checkpoint.run_id,
         )
@@ -211,7 +220,7 @@ class CloudStore:
         self._execute(
             kind="save_task",
             method="POST",
-            url=f"/v1/durable/runs/{run_id}/checkpoints",
+            url=f"{self._runs_base}/{run_id}/checkpoints",
             payload=payload,
             idempotency_key=f"{run_id}:{entry.label}",
         )
@@ -221,7 +230,7 @@ class CloudStore:
         self._execute(
             kind="set_status",
             method="PATCH",
-            url=f"/v1/durable/runs/{run_id}",
+            url=f"{self._runs_base}/{run_id}",
             payload=payload,
             idempotency_key=run_id,
         )
@@ -380,6 +389,30 @@ class CloudStore:
         """The pause reason a fence set for this run, or None. Consulted by
         PapayyaRun._pre_call before resolving the next step."""
         return self._pending_pause.get(run_id)
+
+
+def make_runtime_store(base_url: str, api_key: str, *, timeout: float = 15.0) -> CloudStore:
+    """A CloudStore pointed at the platform-authed runtime lane (Plan 37
+    Unit 1). Used by the hosted worker pool so customer @agent code running
+    in-process writes its checkpoints + run status to
+    ``/v1/runtime/runs/...`` with the shared platform worker key, instead of
+    the tenant-scoped ``/v1/durable/...`` API (which the worker can't reach —
+    it has no project key). The control-plane resolves the tenant off the
+    pre-created run row. Same retry/journal/pending-pause machinery as the
+    tenant CloudStore, only the route prefix + auth header differ.
+
+    ``base_url`` is the control-plane root (e.g. ``http://control-pane-api:8090``);
+    the ``runs_base`` supplies the ``/v1/runtime/runs`` path.
+    """
+    return CloudStore(
+        CloudStoreConfig(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            runs_base="/v1/runtime/runs",
+            platform_auth=True,
+        )
+    )
 
 
 # Type-checkers want CheckpointStore conformance at the module surface,

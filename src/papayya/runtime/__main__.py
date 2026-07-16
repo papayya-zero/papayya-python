@@ -56,8 +56,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--store",
-        required=True,
-        help="Path to the SQLite file customer code should write through.",
+        required=False,
+        default="",
+        help=(
+            "Path to the SQLite file local-dev customer code writes through. "
+            "Only used by the local prototype (`papayya dev` / LocalDispatcher); "
+            "hosted bootstrap workers write to the platform runtime lane and "
+            "ignore this. Removed with SQLite in Plan 37 Unit 4."
+        ),
     )
     p.add_argument(
         "--worker-id",
