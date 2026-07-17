@@ -127,6 +127,33 @@ class APIClient:
             "budget_cents": budget_cents,
         })
 
+    def replay_run(
+        self,
+        run_id: str,
+        *,
+        tenant: str | None = None,
+        latest: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Replay a run: mint a new run that re-drives its captured item.
+
+        Hosted replay (Plan 37 Unit R) — the server-side rebuild of the
+        wedge's "replay what didn't work". ``tenant`` narrows to one
+        partition slice; ``latest`` re-runs on the agent's current version
+        (default: the original run's version); ``force`` re-drives a clean
+        run (default: only a run that didn't work is replayable).
+        """
+        params: dict[str, str] = {}
+        if tenant is not None:
+            params["tenant"] = tenant
+        if latest:
+            params["latest"] = "true"
+        if force:
+            params["force"] = "true"
+        return self._request(
+            "POST", f"/v1/durable/runs/{run_id}/replay", params=params
+        )
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         # v1→v2 cutover: a triggered run is now a durable_run. The v1
         # /v1/runs/{id} surface reads the (now-unfed) runs table, so poll

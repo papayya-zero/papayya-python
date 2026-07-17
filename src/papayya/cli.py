@@ -1165,186 +1165,106 @@ def triage_dismiss(ctx: click.Context, run_id: str) -> None:
 
 
 @main.command("replay")
+@click.argument("run_positional", required=False)
 @click.option("--run", "run_id", default=None,
-              help="Run ID: replay the run's not-ok slice into a new run. "
-                   "(Accepts a pre-0.3.0 per-item id too — falls back to "
-                   "single-item replay when the id matches an item.)")
-@click.option("--item", "single_item_id", default=None,
-              help="Item ID: re-drive one item (the pre-0.3.0 behavior).")
+              help="Run ID to replay. Mints a new run that re-drives the "
+                   "original run's captured item.")
 @click.option("--tenant", "tenant", default=None,
-              help="With --run: replay only items whose partition_key "
+              help="Replay only the run's slice whose partition_key "
                    "(tenant) matches this value.")
-@click.option("--file", "file", default=None,
-              help="Agent file (default: auto-discover agent.py in cwd)")
-@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
-              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
 @click.option(
     "--latest",
     "latest",
     is_flag=True,
     default=False,
     help=(
-        "Replay on the agent's current code even if its agent_version "
-        "differs from the one captured on the original run. Without this "
-        "flag, a version mismatch aborts the replay (ADR-0002 #7). Pre-#7 "
-        "runs whose agent_version is NULL replay freely."
+        "Replay on the agent's current version instead of the version "
+        "captured on the original run (ADR-0002 #7). Pre-#7 runs whose "
+        "agent_version is NULL always replay on latest."
     ),
 )
 @click.option(
-    "--from-step",
-    "from_step",
-    default=None,
+    "--force",
+    "force",
+    is_flag=True,
+    default=False,
     help=(
-        "Phase 3 step-level rewind: resume from this step. Accepts a "
-        "step label (string) or a 1-indexed step number (integer). "
-        "Steps before this one are seeded into the new run's cache "
-        "from the original; this step and everything after re-execute "
-        "fresh."
+        "Re-drive a clean run too. By default only a run that didn't work "
+        "(worst outcome != ok, or a failed/quarantined run) is replayable."
     ),
 )
+@click.option("--wait/--no-wait", "wait", default=True,
+              help="Poll the new run to completion (default) or return "
+                   "immediately after triggering.")
+@click.pass_context
 def replay_cmd(
+    ctx: click.Context,
+    run_positional: str | None,
     run_id: str | None,
-    single_item_id: str | None,
     tenant: str | None,
-    file: str | None,
-    db: str,
     latest: bool,
-    from_step: str | None,
+    force: bool,
+    wait: bool,
 ) -> None:
-    """Replay work that didn't work, from the local ledger.
+    """Replay work that didn't work, in the cloud.
 
     \b
     Usage:
-      papayya replay --run <run_id>                # slice: the run's not-ok items
-      papayya replay --run <run_id> --tenant acme  # slice, one tenant only
-      papayya replay --item <item_id>              # one item (old behavior)
-      papayya replay --run <run_id> --latest
+      papayya replay <run_id>                 # replay the run
+      papayya replay --run <run_id>           # same, explicit flag
+      papayya replay <run_id> --tenant acme   # one partition slice only
+      papayya replay <run_id> --latest        # on the agent's current version
+      papayya replay <run_id> --force         # re-drive even a clean run
 
-    Slice replay (--run): selects the run's items whose
-    worst_outcome_status != 'ok', mints a NEW run row linked to the old
-    one via replayed_from, and re-drives each item into it. --tenant
-    narrows the slice to one partition_key value.
+    Hosted replay (Plan 37 Unit R): mints a NEW run linked to the original
+    via replayed_from and re-drives its captured item through the worker
+    pool. Only a terminal run (completed/failed/quarantined) replays; by
+    default only a run that didn't work is eligible (--force overrides).
 
-    Single-item replay (--item): reads the item's input_snapshot, finds
-    the matching @agent-decorated function in the agent file, and
-    re-invokes it. When the snapshot is a dict whose keys bind to the
-    agent's parameters (the format the @agent decorator captures), the
-    dict is unpacked as kwargs; otherwise it's passed positionally.
-    --from-step applies to this mode only.
-
-    Compatibility: --run <pre-0.3.0 per-item id> still works — when the id
-    isn't a run but matches an item, single-item replay runs instead.
-
-    Version gate (ADR-0002 #7): captured agent_version is compared to the
-    registration's current value; a mismatch aborts unless --latest is
-    passed. NULL captured versions (legacy rows) replay without the gate.
-
-    On any outcome, re-driven failed items are marked
-    disposition='replayed'. A replay that fails again shows up as a fresh
-    dead letter, so the operator can see the pattern.
+    Local single-item / --from-step replay ran off the SQLite ledger, which
+    is deactivated (Plan 37) — replay is a cloud operation now.
     """
-    import sqlite3 as _sqlite
-    from pathlib import Path as _Path
-
-    from papayya.durable import ReplayError
-    from papayya.durable.client import replay as _sdk_replay
-    from papayya.durable.client import replay_slice as _sdk_replay_slice
-
-    if (run_id is None) == (single_item_id is None):
-        click.echo("Error: pass exactly one of --run or --item.", err=True)
+    # Resolve the run id (positional wins over --run).
+    if run_positional is not None and run_id is not None and run_positional != run_id:
+        click.echo("Error: run id given twice (positional and --run). Pick one.", err=True)
+        sys.exit(1)
+    target = run_positional if run_positional is not None else run_id
+    if not target:
+        click.echo('Error: run id required.\n  papayya replay <run_id>', err=True)
         sys.exit(1)
 
-    # Click hands us a string from --from-step. Coerce to int when it
-    # parses as a positive number — that's the "1-indexed step number"
-    # form. Anything else stays a string and resolves as a label. None
-    # passes through to mean "replay from the top" (Phase 1 behaviour).
-    parsed_from_step: str | int | None = None
-    if from_step is not None:
-        try:
-            parsed_from_step = int(from_step)
-        except ValueError:
-            parsed_from_step = from_step
+    scope = _env_scope(ctx.obj)
+    resolved_key = _require_api_key(scope)
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
+    api = APIClient(config)
 
-    def _replay_one(item_id: str) -> None:
-        click.echo(f"Replaying item {item_id}...")
-        try:
-            result = _sdk_replay(
-                item_id,
-                agent_module=file,
-                db_path=db,
-                latest=latest,
-                from_step=parsed_from_step,
-            )
-        except ReplayError as exc:
-            click.echo(f"Error: {exc}", err=True)
-            sys.exit(1)
-        except Exception as exc:  # noqa: BLE001
-            click.echo(f"Replay failed: {exc}", err=True)
-            sys.exit(2)
-        click.echo(f"Replay returned: {result!r}")
-
-    if single_item_id is not None:
-        if tenant is not None:
-            click.echo("Error: --tenant only applies to --run slice replay.", err=True)
-            sys.exit(1)
-        _replay_one(single_item_id)
-        return
-
-    # --run: decide slice-vs-item by looking the id up. A run id gets
-    # slice semantics; an id that only matches an item falls back to
-    # single-item replay (pre-0.3.0 muscle memory, and what the local
-    # dashboard's DLQ Replay button sends).
-    db_file = _Path(db)
-    if not db_file.exists():
-        click.echo(f"Error: No local database at {db_file.resolve()}", err=True)
-        sys.exit(1)
-    conn = _sqlite.connect(str(db_file))
     try:
-        is_run = conn.execute(
-            "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone() is not None
-        is_item = conn.execute(
-            "SELECT 1 FROM items WHERE id = ?", (run_id,)
-        ).fetchone() is not None
+        try:
+            result = api.replay_run(target, tenant=tenant, latest=latest, force=force)
+        except PapayyaAPIError as exc:
+            click.echo(f"Error: replay failed ({exc.status}): {exc}", err=True)
+            sys.exit(1)
+
+        new_run_id = result.get("run_id", "unknown")
+        click.echo(f"Replay triggered: {new_run_id}")
+        click.echo(f"  Replayed from: {result.get('replayed_from', target)}")
+        click.echo(f"  Status: {result.get('status', 'unknown')}")
+
+        if not wait:
+            return
+
+        click.echo("Waiting for completion...")
+        while True:
+            time.sleep(2)
+            status_resp = api.get_run(new_run_id)
+            state = status_resp.get("status", "unknown")
+            done = len(status_resp.get("checkpoints", []) or [])
+            click.echo(f"  {done} step(s) — {state}")
+            if state in ("completed", "failed", "quarantined", "paused"):
+                click.echo(f"\nFinal status: {state}")
+                break
     finally:
-        conn.close()
-
-    if not is_run and is_item:
-        _replay_one(run_id)
-        return
-
-    if from_step is not None:
-        click.echo(
-            "Error: --from-step applies to single-item replay (--item), "
-            "not slice replay.",
-            err=True,
-        )
-        sys.exit(1)
-
-    click.echo(f"Replaying the not-ok slice of run {run_id}...")
-    try:
-        summary = _sdk_replay_slice(
-            run_id,
-            tenant=tenant,
-            agent_module=file,
-            db_path=db,
-            latest=latest,
-        )
-    except ReplayError as exc:
-        click.echo(f"Error: {exc}", err=True)
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001
-        click.echo(f"Replay failed: {exc}", err=True)
-        sys.exit(2)
-    click.echo(
-        f"New run {summary['new_run_id']}: "
-        f"{summary['replayed_ok']} ok, {summary['replay_failed']} failed"
-        + (
-            f", {summary['skipped_no_snapshot']} skipped (no snapshot)"
-            if summary["skipped_no_snapshot"]
-            else ""
-        )
-    )
+        api.close()
 
 
 # ---------------------------------------------------------------------------
