@@ -902,6 +902,44 @@ class Worker:
         except urllib_error.URLError as exc:
             log.warning("failed to mark run %s running: %s", run_id, exc)
 
+    def _mark_run_terminal(
+        self, run_id: str, status: str, output: Any = None
+    ) -> None:
+        """Flip the durable run to its terminal state (running→completed/failed)
+        on the platform-authed runtime lane (Plan 37 Unit 1). The sibling of
+        :meth:`_mark_run_running`: PATCH /v1/runtime/runs/{run_id}
+        {status, output?}. The server guards the transition, resolves the
+        tenant off the run row, and runs the same terminal-status side effects
+        (workload fence + run-failed notification) as the tenant path.
+
+        ``output`` (the agent's return value) is attached on completion when it
+        is JSON-serialisable, so the dashboard shows the run's result; a
+        non-serialisable return just leaves the run output empty rather than
+        failing the flip. Never raises — a transient failure leaves the run
+        'running' until the reaper/next write reconciles it, so it must not
+        block the worker. No-op on the local-dev path (no runtime base)."""
+        if not self._durable_api_base:
+            return
+        body: dict[str, Any] = {"status": status}
+        if status == "completed" and output is not None:
+            try:
+                json.dumps(output)  # probe serialisability
+                body["output"] = output
+            except (TypeError, ValueError):
+                pass  # non-serialisable return — leave run output empty
+        data = json.dumps(body).encode("utf-8")
+        req = urllib_request.Request(
+            f"{self.dispatcher_url}/runs/{run_id}",
+            data=data,
+            headers={"Content-Type": "application/json", **self._auth_headers()},
+            method="PATCH",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=2.0):
+                return
+        except urllib_error.URLError as exc:
+            log.warning("failed to mark run %s %s: %s", run_id, status, exc)
+
     # --- lease handling ------------------------------------------------ #
 
     def _handle_lease(self, lease: Lease) -> None:
@@ -1029,13 +1067,21 @@ class Worker:
             if max_duration is None:
                 max_duration = registration.max_duration_seconds
 
-            self._invoke_with_timeout(
+            run_status, output = self._invoke_with_timeout(
                 fn=registration.fn,
                 lease=lease,
                 started_at=started_at,
                 max_duration=max_duration,
                 short=short,
             )
+            # v1→v2 cutover: the dispatcher's /complete records only the
+            # *lease* (runtime_completed). The durable *run* status is owned
+            # on the platform runtime lane, so flip it here now that the
+            # invocation resolved. run_status is None for a pause/credit
+            # signal — the run's status is authoritative server-side and must
+            # not be clobbered. No-op on the local-dev path (no run_id).
+            if run_id and run_status is not None:
+                self._mark_run_terminal(run_id, run_status, output)
         finally:
             reset_bootstrap_run_id(bootstrap_token)
             with self._hb_lock:
@@ -1093,13 +1139,23 @@ class Worker:
         started_at: float,
         max_duration: float | None,
         short: str,
-    ) -> None:
+    ) -> tuple[str | None, Any]:
         """Run ``fn(lease.item_id)``; arm SIGALRM if max_duration is set.
 
-        Three terminal paths:
-          - Success: report completed.
-          - _AgentTimeout: report failed with error_category=timeout.
-          - Any other exception: report failed with stringified error.
+        Returns ``(run_status, output)`` for the caller to flip the durable
+        run's terminal state on the hosted path (Plan 37 Unit 1 — the
+        dispatcher's ``/complete`` only records the *lease*; the *run* status
+        is owned here). ``run_status`` is ``"completed"`` / ``"failed"``, or
+        ``None`` for a pass-through signal (pause/credit) whose run status is
+        authoritative server-side and must not be clobbered. ``output`` is the
+        agent's return value on success, else ``None``.
+
+        Terminal paths:
+          - Success: report completed lease → ``("completed", result)``.
+          - _AgentTimeout: report failed (category=timeout) → ``("failed", None)``.
+          - WorkloadPaused / CreditExhausted: report failed lease (preserving
+            prior behavior) but leave the run status alone → ``(None, None)``.
+          - Any other exception: report failed → ``("failed", None)``.
 
         The signal arming is local to this call. ``setitimer(0)`` and
         the handler restore in the finally block guarantee no SIGALRM
@@ -1112,18 +1168,18 @@ class Worker:
         for the same wall-clock guarantee.
         """
         if inspect.iscoroutinefunction(fn):
-            self._invoke_async(
+            return self._invoke_async(
                 fn=fn,
                 lease=lease,
                 started_at=started_at,
                 max_duration=max_duration,
                 short=short,
             )
-            return
 
         # Late import: keep the worker boot path free of the bundle
         # loader's importlib pull-in cost when no bundles are involved.
         from papayya.runtime import _bundle_loader
+        from papayya.errors import CreditExhausted, WorkloadPaused
 
         prior_handler = None
         watchdog_armed = max_duration is not None and max_duration > 0
@@ -1136,7 +1192,7 @@ class Worker:
             # against the right version's siblings. ``None`` is a
             # no-op so local-dev / LocalDispatcher leases pay nothing.
             with _bundle_loader.activate(lease.agent_version):
-                fn(lease.item_id)
+                result = fn(lease.item_id)
         except _AgentTimeout:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
@@ -1149,7 +1205,23 @@ class Worker:
                 error=f"timeout: agent ran for >{max_duration}s",
                 error_category="timeout",
             )
-            return
+            return "failed", None
+        except (WorkloadPaused, CreditExhausted) as exc:
+            # Not a body failure: the run is paused (or provider-stopped) and
+            # its status is authoritative server-side. Preserve the prior
+            # lease-completion behavior but do NOT flip the run terminal.
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.warning(
+                "paused   %s item=%s duration=%dms %s: %s",
+                short, lease.item_id, duration_ms, type(exc).__name__, exc,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+                error_category="paused",
+            )
+            return None, None
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.exception(
@@ -1161,7 +1233,7 @@ class Worker:
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
-            return
+            return "failed", None
         finally:
             if watchdog_armed:
                 signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1179,6 +1251,7 @@ class Worker:
             short, lease.item_id, duration_ms,
         )
         self._report_complete(lease.lease_id, status="completed")
+        return "completed", result
 
     def _invoke_async(
         self,
@@ -1188,8 +1261,13 @@ class Worker:
         started_at: float,
         max_duration: float | None,
         short: str,
-    ) -> None:
+    ) -> tuple[str | None, Any]:
         """Run a coroutine ``fn(lease.item_id)`` to completion.
+
+        Returns ``(run_status, output)`` on the same contract as
+        :meth:`_invoke_with_timeout` — the caller flips the durable run's
+        terminal state from it (``None`` = pause/credit signal, leave the run
+        status alone).
 
         Uses ``asyncio.wait_for`` for timeout enforcement instead of the
         sync path's SIGALRM watchdog. Signal handlers raising into a
@@ -1198,8 +1276,8 @@ class Worker:
         ``finally`` / cleanup blocks the agent installed run before we
         report failure.
 
-        Four terminal paths:
-          - Success: report completed.
+        Terminal paths:
+          - Success: report completed → ``("completed", result)``.
           - ``asyncio.TimeoutError`` from ``wait_for``: report failed
             with ``error_category="timeout"`` (parity with sync path).
           - ``asyncio.CancelledError``: report failed with
@@ -1211,9 +1289,12 @@ class Worker:
             doesn't catch it; without an explicit branch this would
             propagate out of ``_handle_lease`` and the lease would only
             recover via TTL.
+          - WorkloadPaused / CreditExhausted: report failed lease but leave
+            the run status alone → ``(None, None)``.
           - Any other ``Exception``: existing stringified-error path.
         """
         from papayya.runtime import _bundle_loader
+        from papayya.errors import CreditExhausted, WorkloadPaused
 
         coro = fn(lease.item_id)
         try:
@@ -1223,9 +1304,9 @@ class Worker:
             # version's siblings.
             with _bundle_loader.activate(lease.agent_version):
                 if max_duration is not None and max_duration > 0:
-                    asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
+                    result = asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
                 else:
-                    asyncio.run(coro)
+                    result = asyncio.run(coro)
         except asyncio.TimeoutError:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
@@ -1238,7 +1319,7 @@ class Worker:
                 error=f"timeout: agent ran for >{max_duration}s",
                 error_category="timeout",
             )
-            return
+            return "failed", None
         except asyncio.CancelledError:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
@@ -1251,7 +1332,20 @@ class Worker:
                 error="cancelled: asyncio.CancelledError",
                 error_category="cancelled",
             )
-            return
+            return "failed", None
+        except (WorkloadPaused, CreditExhausted) as exc:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log.warning(
+                "paused   %s item=%s duration=%dms %s: %s",
+                short, lease.item_id, duration_ms, type(exc).__name__, exc,
+            )
+            self._report_complete(
+                lease.lease_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+                error_category="paused",
+            )
+            return None, None
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.exception(
@@ -1263,7 +1357,7 @@ class Worker:
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
-            return
+            return "failed", None
 
         duration_ms = int((time.monotonic() - started_at) * 1000)
         log.info(
@@ -1271,6 +1365,7 @@ class Worker:
             short, lease.item_id, duration_ms,
         )
         self._report_complete(lease.lease_id, status="completed")
+        return "completed", result
 
     # --- drain watchdog ----------------------------------------------- #
 
