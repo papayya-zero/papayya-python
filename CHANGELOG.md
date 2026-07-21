@@ -2,6 +2,26 @@
 
 All notable changes to the `papayya` Python package.
 
+## Unreleased
+
+Hosted off-cycle path ergonomics — submit a run from a web handler, then
+poll/stream/callback for the result:
+
+- **Auth parity.** `Papayya(...).items` / `.runs` now resolve the API key
+  from the CLI config file (`~/.papayya/config.json`) as a last fallback,
+  matching the durable path. A `papayya login` is enough — you no longer
+  need to also export `PAPAYYA_API_KEY` to use the resource namespaces. The
+  no-key error no longer mentions a `--api-key` flag the SDK doesn't have.
+- **Submit retries transient failures.** `APIClient._request` now retries
+  connect errors and `429/502/503/504` with bounded exponential backoff
+  (same rhythm as the durable checkpoint writer). `4xx` and `500` still
+  raise immediately — a `500` may have partially applied, and run
+  submission is not idempotent, so it is never blindly replayed.
+- **Stable `run_id` on submit.** `items.create(...)` guarantees a `run_id`
+  key on its response regardless of which field the control-plane spells
+  the id under, so `resp["run_id"]` can be handed straight to `.get()` /
+  `.steps()` / `.stream()`.
+
 ## 0.3.0 — 2026-07-09
 
 Two things ship together in 0.3.0: everything that landed since 0.2.1

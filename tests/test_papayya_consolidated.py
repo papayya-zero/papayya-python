@@ -61,8 +61,14 @@ class TestUnifiedSurface:
         access. A run() call that never touches them must not require
         an api_key."""
         monkeypatch.delenv("PAPAYYA_API_KEY", raising=False)
-        # Point ~ at a fresh dir so any saved CLI config is invisible.
+        # Point ~ at a fresh dir AND repoint the CLI config path there: the
+        # hosted resolver now falls back to ~/.papayya/config.json (auth
+        # parity with the durable path), and CONFIG_FILE is bound at import
+        # time, so setenv("HOME") alone won't hide a real `papayya login`.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "papayya._config.CONFIG_FILE", tmp_path / ".papayya" / "config.json"
+        )
         client = Papayya(store=_local_store(tmp_path))
         # Construction succeeded with no credentials. Only when we access
         # a resource namespace does the lookup fail.

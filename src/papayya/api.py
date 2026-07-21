@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,31 @@ class PapayyaAPIError(Exception):
         super().__init__(f"HTTP {status}: {message}")
 
 
+# Retry budget for transient control-plane failures. Same rhythm as
+# durable/cloud_store.py so operators only learn one cadence: worst-case
+# wait is ~0.1 + 0.2 + 0.4 + 0.8 + (capped) 2.0 = 3.5s before raising.
+_MAX_ATTEMPTS = 5
+_INITIAL_BACKOFF = 0.1
+_MAX_BACKOFF = 2.0
+
+# Connect-level exceptions where the request provably never reached the
+# application, so a retry cannot double-apply a non-idempotent submit.
+# Deliberately NARROWER than cloud_store._is_transient: read/write timeouts
+# and RemoteProtocolError can fire *after* the server accepted the request,
+# and run submission (unlike an idempotent checkpoint write) is not safe to
+# replay in that window — a double-submit would re-pay every LLM call.
+_TRANSIENT_CONNECT_EXC = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+# Server-side statuses that mean the request was rejected/never processed by
+# the app (rate-limited or gateway-level), so retrying is safe. 500 is
+# excluded on purpose: it can be raised after partial processing.
+_TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
+
+
 @dataclass
 class APIConfig:
     api_key: str
@@ -28,12 +54,37 @@ def resolve_config(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> APIConfig:
-    key = api_key or os.environ.get("PAPAYYA_API_KEY")
-    if not key:
-        raise PapayyaAPIError(401, "No API key. Set PAPAYYA_API_KEY or pass --api-key.")
+    """Resolve credentials for the hosted resource namespaces (.items/.runs).
 
-    url = base_url or os.environ.get("PAPAYYA_BASE_URL", DEFAULT_BASE_URL)
-    return APIConfig(api_key=key, base_url=url)
+    Resolution order matches the durable path
+    (``papayya._resolve_durable_api_key``): explicit arg → ``PAPAYYA_API_KEY``
+    → the CLI config file that ``papayya login`` writes
+    (``~/.papayya/config.json``). Without the last step a developer who
+    authed via the CLI would get a 401 the moment they touched ``.items``
+    while the durable path silently succeeded — the asymmetry this closes.
+    """
+    # Lazy import: keep api.py free of package-level import ordering effects
+    # (subprocess/WAL tests are sensitive to it) and avoid any cycle.
+    from papayya._config import env_config, load_cli_config
+
+    key = api_key or os.environ.get("PAPAYYA_API_KEY")
+    url = base_url or os.environ.get("PAPAYYA_BASE_URL")
+    if not key or not url:
+        env = env_config(load_cli_config())
+        # Pair key + base_url from the SAME env block so a CLI login to a
+        # non-prod env doesn't hand back that env's key against prod's URL.
+        if not key:
+            key = env.get("api_key")
+            url = url or env.get("base_url")
+        if not url:
+            url = env.get("base_url")
+
+    if not key:
+        raise PapayyaAPIError(
+            401,
+            "No API key. Pass api_key=..., set PAPAYYA_API_KEY, or run `papayya login`.",
+        )
+    return APIConfig(api_key=key, base_url=url or DEFAULT_BASE_URL)
 
 
 class APIClient:
@@ -60,10 +111,32 @@ class APIClient:
         self._http.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        resp = self._http.request(method, path, **kwargs)
-        if not resp.is_success:
-            raise PapayyaAPIError(resp.status_code, resp.text)
-        return resp.json()
+        """Issue one control-plane request, retrying only provably-safe
+        transient failures (connect errors + 429/502/503/504) with bounded
+        exponential backoff. 4xx and 500 raise immediately — the former is a
+        client bug, the latter may have partially applied and must not be
+        blindly replayed. Non-transient failures raise on the first attempt.
+        """
+        backoff = _INITIAL_BACKOFF
+        last_exc: PapayyaAPIError | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                resp = self._http.request(method, path, **kwargs)
+            except _TRANSIENT_CONNECT_EXC as exc:
+                last_exc = PapayyaAPIError(0, f"connection error: {exc}")
+            else:
+                if resp.is_success:
+                    return resp.json()
+                if resp.status_code not in _TRANSIENT_STATUS:
+                    raise PapayyaAPIError(resp.status_code, resp.text)
+                last_exc = PapayyaAPIError(resp.status_code, resp.text)
+
+            if attempt < _MAX_ATTEMPTS:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+
+        assert last_exc is not None  # loop runs ≥1 time and only breaks with a set exc
+        raise last_exc
 
     # -- Auth ----------------------------------------------------------------
 

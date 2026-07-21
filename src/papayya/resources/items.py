@@ -9,6 +9,24 @@ if TYPE_CHECKING:
     from papayya.api import APIClient
 
 
+def _ensure_run_id(resp: Any) -> Any:
+    """Guarantee a stable ``run_id`` key on a submit response.
+
+    The control-plane's durable-run record spells its identifier ``id``
+    (the row PK); some routes carry ``durable_run_id`` instead. Rather than
+    make callers guess which one a given deploy returns, copy whichever is
+    present into ``run_id`` (without clobbering an existing one) so
+    ``resp["run_id"]`` is ALWAYS valid and can be handed straight to
+    ``.get()`` / ``.steps()`` / ``.stream()``. Purely additive — the raw
+    server fields are left intact.
+    """
+    if isinstance(resp, dict) and "run_id" not in resp:
+        for alias in ("id", "durable_run_id"):
+            if alias in resp:
+                return {**resp, "run_id": resp[alias]}
+    return resp
+
+
 class Items:
     """Per-item resource (Plan 34 rename of the old ``Runs`` resource).
 
@@ -37,6 +55,15 @@ class Items:
         callback_url: str | None = None,
         parent_run_id: str | None = None,
     ) -> dict[str, Any]:
+        """Submit ONE run-of-one and return immediately, without blocking on
+        execution — the agent runs off the request path on the worker pool.
+
+        Returns the created durable-run record as a dict. The run identifier
+        is guaranteed present under ``run_id`` (see :func:`_ensure_run_id`);
+        pass it to :meth:`get`, :meth:`steps`, or :meth:`stream`, or supply a
+        ``callback_url`` to have the terminal outcome POSTed to you instead of
+        polling. For many items in one shot use ``Papayya().runs.create``.
+        """
         body: dict[str, Any] = {"input": input}
         if model:
             body["model"] = model
@@ -56,7 +83,9 @@ class Items:
             resolved_parent = get_active_run_id()
         if resolved_parent:
             body["parent_run_id"] = resolved_parent
-        return self._api._request("POST", f"/v1/agents/{agent_id}/runs", json=body)
+        return _ensure_run_id(
+            self._api._request("POST", f"/v1/agents/{agent_id}/runs", json=body)
+        )
 
     # v1→v2 cutover: a run is a durable_run. The read/poll surface below
     # targets /v1/durable/runs/*. The quarantine lifecycle (quarantine/
