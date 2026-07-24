@@ -74,7 +74,7 @@ def iter(
       ``store`` — optional checkpoint store. When omitted, the same store
         the ``@agent`` / client path uses is resolved automatically
         (SQLiteStore locally, CloudStore when an API key is present), so
-        iter-items persist and show up in ``papayya dev`` like any other.
+        iter-items persist in the ledger like any other.
         Pass an explicit store to point an invocation at a specific database.
 
     Behavior:

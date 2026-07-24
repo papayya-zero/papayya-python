@@ -379,7 +379,7 @@ def get_agent(name: str, version: str | None = None) -> AgentRegistration | None
     ``version is None`` preserves the local-dev / single-resident
     semantics: returns the most-recently-registered entry for ``name``
     (insertion order in the dict, latest wins — same as the pre-slice-3
-    slug-keyed overwrite behaviour). ``papayya dev`` and tests that
+    slug-keyed overwrite behaviour). Local scratch runs and tests that
     register one agent per slug rely on this branch.
 
     ``version is not None`` does the multi-version lookup. Used by

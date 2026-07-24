@@ -203,8 +203,8 @@ class Papayya:
           3. SQLiteStore — ONLY when an explicit ``PAPAYYA_LOCAL_DB_PATH`` is
              set. This is internal plumbing (the test harness + the retired
              local worker path), NOT a product surface: local dev is
-             deactivated (Plan 37) — `papayya dev`, the keyless demo, and
-             `map`/`iter` are all hidden — so nothing user-facing sets this.
+             deactivated (Plan 37) — the local dashboard, the keyless demo,
+             and `map`/`iter` are all removed — so nothing user-facing sets this.
 
         With none of the above resolvable the keyless local default is GONE
         (Plan 37): rather than silently writing to ``.papayya/local.db`` — the

@@ -195,38 +195,72 @@ def test_envs_link_persists(tmp_config: Path) -> None:
     assert env_block["api_key"] == "cpk_stg"
 
 
-def test_envs_create_requires_jwt(tmp_config: Path) -> None:
-    code, out = _invoke("envs", "create", "staging")
-    assert code != 0
-    assert "papayya login" in out
-
-
-def test_envs_create_calls_api_and_persists(tmp_config: Path) -> None:
-    save_cli_config({
-        "version": 2,
-        "current_env": "dev",
-        "envs": {"dev": {"api_key": "cpk_x"}},
-        "auth": {"jwt": "ey.fake.jwt", "email": "me@example.com"},
-    })
-
-    # Mock APIClient so no network calls happen.
-    fake_project = {"id": "p-new"}
-    fake_key = {"key": "cpk_new_key"}
+def test_login_pastes_key_validates_and_persists(tmp_config: Path) -> None:
+    # Dashboard-first login: paste a key, validate it via list_projects, and
+    # persist it — no email/password, no JWT.
     with patch.object(cli_module, "APIClient") as MockClient:
         instance = MockClient.return_value
-        instance.create_project.return_value = fake_project
-        instance.create_api_key.return_value = fake_key
+        instance.list_projects.return_value = [{"id": "p-only", "name": "Only"}]
 
+        runner = CliRunner()
+        result = runner.invoke(cli_module.main, ["login", "--key", "cpk_pasted"])
+
+    assert result.exit_code == 0, result.output
+    cfg = load_cli_config()
+    env_block = env_config(cfg, current_env(cfg))
+    assert env_block["api_key"] == "cpk_pasted"
+    assert env_block["project_id"] == "p-only"
+    assert "auth" not in cfg  # no JWT stored anymore
+
+
+def test_login_rejects_bad_key(tmp_config: Path) -> None:
+    from papayya.api import PapayyaAPIError
+
+    with patch.object(cli_module, "APIClient") as MockClient:
+        instance = MockClient.return_value
+        instance.list_projects.side_effect = PapayyaAPIError(401, "nope")
+
+        runner = CliRunner()
+        result = runner.invoke(cli_module.main, ["login", "--key", "bad"])
+
+    assert result.exit_code != 0
+    assert "rejected" in result.output
+    assert load_cli_config() == {}  # nothing persisted
+
+
+def test_login_multi_project_requires_project_id(tmp_config: Path) -> None:
+    with patch.object(cli_module, "APIClient") as MockClient:
+        instance = MockClient.return_value
+        instance.list_projects.return_value = [
+            {"id": "p-a", "name": "A"}, {"id": "p-b", "name": "B"},
+        ]
+
+        runner = CliRunner()
+        result = runner.invoke(cli_module.main, ["login", "--key", "cpk_multi"])
+
+    assert result.exit_code != 0
+    assert "--project-id" in result.output
+    assert load_cli_config() == {}
+
+
+def test_envs_create_guides_to_dashboard(tmp_config: Path) -> None:
+    # Dashboard-first: `envs create` no longer provisions; it points you at the
+    # dashboard + `envs link`. Succeeds without any account session.
+    code, out = _invoke("envs", "create", "staging")
+    assert code == 0, out
+    assert "app.getpapayya.com" in out
+    assert "papayya envs link staging" in out
+
+
+def test_envs_create_does_not_provision(tmp_config: Path) -> None:
+    # It must not call the API or persist a half-formed env.
+    with patch.object(cli_module, "APIClient") as MockClient:
         code, out = _invoke("envs", "create", "staging")
 
     assert code == 0, out
-    instance.create_project.assert_called_once()
-    instance.create_api_key.assert_called_once_with("p-new", name="cli-env-staging")
+    MockClient.assert_not_called()
     cfg = load_cli_config()
-    assert cfg["current_env"] == "staging"
-    env_block = env_config(cfg, "staging")
-    assert env_block["project_id"] == "p-new"
-    assert env_block["api_key"] == "cpk_new_key"
+    assert "staging" not in cfg.get("envs", {})
 
 
 def test_envs_create_duplicate_errors(tmp_config: Path) -> None:

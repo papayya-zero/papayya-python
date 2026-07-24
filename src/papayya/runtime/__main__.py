@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Absolute path to a .py file with @agent-decorated function(s). "
-            "Required for local dev (`papayya dev`); omit when --bootstrap "
+            "Required for local dev; omit when --bootstrap "
             "or PAPAYYA_BOOTSTRAP=1 is set (hosted ECS workers load every "
             "bundle on demand via lease.agent_version)."
         ),
@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Path to the SQLite file local-dev customer code writes through. "
-            "Only used by the local prototype (`papayya dev` / LocalDispatcher); "
+            "Only used by the local prototype (LocalDispatcher); "
             "hosted bootstrap workers write to the platform runtime lane and "
             "ignore this. Removed with SQLite in Plan 37 Unit 4."
         ),

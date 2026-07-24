@@ -146,7 +146,7 @@ def test_worker_processes_batch_with_correct_lineage(
     )
 
     # 3. Per-item lineage shape is identical to what a single-process
-    #    `papayya dev` would produce. The worker is a deployment detail;
+    #    single-process local run would produce. The worker is a deployment detail;
     #    the customer-facing data shape must not change.
     for item_id in items:
         run = in_memory_store.run_for_item(item_id)

@@ -718,7 +718,7 @@ class SQLiteStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # journal_mode=DELETE (not WAL): the worker mints one short-lived store
-        # connection per item, while `papayya dev`/the test harness keeps a
+        # connection per item, while the test harness keeps a
         # long-lived reader open. Under WAL that reader blocks checkpointing, so
         # committed frames strand in the -wal file and never reach main.db —
         # rows silently vanish on worker shutdown. DELETE checkpoints on each
@@ -728,7 +728,7 @@ class SQLiteStore:
         self._conn.execute("PRAGMA journal_mode=DELETE")
         _init_schema(self._conn, db_file)
 
-        # Plan 33 local fences (Decision 6) — so `papayya dev` demos auto-pause
+        # Plan 33 local fences (Decision 6) — so local demos auto-pause
         # with zero cloud dependency. Run-level: pause after K consecutive
         # degraded steps (env override wins; else the per-run kwarg via
         # set_run_fence; else 3; 0 disables). Workload-level: pause the agent

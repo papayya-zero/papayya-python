@@ -27,7 +27,7 @@ from papayya._config import (
     save_cli_config as _save_cli_config,
     set_env_config as _set_env_config,
 )
-from papayya._defaults import DEFAULT_BASE_URL
+from papayya._defaults import DEFAULT_BASE_URL, DEFAULT_DASHBOARD_URL
 from papayya.api import APIClient, APIConfig, PapayyaAPIError, resolve_config
 
 
@@ -206,7 +206,8 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
 def _require_api_key(scope: _EnvScope) -> str:
     if not scope.api_key:
         click.echo(
-            "Error: No API key. Run `papayya signup` first, or set PAPAYYA_API_KEY.",
+            "Error: no API key. Run `papayya login` to paste one, or set "
+            f"PAPAYYA_API_KEY (mint a key in the dashboard at {DEFAULT_DASHBOARD_URL}).",
             err=True,
         )
         sys.exit(1)
@@ -283,61 +284,12 @@ def init() -> None:
     )
     click.echo(f"✓ Created papayya.yaml in {cwd}")
     click.echo("")
-    click.echo("Next: scaffold a runnable demo to feel the loop:")
+    click.echo("Next: write an @agent-decorated agent.py, then deploy it:")
     click.echo("")
-    click.echo("    papayya example     # writes agent.py")
-    click.echo("    python agent.py")
-    click.echo("    papayya dev         # open the dashboard")
+    click.echo("    papayya login")
+    click.echo("    papayya deploy")
     click.echo("")
-    click.echo("Or write your own agent — see https://docs.getpapayya.com")
-
-
-# ---------------------------------------------------------------------------
-# example
-# ---------------------------------------------------------------------------
-
-# Plan 37: `papayya example` scaffolds a KEYLESS `python agent.py` demo — the
-# "second app" onboarding. DEACTIVATED (standalone, not registered on `main`)
-# until the cloud-first deploy→run scaffold replaces it; body retained.
-@click.command()
-@click.option(
-    "--print",
-    "print_only",
-    is_flag=True,
-    default=False,
-    help="Print the demo to stdout instead of writing a file.",
-)
-def example(print_only: bool) -> None:
-    """Scaffold agent.py — a keyless durable run you can execute immediately."""
-    from papayya._demo import LOCAL_DEMO_AGENT_SOURCE
-
-    if print_only:
-        click.echo(LOCAL_DEMO_AGENT_SOURCE, nl=False)
-        return
-
-    cwd = Path.cwd()
-    # Write agent.py — the same name `deploy` / `run` auto-discover, so the
-    # scaffold flows straight into the golden path instead of failing with
-    # "No agent.py found."
-    target = cwd / "agent.py"
-
-    if target.exists():
-        click.confirm(
-            "agent.py already exists. Overwrite?",
-            default=False,
-            abort=True,
-        )
-
-    target.write_text(LOCAL_DEMO_AGENT_SOURCE)
-    click.echo(f"✓ Wrote agent.py to {cwd}")
-    click.echo("")
-    click.echo("Run it:")
-    click.echo("")
-    click.echo("    python agent.py")
-    click.echo("")
-    click.echo("Then open the dashboard:")
-    click.echo("")
-    click.echo("    papayya dev")
+    click.echo("See https://docs.getpapayya.com to write your first agent.")
 
 
 # ---------------------------------------------------------------------------
@@ -345,144 +297,98 @@ def example(print_only: bool) -> None:
 # ---------------------------------------------------------------------------
 
 @main.command()
-@click.option("--email", prompt=True, help="Your email address")
-@click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True, help="Password (min 8 characters)")
-@click.option("--name", prompt="Account name", help="Your name or org name")
-@click.option("--force", is_flag=True, default=False, help="Overwrite an existing ~/.papayya/config.json.")
+def signup() -> None:
+    """Create your Papayya account (in the dashboard)."""
+    # Account creation and key issuance live in the dashboard, not the CLI —
+    # the CLI only consumes an API key you mint there. See `papayya login`.
+    click.echo("Create your Papayya account in the dashboard:")
+    click.echo(f"  {DEFAULT_DASHBOARD_URL}/register")
+    click.echo("")
+    click.echo("Then create a project + API key there and connect the CLI:")
+    click.echo("  papayya login            # paste your API key")
+    click.echo("  # or: export PAPAYYA_API_KEY=pk_...")
+
+
+@main.command()
+@click.option("--key", "key", default=None,
+              help="API key from the dashboard. Prompted (hidden) if omitted.")
+@click.option("--project-id", "project_id_opt", default=None,
+              help="Project the key belongs to. Auto-resolved when the account has one project.")
 @click.pass_context
-def signup(ctx: click.Context, email: str, password: str, name: str, force: bool) -> None:
-    """Create a Papayya account and get an API key."""
+def login(ctx: click.Context, key: str | None, project_id_opt: str | None) -> None:
+    """Connect the CLI by pasting an API key from the dashboard.
+
+    Sign up and mint a key at the dashboard (Project → API keys), then run
+    `papayya login` and paste it — account creation lives in the dashboard,
+    not the CLI. Setting PAPAYYA_API_KEY works too and skips this entirely.
+    Pass `--env <name>` (global flag) to connect a specific env.
+    """
     base_url = ctx.obj["base_url"]
 
-    existing = _load_cli_config()
-    existing_dev = _env_config(existing, "dev")
-    if existing_dev.get("api_key") and not force:
-        current_email = existing_dev.get("email") or (existing.get("auth") or {}).get("email", "<unknown email>")
+    api_key = (key or click.prompt("Paste your Papayya API key", hide_input=True) or "").strip()
+    if not api_key:
         click.echo(
-            f"Error: already signed in as {current_email} ({_CONFIG_FILE}).\n"
-            "  Run `papayya logout` to clear the current config, or pass --force to overwrite.\n"
-            "  (Creating a new account clobbers your existing API key.)",
+            f"Error: no API key provided. Create one at {DEFAULT_DASHBOARD_URL} "
+            "(Project → API keys).",
             err=True,
         )
         sys.exit(1)
 
-    if len(password) < 8:
-        click.echo("Error: Password must be at least 8 characters.", err=True)
-        sys.exit(1)
-
-    api = APIClient(APIConfig(api_key="none", base_url=base_url))
+    api = APIClient(APIConfig(api_key=api_key, base_url=base_url))
     try:
-        # 1. Register
-        click.echo("Creating account...")
-        reg = api.register(email, password, name)
-        click.echo(f"  ✓ Account created ({reg.get('email', email)})")
-
-        # 2. Login to get JWT
-        click.echo("Logging in...")
-        login_resp = api.login(email, password)
-        jwt = login_resp["access_token"]
-
-        # Re-create client with JWT auth
-        api.close()
-        api = APIClient(APIConfig(api_key=jwt, base_url=base_url))
-
-        # 3. Create project
-        click.echo("Setting up project...")
-        slug = name.lower().replace(" ", "-")[:30]
-        project = api.create_project(name=f"{name}'s project", slug=f"{slug}-project")
-        project_id = project["id"]
-        click.echo(f"  ✓ Project created ({project_id})")
-
-        # 4. Create API key
-        click.echo("Generating API key...")
-        key_resp = api.create_api_key(project_id, name="default")
-        api_key = key_resp.get("key") or key_resp.get("api_key") or key_resp.get("raw_key", "")
-        click.echo(f"  ✓ API key generated")
-
-        # 5. Persist config — dev env holds the project-scoped key; JWT lives
-        # at the top level under `auth` for commands like `envs create` that
-        # need account-level credentials.
-        cfg = _load_cli_config()
-        _set_env_config(cfg, "dev", {
-            "api_key": api_key,
-            "base_url": base_url,
-            "project_id": project_id,
-            "email": email,
-        })
-        cfg["current_env"] = "dev"
-        cfg["auth"] = {"jwt": jwt, "email": email}
-        _save_cli_config(cfg)
-        click.echo(f"\n✓ All set! Config saved to {_CONFIG_FILE}")
-        click.echo(f"  Env: dev")
-        click.echo(f"  API key: {api_key[:12]}...")
-        click.echo(f"  Project: {project_id}")
-        click.echo("\nNext: papayya init")
-        click.echo("Tip: pass --env <name> on any command to target a non-default env.")
-
-    except PapayyaAPIError as e:
-        if e.status == 409:
-            click.echo("Error: An account with that email already exists. Try `papayya login`.", err=True)
-            sys.exit(1)
-        raise
-    finally:
-        api.close()
-
-
-@main.command()
-@click.option("--email", prompt=True, help="Your email address")
-@click.option("--password", prompt=True, hide_input=True, help="Password")
-@click.pass_context
-def login(ctx: click.Context, email: str, password: str) -> None:
-    """Log in to an existing Papayya account."""
-    base_url = ctx.obj["base_url"]
-    api = APIClient(APIConfig(api_key="none", base_url=base_url))
-
-    try:
-        click.echo("Logging in...")
-        login_resp = api.login(email, password)
-        jwt = login_resp["access_token"]
-
-        # Re-create client with JWT auth
-        api.close()
-        api = APIClient(APIConfig(api_key=jwt, base_url=base_url))
-
-        # Find existing projects and API keys
-        projects = api.list_projects()
-        if not projects:
-            click.echo("Error: No projects found. Run `papayya signup` to create one.", err=True)
-            sys.exit(1)
-
-        project_id = projects[0]["id"]
-
-        # Try to get existing API key or create one
+        # Validate the key and discover which project(s) it can reach.
         try:
-            key_resp = api.create_api_key(project_id, name="cli-login")
-            api_key = key_resp.get("key") or key_resp.get("api_key") or key_resp.get("raw_key", "")
-        except PapayyaAPIError:
-            # Use JWT as fallback
-            api_key = jwt
+            projects = api.list_projects()
+        except PapayyaAPIError as e:
+            if e.status in (401, 403):
+                click.echo(
+                    "Error: that API key was rejected. Copy a current key from "
+                    f"{DEFAULT_DASHBOARD_URL} (Project → API keys) and try again.",
+                    err=True,
+                )
+                sys.exit(1)
+            raise
+
+        if not projects:
+            click.echo(
+                "Error: this key can't see any projects. Create a project in the "
+                f"dashboard at {DEFAULT_DASHBOARD_URL} first.",
+                err=True,
+            )
+            sys.exit(1)
+
+        project_ids = [p["id"] for p in projects]
+        if project_id_opt:
+            if project_id_opt not in project_ids:
+                click.echo(
+                    f"Error: project '{project_id_opt}' isn't reachable with this key.\n"
+                    f"  Reachable: {', '.join(project_ids)}",
+                    err=True,
+                )
+                sys.exit(1)
+            project_id = project_id_opt
+        elif len(projects) == 1:
+            project_id = project_ids[0]
+        else:
+            click.echo("This key reaches multiple projects — re-run with --project-id <id>:", err=True)
+            for p in projects:
+                click.echo(f"  {p['id']}  {p.get('name', '')}", err=True)
+            sys.exit(1)
 
         cfg = _load_cli_config()
-        # Default to writing into dev unless another env is already current.
-        target_env = _current_env(cfg) if cfg.get("envs") else "dev"
+        # Honor a global --env override; otherwise write the current env (or dev).
+        target_env = ctx.obj.get("env") or (_current_env(cfg) if cfg.get("envs") else "dev")
         _set_env_config(cfg, target_env, {
             "api_key": api_key,
             "base_url": base_url,
             "project_id": project_id,
-            "email": email,
         })
         cfg["current_env"] = target_env
-        cfg["auth"] = {"jwt": jwt, "email": email}
         _save_cli_config(cfg)
-        click.echo(f"✓ Logged in! Config saved to {_CONFIG_FILE}")
+        click.echo(f"✓ Connected! Config saved to {_CONFIG_FILE}")
         click.echo(f"  Env: {target_env}")
         click.echo(f"  Project: {project_id}")
-
-    except PapayyaAPIError as e:
-        if e.status == 401:
-            click.echo("Error: Invalid email or password.", err=True)
-            sys.exit(1)
-        raise
+        click.echo("\nNext: papayya init")
     finally:
         api.close()
 
@@ -494,9 +400,10 @@ def logout() -> None:
         click.echo("Not signed in — no config to remove.")
         return
     existing = _load_cli_config()
-    email = (existing.get("auth") or {}).get("email") or _env_config(existing).get("email", "<unknown>")
+    email = (existing.get("auth") or {}).get("email") or _env_config(existing).get("email")
     _CONFIG_FILE.unlink()
-    click.echo(f"✓ Logged out ({email}). Removed {_CONFIG_FILE}.")
+    who = f" ({email})" if email else ""
+    click.echo(f"✓ Logged out{who}. Removed {_CONFIG_FILE}.")
 
 
 # ---------------------------------------------------------------------------
@@ -575,10 +482,10 @@ def envs_link(ctx: click.Context, name: str, project_id: str, api_key: str, base
 @click.argument("name")
 @click.pass_context
 def envs_create(ctx: click.Context, name: str) -> None:
-    """Provision a new project + API key and persist it as an env.
+    """Set up a new env from a dashboard project + API key.
 
-    Requires an account-level session (JWT) in ~/.papayya/config.json.
-    Run `papayya login` if the command rejects your stored credentials.
+    Projects and keys are minted in the dashboard, then linked here — the CLI
+    doesn't create accounts or projects. See `papayya envs link`.
     """
     if not name or not name.strip():
         click.echo("Error: env name must be non-empty.", err=True)
@@ -593,51 +500,12 @@ def envs_create(ctx: click.Context, name: str) -> None:
         )
         sys.exit(1)
 
-    jwt = (cfg.get("auth") or {}).get("jwt")
-    if not jwt:
-        click.echo(
-            "Error: no account session found. Run `papayya login` first — "
-            "`envs create` needs account-level credentials to create projects.",
-            err=True,
-        )
-        sys.exit(1)
-
-    base_url = ctx.obj["base_url"]
-    api = APIClient(APIConfig(api_key=jwt, base_url=base_url))
-    try:
-        slug = f"env-{name.lower()}"[:60]
-        click.echo(f"Creating project for env '{name}'...")
-        try:
-            project = api.create_project(name=f"papayya env {name}", slug=slug)
-        except PapayyaAPIError as exc:
-            if exc.status in (401, 403):
-                click.echo(
-                    "Error: stored credentials were rejected. "
-                    "Run `papayya login` to refresh, then retry.",
-                    err=True,
-                )
-                sys.exit(1)
-            raise
-        project_id = project["id"]
-        click.echo(f"  ✓ Project created ({project_id})")
-
-        click.echo("Generating API key...")
-        key_resp = api.create_api_key(project_id, name=f"cli-env-{name}")
-        api_key = key_resp.get("key") or key_resp.get("api_key") or key_resp.get("raw_key", "")
-        click.echo(f"  ✓ API key generated")
-
-        _set_env_config(cfg, name, {
-            "api_key": api_key,
-            "base_url": base_url,
-            "project_id": project_id,
-        })
-        cfg["current_env"] = name
-        _save_cli_config(cfg)
-        click.echo(f"\n✓ Env '{name}' is ready and selected as current.")
-        click.echo(f"  Project: {project_id}")
-        click.echo(f"  API key: {api_key[:12]}...")
-    finally:
-        api.close()
+    click.echo(f"Create a project + API key in the dashboard at {DEFAULT_DASHBOARD_URL},")
+    click.echo(f"then link them into env '{name}':")
+    click.echo("")
+    click.echo(f"  papayya envs link {name} --project-id <id> --api-key <key>")
+    click.echo("")
+    click.echo(f"Or paste the key interactively: papayya --env {name} login")
 
 
 # ---------------------------------------------------------------------------
@@ -1028,22 +896,6 @@ def _print_apply_result(result, *, api_base_url: str) -> None:
         click.echo(f"\nApplied {result.applied} of {result.total} operations.")
 
 
-# Plan 37: `papayya dev` (the local SQLite dashboard) is DEACTIVATED — the
-# dashboard is the Next.js app pointed at a control-plane. Detached from
-# `main` (standalone command, not registered) so `papayya dev` is unknown;
-# body retained for self-host / revival.
-@click.command()
-@click.option("--port", default=8585, help="Port for the dev dashboard")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
-              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
-def dev(port: int, host: str, db: str) -> None:
-    """Launch the local development dashboard."""
-    click.echo(f"Starting Papayya Dev Dashboard...")
-    from papayya.dev.server import serve
-    serve(host=host, port=port, db_path=db)
-
-
 # ---------------------------------------------------------------------------
 # triage — unified Needs Attention feed across DLQ + quarantine
 #
@@ -1305,7 +1157,7 @@ def runs_list(db: str, limit: int) -> None:
 
     Each line carries the outcome rollup — item counts, degraded/failed
     items, worst_outcome_status — so a degradation incident is visible
-    from the terminal. Reads the same ledger `papayya dev` serves.
+    from the terminal. Reads the local SQLite ledger directly.
     """
     import sqlite3 as _sqlite
     from pathlib import Path as _Path

@@ -5,7 +5,7 @@ Slice 3 re-keys ``papayya.agent._registry`` from
 ``dict[tuple[str, str], AgentRegistration]`` so a hosted worker can
 hold v1 and v2 of the same agent slug resident at once. ``get_agent``
 takes an optional ``version`` kwarg: ``None`` preserves single-resident
-behaviour for ``papayya dev`` / LocalDispatcher; a concrete string does
+behaviour for local scratch runs / LocalDispatcher; a concrete string does
 the multi-version lookup.
 """
 
@@ -53,7 +53,7 @@ def test_two_versions_resolve_independently():
 
 def test_no_version_returns_latest_registered():
     """``get_agent("foo", None)`` preserves the legacy single-resident
-    semantics: latest insertion wins. ``papayya dev`` and tests that
+    semantics: latest insertion wins. Local scratch runs and tests that
     register one agent per slug rely on this branch."""
 
     @agent_decorator(name="bar", agent_version="v1")
