@@ -17,13 +17,10 @@ import click
 from papayya._cli_errors import SafeGroup
 from papayya._config import (
     CONFIG_FILE as _CONFIG_FILE,
-    PapayyaYaml,
-    PapayyaYamlError,
     current_env as _current_env,
     env_config as _env_config,
     list_envs as _list_envs,
     load_cli_config as _load_cli_config,
-    load_yaml as _load_yaml,
     save_cli_config as _save_cli_config,
     set_env_config as _set_env_config,
 )
@@ -256,43 +253,6 @@ def main(ctx: click.Context, api_key: str | None, base_url: str, env: str | None
 
 
 # ---------------------------------------------------------------------------
-# init
-# ---------------------------------------------------------------------------
-
-@main.command()
-def init() -> None:
-    """Scaffold a minimal papayya.yaml in the current directory."""
-    cwd = Path.cwd()
-    target = cwd / "papayya.yaml"
-
-    if target.exists():
-        click.confirm(
-            "papayya.yaml already exists. Overwrite?",
-            default=False,
-            abort=True,
-        )
-
-    # A starter env so the first `papayya deploy` doesn't fail
-    # `_pick_yaml_env` with "no `envs:` block." `agents: {}` is valid —
-    # deploy discovers the @agent-decorated function from agent.py; the
-    # yaml block only carries per-agent schedules/webhooks.
-    target.write_text(
-        "version: 1\n"
-        "envs:\n"
-        "  dev:\n"
-        "    agents: {}\n"
-    )
-    click.echo(f"✓ Created papayya.yaml in {cwd}")
-    click.echo("")
-    click.echo("Next: write an @agent-decorated agent.py, then deploy it:")
-    click.echo("")
-    click.echo("    papayya login")
-    click.echo("    papayya deploy")
-    click.echo("")
-    click.echo("See https://docs.getpapayya.com to write your first agent.")
-
-
-# ---------------------------------------------------------------------------
 # signup / login
 # ---------------------------------------------------------------------------
 
@@ -388,7 +348,7 @@ def login(ctx: click.Context, key: str | None, project_id_opt: str | None) -> No
         click.echo(f"✓ Connected! Config saved to {_CONFIG_FILE}")
         click.echo(f"  Env: {target_env}")
         click.echo(f"  Project: {project_id}")
-        click.echo("\nNext: papayya init")
+        click.echo("\nNext: papayya deploy")
     finally:
         api.close()
 
@@ -538,8 +498,9 @@ def deploy(
       papayya deploy agents.py    # explicit file
       papayya deploy --dry-run    # preview trigger reconciliation
 
-    If a `papayya.yaml` is present, schedules and webhooks declared in it are
-    reconciled against the selected env's project after the bundle upload.
+    Schedules and webhooks declared via `@schedule` / `@trigger` decorators on
+    the deployed `@agent` functions are reconciled against the selected env's
+    project after the bundle upload.
     """
     from papayya.bundler import bundle_project
     from papayya import _reconcile
@@ -552,17 +513,10 @@ def deploy(
             click.echo("Error: No agent.py found in current directory. Specify a file:\n  papayya deploy my_agents.py", err=True)
             sys.exit(1)
 
-    # Detect optional papayya.yaml
-    yaml_path = Path("papayya.yaml")
-    spec: PapayyaYaml | None = None
-    env_name: str | None = None
-    if yaml_path.exists():
-        try:
-            spec = _load_yaml(yaml_path)
-        except PapayyaYamlError as e:
-            click.echo(f"Error: {e}", err=True)
-            sys.exit(1)
-        env_name = _pick_yaml_env(spec, ctx.obj.get("env"))
+    # Env selection is code-first: --env / PAPAYYA_ENV / current_env in
+    # ~/.papayya/config.json (all folded into ctx.obj["env"] by the main
+    # callback). There is no papayya.yaml env block.
+    env_name: str | None = ctx.obj.get("env")
 
     # Resolve auth
     resolved_key = _resolve_api_key(ctx.obj["api_key"], env=env_name)
@@ -597,9 +551,6 @@ def deploy(
         if not project_id and not agent_id:
             click.echo("Error: No project ID. Set PAPAYYA_PROJECT_ID or run `papayya signup`.", err=True)
             sys.exit(1)
-
-        if spec is not None:
-            click.echo(f"Using env '{env_name}' (project {project_id})")
 
         # Deploy each agent; track slug -> agent_id for the reconciler.
         deployed: dict[str, str] = {}
@@ -647,27 +598,23 @@ def deploy(
             deployed[slug] = resolved_agent_id
             click.echo(f"  Deployed {slug} → {resolved_agent_id}")
 
-        # Reconcile triggers. Sources are:
-        #   1. papayya.yaml (if present) — yaml_env below.
-        #   2. @schedule / @trigger decorators attached to @agent functions
-        #      — populated in the module-level registry by _discover_agents
-        #      above, harvested via _decorator_synthesis.
+        # Reconcile triggers. Source = @schedule / @trigger decorators
+        # attached to @agent functions — populated in the module-level
+        # registry by _discover_agents above, harvested via
+        # _decorator_synthesis.
         #
         # The synthesis helper is imported lazily because it transitively
         # pulls papayya.decorators (croniter + zoneinfo). Eager import at
         # cli-module load time changes module-init ordering enough to mask
         # cross-process SQLite WAL writes in the worker subprocess test
         # (see Plan 11's __init__.py __getattr__ fix for context).
-        yaml_env = spec.envs[env_name] if (spec is not None and env_name is not None) else None
         from papayya.agent import get_registry
-        from papayya._decorator_synthesis import env_spec_from_registry_and_yaml
-        env_spec = env_spec_from_registry_and_yaml(yaml_env, get_registry())
+        from papayya._decorator_synthesis import env_spec_from_registry
+        env_spec = env_spec_from_registry(get_registry())
         has_triggers = any(
             a.schedules or a.webhooks for a in env_spec.agents.values()
         )
-        if spec is not None and env_name is not None and not has_triggers:
-            click.echo("\nNo triggers declared.")
-        elif has_triggers:
+        if has_triggers:
             label = f" for env '{env_name}'" if env_name else ""
             click.echo(f"\nReconciling triggers{label}...")
             try:
@@ -713,30 +660,6 @@ def deploy(
 
     finally:
         api.close()
-
-
-def _pick_yaml_env(spec: PapayyaYaml, cli_env: str | None) -> str:
-    """Choose the env to reconcile against, or fail loud."""
-    envs = sorted(spec.envs.keys())
-    if not envs:
-        click.echo("Error: papayya.yaml has no `envs:` block.", err=True)
-        sys.exit(1)
-    if cli_env is not None:
-        if cli_env not in spec.envs:
-            click.echo(
-                f"Error: env '{cli_env}' not defined in papayya.yaml. Available: {envs}.",
-                err=True,
-            )
-            sys.exit(1)
-        return cli_env
-    if len(envs) == 1:
-        return envs[0]
-    click.echo(
-        f"Error: papayya.yaml defines multiple envs {envs}. Pass --env NAME "
-        "(or set PAPAYYA_ENV).",
-        err=True,
-    )
-    sys.exit(1)
 
 
 def _print_reconcile_plan(plan, *, api_base_url: str) -> None:
@@ -2656,7 +2579,7 @@ main.add_command(batch)
 # Plan 37: `example`, `dev`, and `project` (local ledger export/import) are
 # deactivated local surfaces — dropped from the help tiers.
 main.sections = [
-    ("Getting started", ["init", "deploy", "replay", "login"]),
+    ("Getting started", ["deploy", "replay", "login"]),
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
       "triggers", "triage"]),

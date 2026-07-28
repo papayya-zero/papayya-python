@@ -43,11 +43,11 @@ class TaskEntry:
     # joining. Stays None for runs created before the v7 migration and for
     # in-process MemoryStore use where no registration is in scope.
     agent_version: str | None = None
-    # v9: partition-key metadata. metadata is the JSON blob captured at
-    # run() time; partition_key is the value extracted from metadata
-    # using the path declared in papayya.yaml. Both denormalize from
-    # the run so the dashboard can filter steps by partition without
-    # joining (the most common use case is per-tenant filtering).
+    # partition-key metadata. metadata is the JSON blob captured at
+    # item() time; partition_key is the value passed to item()/map().
+    # Both denormalize from the run so the dashboard can filter steps by
+    # partition without joining (the most common use case is per-tenant
+    # filtering).
     metadata: dict[str, Any] | None = None
     partition_key: str | None = None
     # v11: structural outcome accountability. status defaults to 'ok'; the
@@ -88,12 +88,10 @@ class RunCheckpoint:
     # the replay-mismatch gate; the same value denormalizes onto every task
     # row written for this run.
     agent_version: str | None = None
-    # v9: partition-key metadata convention. metadata is the
-    # user-supplied JSON captured at run() time. partition_key is the
-    # value extracted at the path declared by `partition_key:` in
-    # papayya.yaml — populated only when the project config opts in.
-    # Both fields stay None for runs created before v9 and for projects
-    # with no partition_key declaration.
+    # partition-key metadata. metadata is the user-supplied JSON captured
+    # at item() time. partition_key is the value passed to item()/map() —
+    # populated only when the caller supplies one. Both fields stay None
+    # for unattributed runs.
     metadata: dict[str, Any] | None = None
     partition_key: str | None = None
     # v10: sub-runs lineage (Layer 3 #7). run_id of the outer run that
@@ -130,10 +128,9 @@ class DurableRunConfig:
     # Slice 6: run-level item_id. If set, every step inherits this item_id
     # unless a step overrides it via run.step(..., item_id=...).
     item_id: str | None = None
-    # v9: partition key value extracted from metadata at the path
-    # declared in papayya.yaml. Resolved at PapayyaClient.run()
-    # construction time so PapayyaRun never has to re-read the project
-    # config.
+    # partition key value passed to item()/map(). Resolved at
+    # PapayyaClient.item() construction time so PapayyaRun never has to
+    # re-derive it.
     partition_key: str | None = None
     # Replay snapshot supplied at construction. The @agent decorator leaves
     # this _UNSET and lets PapayyaRun.init() read the call args from the

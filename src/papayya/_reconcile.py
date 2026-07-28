@@ -1,4 +1,4 @@
-"""Reconcile papayya.yaml triggers against control plane state.
+"""Reconcile decorator-declared triggers against control plane state.
 
 Pure diff/apply for the declarative-config reconciler wired into
 `papayya deploy`. No I/O beyond the APIClient passed in; the CLI
@@ -141,14 +141,15 @@ def diff_env(
     """Compute the reconcile plan for one env against current server state.
 
     `deployed` maps agent_slug -> agent_id for agents the deploy step just
-    resolved or created. Any yaml slug not in `deployed` raises ReconcileError
-    before a single server call.
+    resolved or created. Any trigger-bearing slug not in `deployed` raises
+    ReconcileError before a single server call.
     """
     missing = [slug for slug in env_spec.agents if slug not in deployed]
     if missing:
         raise ReconcileError(
-            f"papayya.yaml references agent(s) {sorted(missing)!r} "
-            "which are not in the bundle. Add an @agent for each, or remove the block."
+            f"@schedule/@trigger declared on agent(s) {sorted(missing)!r} "
+            "which are not in the bundle. Add an @agent for each, or remove "
+            "the decorator."
         )
 
     plan = ReconcilePlan()

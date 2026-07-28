@@ -2,8 +2,10 @@
 
 Two concerns live here, kept in one module so the CLI has one import:
 
-1. `papayya.yaml` — declarative project config (envs, schedules, webhooks).
-   Pydantic-validated, read-only from the CLI's perspective.
+1. Deploy specs (`ScheduleSpec` / `WebhookSpec` / `AgentSpec` / `EnvSpec`) —
+   the data structures the reconcile path diffs against the control plane.
+   Synthesized from `@schedule` / `@trigger` decorators (code-first); no
+   `papayya.yaml` is read anywhere.
 2. `~/.papayya/config.json` — CLI session state (api keys, current env).
    JSON, mutable, backwards-compatible with the legacy flat format.
 """
@@ -12,21 +14,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    ValidationError,
-    field_validator,
     model_validator,
 )
 
 
 # ---------------------------------------------------------------------------
-# papayya.yaml schema
+# Deploy specs (synthesized from decorators)
 # ---------------------------------------------------------------------------
 
 
@@ -76,84 +75,6 @@ class AgentSpec(_Strict):
 
 class EnvSpec(_Strict):
     agents: dict[str, AgentSpec] = Field(default_factory=dict)
-
-
-class PapayyaYaml(_Strict):
-    version: Literal[1]
-    envs: dict[str, EnvSpec] = Field(default_factory=dict)
-    # v9 partition-key convention: name the metadata key whose value is
-    # the partitioning axis for this project (most often: a tenant /
-    # organization identifier). When set, every run() call must include
-    # this key in its metadata; the SDK extracts it into the indexed
-    # partition_key column so dashboards and downstream layers
-    # (per-partition budgets, rate-limit pools, fairness) can filter
-    # and aggregate without joining. Leave unset for single-partition
-    # projects.
-    partition_key: str | None = Field(
-        default=None,
-        description="Metadata key whose value identifies the partition (often a tenant) for this project.",
-    )
-
-    @field_validator("partition_key")
-    @classmethod
-    def _partition_key_nonempty(cls, value: str | None) -> str | None:
-        # An empty-string partition_key is almost certainly a mistake —
-        # pydantic would otherwise accept it and the SDK would extract
-        # empty values without complaint. Fail loud at parse time instead.
-        if value is not None and value.strip() == "":
-            raise ValueError("partition_key must be a non-empty string when set")
-        return value
-
-
-class PapayyaYamlError(Exception):
-    """Any problem loading or validating papayya.yaml."""
-
-
-def load_yaml(path: str | Path) -> PapayyaYaml:
-    """Load and validate a papayya.yaml file.
-
-    Raises PapayyaYamlError with a human-readable message on any failure
-    (missing file, malformed yaml, unknown version, schema violation).
-    """
-    p = Path(path)
-    try:
-        raw = p.read_text()
-    except FileNotFoundError as exc:
-        raise PapayyaYamlError(f"papayya.yaml not found at {p}") from exc
-    except OSError as exc:
-        raise PapayyaYamlError(f"Could not read {p}: {exc}") from exc
-
-    try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise PapayyaYamlError(f"Malformed yaml in {p}: {exc}") from exc
-
-    if data is None:
-        raise PapayyaYamlError(f"{p} is empty.")
-    if not isinstance(data, dict):
-        raise PapayyaYamlError(f"{p} must be a mapping at the top level.")
-
-    # Unknown version gets a dedicated message before generic schema errors
-    # (pydantic's Literal[1] mismatch otherwise reads as a cryptic type error).
-    version = data.get("version")
-    if version is not None and version != 1:
-        raise PapayyaYamlError(
-            f"papayya.yaml version {version!r} is not supported. "
-            f"This CLI understands `version: 1`. Upgrade papayya or change the file."
-        )
-
-    try:
-        return PapayyaYaml.model_validate(data)
-    except ValidationError as exc:
-        raise PapayyaYamlError(_format_validation_error(p, exc)) from exc
-
-
-def _format_validation_error(path: Path, exc: ValidationError) -> str:
-    lines = [f"Invalid papayya.yaml ({path}):"]
-    for err in exc.errors():
-        loc = ".".join(str(x) for x in err["loc"]) or "<root>"
-        lines.append(f"  - {loc}: {err['msg']}")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

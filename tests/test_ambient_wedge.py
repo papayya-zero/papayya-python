@@ -200,26 +200,9 @@ def test_partition_key_kwarg_reaches_minted_run(db):
     assert runs[0]["partition_key"] == "tenant-a"
 
 
-@pytest.fixture
-def declared_partition_key_yaml(tmp_path, monkeypatch):
-    """A project whose papayya.yaml declares a partition_key — the
-    multi-tenant configuration. Chdir so ``papayya().run()`` resolves it."""
-    (tmp_path / "papayya.yaml").write_text(
-        "version: 1\n"
-        "partition_key: tenant_id\n"
-        "envs:\n"
-        "  dev:\n"
-        "    agents: {}\n"
-    )
-    monkeypatch.chdir(tmp_path)
-
-
-def test_declared_partition_key_does_not_crash_clean_path(
-    db, declared_partition_key_yaml
-):
-    """Regression: the lazy mint called papayya().run() with no metadata, so a
-    declared partition_key hit strict-when-declared and the first ambient verb
-    raised ValueError. The body can't pass metadata — record NULL instead."""
+def test_ambient_clean_path_records_null_partition_key(db):
+    """The ambient mint passes no partition_key, so the run records NULL
+    (unattributed) — code-first attribution is opt-in via item()/map()."""
 
     @papayya.llm
     def call_model(item):
@@ -237,11 +220,9 @@ def test_declared_partition_key_does_not_crash_clean_path(
     assert runs[0]["partition_key"] is None
 
 
-def test_declared_partition_key_does_not_crash_inject_path(
-    db, declared_partition_key_yaml
-):
-    """Same regression on the ``def f(run, …)`` branch — the decorator's
-    factory call passes no metadata either."""
+def test_ambient_inject_path_records_null_partition_key(db):
+    """Same on the ``def f(run, …)`` branch — the decorator's factory call
+    passes no partition_key, so the run is unattributed and does not crash."""
 
     @papayya.durable
     def enrich(run, item):

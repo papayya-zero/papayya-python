@@ -11,22 +11,19 @@ are imported from that file to avoid drift.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
 from papayya import cli as cli_module
+from papayya._config import ScheduleSpec, WebhookSpec
 
-# Reuse the heavy-lifting fixtures from test_deploy_reconcile rather than
-# duplicating them — keeps both files in lockstep when the deploy flow
-# evolves and is the convention this suite already follows.
-from tests.test_deploy_reconcile import deploy_env, tmp_config  # noqa: F401
-
-
-def _write_yaml(tmp_path: Path, body: str) -> None:
-    (tmp_path / "papayya.yaml").write_text(body)
+# Reuse the heavy-lifting fixtures + registry seeding helper from
+# test_deploy_reconcile rather than duplicating them — keeps both files in
+# lockstep when the deploy flow evolves and is the convention this suite
+# already follows.
+from tests.test_deploy_reconcile import _seed_registry, deploy_env, tmp_config  # noqa: F401
 
 
 def _invoke(*args: str) -> tuple[int, str, str]:
@@ -42,18 +39,13 @@ def _invoke(*args: str) -> tuple[int, str, str]:
 def test_dry_run_calls_put_endpoints_with_dry_run_flag(
     deploy_env: dict[str, Any],
 ) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules:
-          - {cron: "0 9 * * *"}
-          - {cron: "0 17 * * *"}
-        webhooks:
-          - {name: trigger, secret_env: MY_SECRET}
-""")
+    _seed_registry(
+        schedules=[
+            ScheduleSpec(cron="0 9 * * *"),
+            ScheduleSpec(cron="0 17 * * *"),
+        ],
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     api = deploy_env["api"]
@@ -100,15 +92,10 @@ def test_dry_run_renders_managed_section_with_counts(
         "delete": [],
         "unmanaged_skipped": 0,
     }
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        schedules=[ScheduleSpec(cron="0 9 * * *")],
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     assert "managed_by='code' diff (PUT-replace preview):" in stdout
@@ -153,14 +140,7 @@ def test_dry_run_renders_update_with_field_changes(
         "managed_by": "code",
         "create": [], "update": [], "delete": [], "unmanaged_skipped": 0,
     }
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-""")
+    _seed_registry(schedules=[ScheduleSpec(cron="0 9 * * *")])
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     assert "~ schedule 0 9 * * *" in stdout
@@ -188,15 +168,10 @@ def test_dry_run_does_not_modify_legacy_reconcile_output(
         "managed_by": "code",
         "create": [], "update": [], "delete": [], "unmanaged_skipped": 0,
     }
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        schedules=[ScheduleSpec(cron="0 9 * * *")],
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     # The legacy renderer's per-agent line and the per-op lines must be
@@ -246,14 +221,7 @@ def test_real_deploy_also_prints_managed_preview(
 
     monkeypatch.setattr(reconcile_mod, "apply_plan", fake_apply)
 
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-""")
+    _seed_registry(schedules=[ScheduleSpec(cron="0 9 * * *")])
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
     # Preview rendered AND apply was invoked.
@@ -272,14 +240,7 @@ def test_dry_run_api_error_exits_with_message(
     from papayya.api import PapayyaAPIError
     api = deploy_env["api"]
     api.put_schedules.side_effect = PapayyaAPIError(500, "boom")
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-""")
+    _seed_registry(schedules=[ScheduleSpec(cron="0 9 * * *")])
     exit_code, _stdout, stderr = _invoke("deploy")
     assert exit_code != 0
     assert "Error (managed_by preview):" in stderr
@@ -319,14 +280,7 @@ def test_zero_managed_resources_still_probes_both_endpoints(
         "delete": [{"id": "ghost", "name": "old-trigger"}],
         "unmanaged_skipped": 0,
     }
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-""")
+    _seed_registry(schedules=[ScheduleSpec(cron="0 9 * * *")])
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     # put_webhooks was probed even though the yaml declares zero webhooks.

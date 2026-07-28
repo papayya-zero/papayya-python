@@ -1,9 +1,9 @@
 """Tiered --help (Plan 34 Unit 4).
 
 `papayya --help` must read as a quickstart: the rung-0 loop
-(init → example → dev → replay, plus deploy/login) listed first under
-"Getting started", hosted/ops groups grouped below, and the deprecated
-hidden aliases (`batch`, `webhooks`) absent.
+(deploy → replay, plus login) listed first under "Getting started",
+hosted/ops groups grouped below, and the deprecated hidden aliases
+(`batch`, `webhooks`) absent.
 """
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ def test_rung_zero_commands_lead() -> None:
     out = result.output
     started = out[out.index("Getting started:"):out.index("Run agents & inspect results:")]
     # Plan 37: `example` + `dev` deactivated (local surface hidden).
-    for cmd in ("init", "deploy", "replay", "login"):
+    # Code-first: `init` removed (papayya.yaml scaffolding retired).
+    for cmd in ("deploy", "replay", "login"):
         assert re.search(rf"^  {cmd}\b", started, flags=re.M), f"{cmd} missing from Getting started"
     # Ops commands must NOT be in the first section.
     for cmd in ("envs", "secrets", "rate-card", "usage"):

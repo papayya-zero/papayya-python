@@ -1,18 +1,17 @@
-"""v9 partition-key metadata convention.
+"""partition-key metadata convention (code-first).
 
-Covers store round-trip + PapayyaClient strict-when-declared enforcement
-against papayya.yaml. The yaml's partition_key declaration is the contract:
-when set, every run() call must include the named key in metadata.
+Covers the metadata codec + store round-trip of the ``partition_key`` value
+supplied to ``item()`` / ``map()``. Attribution is opt-in: a run carries a
+partition_key only when the caller passes one — there is no declarative
+(papayya.yaml) enforcement.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
-from papayya.durable.client import PapayyaClient, PapayyaClientConfig
 from papayya.durable.sqlite_store import SQLiteStore, _decode_metadata, _encode_metadata
 from papayya.durable.types import RunCheckpoint, TaskEntry
 
@@ -122,107 +121,46 @@ class TestSQLiteStoreRoundTrip:
         assert task.partition_key is None
 
 
-@pytest.fixture
-def papayya_yaml_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Run tests inside a temp cwd so PapayyaClient picks up our yaml."""
-    monkeypatch.chdir(tmp_path)
-    return tmp_path
+class TestCodeFirstPartitionKey:
+    """Attribution is opt-in via ``item(partition_key=...)`` — a non-empty
+    string is used as-is; omitting it (or ``None``) records unattributed."""
 
+    def test_explicit_partition_key_persists(self, tmp_path: Path) -> None:
+        from papayya import Papayya
 
-def _write_yaml(dir: Path, body: str) -> None:
-    (dir / "papayya.yaml").write_text(body)
-
-
-class TestPapayyaClientStrictWhenDeclared:
-    """PapayyaClient.run() reads papayya.yaml at first call and enforces
-    that every run includes the declared partition_key in its metadata."""
-
-    def test_no_yaml_means_partition_key_optional(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        # No papayya.yaml exists — runs without metadata are accepted.
         store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
-        run = client.run(agent="enrich")
-        assert run is not None
-
-    def test_yaml_without_partition_key_means_optional(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(papayya_yaml_dir, "version: 1\n")
-        store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
-        run = client.run(agent="enrich", metadata={"any": "thing"})
-        assert run is not None
-
-    def test_declared_key_present_extracts_value(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(
-            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
-        )
-        store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
-        run = client.run(
-            agent="enrich",
-            run_id="r1",
-            metadata={"organization_id": "org_42", "user_id": "u_7"},
+        run = Papayya(store=store).item(
+            agent="enrich", run_id="r1", partition_key="org_42"
         )
         run.step("enrich", lambda: {"out": 1})()
-        # Round-trip via the store.
+
         loaded = store.load("r1")
         assert loaded is not None
         assert loaded.partition_key == "org_42"
-        assert loaded.metadata == {"organization_id": "org_42", "user_id": "u_7"}
         (task,) = loaded.tasks
         assert task.partition_key == "org_42"
 
-    def test_declared_key_missing_metadata_raises(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(
-            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
-        )
-        store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
-        with pytest.raises(ValueError, match="organization_id"):
-            client.run(agent="enrich")
+    def test_omitted_partition_key_is_unattributed(self, tmp_path: Path) -> None:
+        from papayya import Papayya
 
-    def test_declared_key_metadata_missing_key_raises(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(
-            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
-        )
         store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
-        with pytest.raises(ValueError, match="organization_id"):
-            client.run(agent="enrich", metadata={"unrelated": "value"})
+        run = Papayya(store=store).item(agent="enrich", run_id="r1")
+        run.step("enrich", lambda: {"out": 1})()
 
-    def test_declared_key_empty_value_raises(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(
-            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
-        )
+        loaded = store.load("r1")
+        assert loaded is not None
+        assert loaded.partition_key is None
+
+    def test_empty_partition_key_raises(self, tmp_path: Path) -> None:
+        from papayya import Papayya
+
         store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
         with pytest.raises(ValueError, match="non-empty"):
-            client.run(
-                agent="enrich",
-                metadata={"organization_id": ""},
-            )
+            Papayya(store=store).item(agent="enrich", partition_key="")
 
-    def test_declared_key_non_string_raises(
-        self, tmp_path: Path, papayya_yaml_dir: Path
-    ) -> None:
-        _write_yaml(
-            papayya_yaml_dir, "version: 1\npartition_key: organization_id\n"
-        )
+    def test_non_string_partition_key_raises(self, tmp_path: Path) -> None:
+        from papayya import Papayya
+
         store = SQLiteStore(str(tmp_path / "local.db"))
-        client = PapayyaClient(PapayyaClientConfig(store=store))
         with pytest.raises(ValueError, match="non-empty"):
-            client.run(
-                agent="enrich",
-                metadata={"organization_id": 42},
-            )
+            Papayya(store=store).item(agent="enrich", partition_key=42)

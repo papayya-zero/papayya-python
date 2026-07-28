@@ -1,4 +1,10 @@
-"""CLI-level tests for `papayya deploy` with papayya.yaml reconciliation."""
+"""CLI-level tests for `papayya deploy` decorator-sourced reconciliation.
+
+Schedules and webhooks are declared via `@schedule` / `@trigger` on the
+`@agent` functions (harvested into the module-level registry); the
+papayya.yaml surface has been removed from the CLI. Tests seed the
+registry directly via `_seed_registry` to stand in for decorator-harvest.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ from click.testing import CliRunner
 
 from papayya import _config as cfg_module
 from papayya import cli as cli_module
+from papayya._config import ScheduleSpec, WebhookSpec
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +130,30 @@ def deploy_env(
     api_patcher.stop()
 
 
-def _write_yaml(tmp_path: Path, body: str) -> None:
-    (tmp_path / "papayya.yaml").write_text(body)
+def _seed_registry(
+    *,
+    name: str = "ops-bot",
+    schedules: list | None = None,
+    webhooks: list | None = None,
+) -> None:
+    """Populate the module-level @agent registry as decorator-harvest would.
+
+    The deploy fixture monkeypatches `_discover_agents` (which normally
+    fills the registry), so tests seed it directly. The registry is
+    cleared by the `deploy_env` fixture at the start of every test.
+    """
+    from papayya.agent import AgentRegistration, _registry
+    _registry[(name, "v1")] = AgentRegistration(
+        name=name,
+        model="gpt-4o-mini",
+        instructions="",
+        fn=lambda *_a, **_k: None,
+        tools=[],
+        max_steps=10,
+        budget_usd=1.0,
+        schedules=list(schedules or []),
+        webhooks=list(webhooks or []),
+    )
 
 
 def _invoke(*args: str) -> tuple[int, str, str]:
@@ -150,43 +179,13 @@ def test_deploy_without_yaml_is_unchanged(deploy_env: dict[str, Any]) -> None:
     api.create_webhook.assert_not_called()
 
 
-def test_deploy_multi_env_yaml_without_env_flag_errors(
-    deploy_env: dict[str, Any],
-) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 * * * *"}]
-  prod:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 * * * *"}]
-""")
-    exit_code, _stdout, stderr = _invoke("deploy")
-    assert exit_code != 0
-    assert "multiple envs" in stderr
-    assert "dev" in stderr and "prod" in stderr
-    # Must fail before any server calls.
-    api = deploy_env["api"]
-    api.list_schedules.assert_not_called()
-    api.upload_deployment.assert_not_called()
-
-
 def test_deploy_dry_run_prints_plan_without_mutation(
     deploy_env: dict[str, Any],
 ) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        schedules=[ScheduleSpec(cron="0 9 * * *")],
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
     assert exit_code == 0, stdout
     assert "Dry run — no changes applied." in stdout
@@ -215,15 +214,10 @@ envs:
 def test_deploy_create_schedule_and_webhook_happy_path(
     deploy_env: dict[str, Any],
 ) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        schedules=[ScheduleSpec(cron="0 9 * * *")],
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
     api = deploy_env["api"]
@@ -252,14 +246,9 @@ envs:
 def test_deploy_prints_webhook_secret_and_url_on_create(
     deploy_env: dict[str, Any],
 ) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        webhooks=[WebhookSpec(name="trigger", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("--base-url", "https://control.example.com", "deploy")
     assert exit_code == 0, stdout
     assert "whs_abcdef" in stdout
@@ -271,8 +260,9 @@ def test_deploy_webhook_rename_prints_rotation_warning(
     deploy_env: dict[str, Any],
 ) -> None:
     api = deploy_env["api"]
-    # The old name is code-managed; the new yaml omits it -> rename = delete-
-    # then-create. Post-Plan 12 the rename is one PUT call replacing the set.
+    # The old name is code-managed; the new decorator set omits it ->
+    # rename = delete-then-create. Post-Plan 12 the rename is one PUT call
+    # replacing the set.
     api.list_webhooks.return_value = [
         {"id": "wh-old", "name": "old-name", "managed_by": "code"},
     ]
@@ -286,14 +276,9 @@ def test_deploy_webhook_rename_prints_rotation_warning(
         }],
         "summary": {"created": 1, "updated": 0, "deleted": 1, "unchanged": 0},
     }
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        webhooks: [{name: new-name, secret_env: MY_SECRET}]
-""")
+    _seed_registry(
+        webhooks=[WebhookSpec(name="new-name", secret_env="MY_SECRET")],
+    )
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
     assert "rotating webhook 'new-name'" in stdout
@@ -331,17 +316,13 @@ def test_deploy_partial_failure_stops_and_reports(
         dryrun_wh_response,             # 1st call: Plan 13 preview probe
         PapayyaAPIError(500, "boom"),   # 2nd call: apply
     ]
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks:
-          - {name: a, secret_env: A}
-          - {name: b, secret_env: B}
-""")
+    _seed_registry(
+        schedules=[ScheduleSpec(cron="0 9 * * *")],
+        webhooks=[
+            WebhookSpec(name="a", secret_env="A"),
+            WebhookSpec(name="b", secret_env="B"),
+        ],
+    )
     exit_code, stdout, stderr = _invoke("deploy")
     assert exit_code != 0
     # put_schedules: dry-run probe + apply = 2 calls.
@@ -351,17 +332,13 @@ envs:
     assert "Applied 1 of 3 operations." in stderr
 
 
-def test_deploy_yaml_refs_undeployed_slug_errors_before_server(
+def test_deploy_trigger_on_undeployed_slug_errors_before_server(
     deploy_env: dict[str, Any],
 ) -> None:
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ghost-agent:
-        schedules: [{cron: "0 * * * *"}]
-""")
+    # A @schedule attached to an agent slug that isn't among the deployed
+    # agents (the fixture deploys only "ops-bot"). diff_env must fail loud
+    # before any server mutation.
+    _seed_registry(name="ghost-agent", schedules=[ScheduleSpec(cron="0 * * * *")])
     exit_code, _stdout, stderr = _invoke("deploy")
     assert exit_code != 0
     assert "ghost-agent" in stderr
@@ -378,8 +355,8 @@ def test_deploy_shows_agent_id_in_output(deploy_env: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 12: decorator-harvest splice — the deploy flow fuses yaml + decorator
-# metadata via _decorator_synthesis.env_spec_from_registry_and_yaml before
+# Plan 12: decorator-harvest splice — the deploy flow builds its EnvSpec
+# from the registry via _decorator_synthesis.env_spec_from_registry before
 # diff_env runs.
 # ---------------------------------------------------------------------------
 
@@ -388,9 +365,9 @@ def test_deploy_calls_synthesis_helper_before_diff_env(
     deploy_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Splice contract: the deploy flow must hand its yaml_env + registry
-    to env_spec_from_registry_and_yaml, then pass the helper's RETURN
-    value to diff_env (not the raw yaml block)."""
+    """Splice contract: the deploy flow must hand the registry to
+    env_spec_from_registry, then pass the helper's RETURN value to
+    diff_env (not the raw registry)."""
     from papayya._config import AgentSpec, EnvSpec, ScheduleSpec
     from papayya import _decorator_synthesis as synth_mod
     from papayya import _reconcile as reconcile_mod
@@ -401,12 +378,12 @@ def test_deploy_calls_synthesis_helper_before_diff_env(
 
     synth_calls: list[Any] = []
 
-    def fake_synth(yaml_env: Any, registry: Any) -> EnvSpec:
-        synth_calls.append((yaml_env, registry))
+    def fake_synth(registry: Any) -> EnvSpec:
+        synth_calls.append(registry)
         return sentinel_env
 
     monkeypatch.setattr(
-        synth_mod, "env_spec_from_registry_and_yaml", fake_synth,
+        synth_mod, "env_spec_from_registry", fake_synth,
     )
 
     diff_calls: list[Any] = []
@@ -418,62 +395,18 @@ def test_deploy_calls_synthesis_helper_before_diff_env(
 
     monkeypatch.setattr(reconcile_mod, "diff_env", fake_diff_env)
 
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-""")
+    _seed_registry(schedules=[ScheduleSpec(cron="0 9 * * *")])
     exit_code, stdout, _stderr = _invoke("deploy")
     assert exit_code == 0, stdout
-    # Synthesis was called exactly once with the parsed yaml env + the
-    # registry dict.
+    # Synthesis was called exactly once with the registry dict.
     assert len(synth_calls) == 1
-    yaml_env_arg, registry_arg = synth_calls[0]
-    assert yaml_env_arg is not None
-    assert "ops-bot" in yaml_env_arg.agents
+    registry_arg = synth_calls[0]
     assert isinstance(registry_arg, dict)
     # diff_env received the SENTINEL env_spec the helper returned, not
-    # the raw yaml block.
+    # the raw registry.
     assert len(diff_calls) == 1
     diff_env_arg, _deployed = diff_calls[0]
     assert diff_env_arg is sentinel_env
-
-
-def test_deploy_yaml_only_continues_to_work(deploy_env: dict[str, Any]) -> None:
-    """Regression guard: yaml-only customers (no @schedule / @trigger
-    decorators) must produce the same plan they did pre-synthesis.
-    Exercised via the dry-run path so the test asserts shape, not
-    side-effects."""
-    _write_yaml(deploy_env["tmp_path"], """\
-version: 1
-envs:
-  dev:
-    agents:
-      ops-bot:
-        schedules: [{cron: "0 9 * * *"}]
-        webhooks: [{name: trigger, secret_env: MY_SECRET}]
-""")
-    exit_code, stdout, _stderr = _invoke("deploy", "--dry-run")
-    assert exit_code == 0, stdout
-    # The plan was printed (yaml entries surfaced as creates).
-    assert "schedule 0 9 * * *" in stdout
-    assert "webhook  trigger" in stdout
-    api = deploy_env["api"]
-    # Plan 13: --dry-run still probes PUT endpoints to render the
-    # managed_by='code' preview. Apply is what's suppressed.
-    api.put_schedules.assert_called_once_with(
-        "agt1",
-        [{"cron_expression": "0 9 * * *", "timezone": "UTC"}],
-        dry_run=True,
-    )
-    api.put_webhooks.assert_called_once_with(
-        "agt1",
-        [{"name": "trigger", "secret_env": "MY_SECRET"}],
-        dry_run=True,
-    )
 
 
 def test_deploy_decorator_only_no_yaml_succeeds(

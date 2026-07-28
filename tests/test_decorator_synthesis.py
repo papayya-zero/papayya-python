@@ -1,17 +1,16 @@
-"""Tests for papayya._decorator_synthesis.env_spec_from_registry_and_yaml.
+"""Tests for papayya._decorator_synthesis.env_spec_from_registry.
 
-The synthesis helper fuses yaml-sourced EnvSpec with the @schedule /
-@trigger decorator-attached registry produced by Plan 11. Exercised
-five ways: empty, yaml-only, decorator-only, fused-overlap, and
-fused-disjoint.
+The synthesis helper shapes the @schedule / @trigger decorator-attached
+registry produced by Plan 11 into the EnvSpec the reconciler reads.
+Decorators are the sole source of truth (the papayya.yaml surface was
+removed from the CLI). Exercised: empty, single-agent, multi-agent, and
+immutability of the harvested specs.
 """
 
 from __future__ import annotations
 
-import pytest
-
-from papayya._config import AgentSpec, EnvSpec, ScheduleSpec, WebhookSpec
-from papayya._decorator_synthesis import env_spec_from_registry_and_yaml
+from papayya._config import EnvSpec, ScheduleSpec, WebhookSpec
+from papayya._decorator_synthesis import env_spec_from_registry
 from papayya.agent import AgentRegistration
 
 
@@ -34,53 +33,30 @@ def _reg(
     )
 
 
-def test_synthesis_returns_empty_envspec_when_no_yaml_no_registry() -> None:
-    out = env_spec_from_registry_and_yaml(None, {})
+def test_synthesis_returns_empty_envspec_when_no_registry() -> None:
+    out = env_spec_from_registry({})
     assert isinstance(out, EnvSpec)
     assert out.agents == {}
 
 
-def test_synthesis_yaml_only_returns_yaml() -> None:
-    """No decorator metadata -> the yaml passes through unchanged."""
-    yaml_env = EnvSpec(agents={
-        "ops-bot": AgentSpec(
+def test_synthesis_single_agent_schedules() -> None:
+    registry: dict[tuple[str, str], AgentRegistration] = {
+        ("ops-bot", "v1"): _reg(
+            "ops-bot",
             schedules=[
                 ScheduleSpec(cron="0 9 * * *"),
                 ScheduleSpec(cron="*/15 * * * *"),
             ],
         ),
-    })
-    out = env_spec_from_registry_and_yaml(yaml_env, {})
+    }
+    out = env_spec_from_registry(registry)
     assert set(out.agents.keys()) == {"ops-bot"}
-    assert len(out.agents["ops-bot"].schedules) == 2
     crons = [s.cron for s in out.agents["ops-bot"].schedules]
     assert crons == ["0 9 * * *", "*/15 * * * *"]
     assert out.agents["ops-bot"].webhooks == []
 
 
-def test_synthesis_decorator_only_returns_decorator() -> None:
-    """No yaml at all -> result has only decorator-attached agents."""
-    registry: dict[tuple[str, str], AgentRegistration] = {
-        ("ops-bot", "v1"): _reg(
-            "ops-bot",
-            schedules=[ScheduleSpec(cron="0 9 * * *")],
-        ),
-    }
-    out = env_spec_from_registry_and_yaml(None, registry)
-    assert set(out.agents.keys()) == {"ops-bot"}
-    assert len(out.agents["ops-bot"].schedules) == 1
-    assert out.agents["ops-bot"].schedules[0].cron == "0 9 * * *"
-    assert out.agents["ops-bot"].webhooks == []
-
-
-def test_synthesis_fuses_yaml_and_decorator_for_same_slug() -> None:
-    """Agent in both yaml AND registry -> union of schedules + webhooks."""
-    yaml_env = EnvSpec(agents={
-        "ops-bot": AgentSpec(
-            schedules=[ScheduleSpec(cron="0 9 * * *")],
-            webhooks=[WebhookSpec(name="yaml-hook", secret_env="A")],
-        ),
-    })
+def test_synthesis_single_agent_schedules_and_webhooks() -> None:
     registry: dict[tuple[str, str], AgentRegistration] = {
         ("ops-bot", "v1"): _reg(
             "ops-bot",
@@ -88,53 +64,37 @@ def test_synthesis_fuses_yaml_and_decorator_for_same_slug() -> None:
             webhooks=[WebhookSpec(name="decorator-hook", secret_env="B")],
         ),
     }
-    out = env_spec_from_registry_and_yaml(yaml_env, registry)
+    out = env_spec_from_registry(registry)
     agent = out.agents["ops-bot"]
-    crons = sorted(s.cron for s in agent.schedules)
-    assert crons == ["*/15 * * * *", "0 9 * * *"]
-    names = sorted(w.name for w in agent.webhooks)
-    assert names == ["decorator-hook", "yaml-hook"]
+    assert [s.cron for s in agent.schedules] == ["*/15 * * * *"]
+    assert [w.name for w in agent.webhooks] == ["decorator-hook"]
 
 
-def test_synthesis_decorator_only_slug_not_in_yaml() -> None:
-    """yaml has agent A; registry has agent B with decorators -> result
-    carries BOTH agents, A from yaml unmodified, B from decorators."""
-    yaml_env = EnvSpec(agents={
-        "agent-a": AgentSpec(schedules=[ScheduleSpec(cron="0 9 * * *")]),
-    })
+def test_synthesis_multiple_agents() -> None:
     registry: dict[tuple[str, str], AgentRegistration] = {
+        ("agent-a", "v1"): _reg(
+            "agent-a", schedules=[ScheduleSpec(cron="0 9 * * *")],
+        ),
         ("agent-b", "v1"): _reg(
-            "agent-b",
-            webhooks=[WebhookSpec(name="b-hook", secret_env="B")],
+            "agent-b", webhooks=[WebhookSpec(name="b-hook", secret_env="B")],
         ),
     }
-    out = env_spec_from_registry_and_yaml(yaml_env, registry)
+    out = env_spec_from_registry(registry)
     assert set(out.agents.keys()) == {"agent-a", "agent-b"}
-    # A: yaml schedule, no webhooks.
     assert [s.cron for s in out.agents["agent-a"].schedules] == ["0 9 * * *"]
     assert out.agents["agent-a"].webhooks == []
-    # B: decorator webhook, no schedules.
     assert out.agents["agent-b"].schedules == []
     assert [w.name for w in out.agents["agent-b"].webhooks] == ["b-hook"]
 
 
-def test_synthesis_preserves_immutability_of_yaml_envspec() -> None:
-    """The synthesis must not mutate the yaml EnvSpec's AgentSpec lists.
-    Pydantic frozen-model `model_copy(update=...)` produces a NEW
-    AgentSpec — the original's schedules/webhooks must be untouched
-    after fusion."""
+def test_synthesis_does_not_mutate_registration_lists() -> None:
+    """The synthesis must not alias the registration's schedule list —
+    the built AgentSpec carries a copy."""
     original_schedules = [ScheduleSpec(cron="0 9 * * *")]
-    yaml_env = EnvSpec(agents={
-        "ops-bot": AgentSpec(schedules=original_schedules),
-    })
     registry: dict[tuple[str, str], AgentRegistration] = {
-        ("ops-bot", "v1"): _reg(
-            "ops-bot",
-            schedules=[ScheduleSpec(cron="*/15 * * * *")],
-        ),
+        ("ops-bot", "v1"): _reg("ops-bot", schedules=original_schedules),
     }
-    out = env_spec_from_registry_and_yaml(yaml_env, registry)
-    # Original yaml block is untouched.
-    assert len(yaml_env.agents["ops-bot"].schedules) == 1
-    # Output has the union.
-    assert len(out.agents["ops-bot"].schedules) == 2
+    out = env_spec_from_registry(registry)
+    out.agents["ops-bot"].schedules.append(ScheduleSpec(cron="*/15 * * * *"))
+    # Original registration list is untouched.
+    assert len(original_schedules) == 1

@@ -39,15 +39,11 @@ from __future__ import annotations
 
 import os
 from functools import cached_property
-from pathlib import Path
 from typing import Any
 
 from papayya._config import (
-    PapayyaYaml,
-    PapayyaYamlError,
     env_config,
     load_cli_config,
-    load_yaml,
 )
 from papayya._defaults import DEFAULT_BASE_URL
 from papayya.api import APIClient, PapayyaAPIError, resolve_config
@@ -64,11 +60,9 @@ from papayya.resources.usage import Usage
 from papayya.resources.webhooks import Webhooks
 
 
-_PARTITION_KEY_SENTINEL = object()
-
-# Distinguishes "run(partition_key=...) not passed" (strict metadata
-# extraction applies) from an explicit value — including an explicit None,
-# which opts a run out of strict-when-declared.
+# Distinguishes "item(partition_key=...) not passed" (unattributed) from an
+# explicit value — including an explicit None, which records the run
+# unattributed.
 _PARTITION_KEY_UNSET = object()
 
 
@@ -94,52 +88,6 @@ def _resolve_durable_base_url(explicit: str | None) -> str:
     return os.environ.get("PAPAYYA_BASE_URL") or DEFAULT_BASE_URL
 
 
-def _resolve_yaml_partition_key_field(yaml_path: Path) -> str | None:
-    """Read the partition_key declaration from papayya.yaml. None when absent.
-
-    Missing yaml is silent — single-partition projects don't need to
-    write one. Malformed yaml or version mismatches raise
-    PapayyaYamlError so config bugs surface here rather than at first
-    run().
-    """
-    if not yaml_path.exists():
-        return None
-    spec: PapayyaYaml = load_yaml(yaml_path)
-    return spec.partition_key
-
-
-def _extract_partition_key(
-    metadata: dict[str, Any] | None,
-    partition_key_field: str,
-) -> str:
-    """Pull the partition key value from run metadata. Strict by design.
-
-    Raises ValueError when papayya.yaml declares a partition_key but
-    the caller didn't include it in metadata, or included an
-    empty/non-string value. The error names the missing key so the
-    caller knows what contract they're violating.
-    """
-    if not metadata:
-        raise ValueError(
-            f"papayya.yaml declares partition_key={partition_key_field!r} but "
-            f"run() was called with no metadata. Pass "
-            f"metadata={{{partition_key_field!r}: ...}} to identify the partition."
-        )
-    if partition_key_field not in metadata:
-        raise ValueError(
-            f"papayya.yaml declares partition_key={partition_key_field!r} but "
-            f"run() metadata is missing this key. "
-            f"metadata.keys()={sorted(metadata.keys())}"
-        )
-    value = metadata[partition_key_field]
-    if not isinstance(value, str) or value == "":
-        raise ValueError(
-            f"metadata[{partition_key_field!r}] must be a non-empty string; "
-            f"got {value!r}"
-        )
-    return value
-
-
 class Papayya:
     """Canonical Papayya SDK client.
 
@@ -163,8 +111,6 @@ class Papayya:
         # local-only durable script (no api_key) can construct Papayya
         # without ever needing credentials.
         self._api: APIClient | None = None
-        # papayya.yaml partition_key declaration — resolved on first run().
-        self._partition_key_field: Any = _PARTITION_KEY_SENTINEL
 
     # --- internal ----------------------------------------------------- #
 
@@ -180,13 +126,6 @@ class Papayya:
             config = resolve_config(self._api_key, self._base_url)
             self._api = APIClient(config)
         return self._api
-
-    def _project_partition_key_field(self) -> str | None:
-        if self._partition_key_field is _PARTITION_KEY_SENTINEL:
-            self._partition_key_field = _resolve_yaml_partition_key_field(
-                Path("papayya.yaml")
-            )
-        return self._partition_key_field  # type: ignore[return-value]
 
     def _auto_store(self) -> Any:
         """Auto-select a CheckpointStore for durable runs.
@@ -259,19 +198,12 @@ class Papayya:
         their pre-consolidation kwarg names for compatibility; ``item_id=``
         stays reserved for CUSTOMER identity (e.g. ``"co_007"``).
 
-        When ``papayya.yaml`` declares a ``partition_key:``, the
-        supplied ``metadata`` MUST include that key —
-        strict-when-declared. The extracted value is persisted in the
-        indexed ``partition_key`` column on every row written under
-        this run.
-
-        Passing ``partition_key=`` explicitly overrides the metadata
-        extraction: a non-empty string is used as-is; an explicit
-        ``None`` records the run unattributed even when papayya.yaml
-        declares a field. The ``@papayya.durable`` clean path mints
-        runs this way — the caller there never sees ``run()``, so the
-        strict-metadata contract can't apply to it (use
-        ``papayya.map(..., partition_key=…)`` for real attribution).
+        Attribution is code-first: pass ``partition_key=`` to persist an
+        indexed partition value (often a tenant / organization id) on every
+        row written under this run. A non-empty string is used as-is; an
+        explicit ``None`` (or omitting it) records the run unattributed.
+        ``papayya.map(..., partition_key=…)`` is the per-item form for real
+        per-partition attribution.
 
         When called from inside an ``@agent`` body, the outer run's id
         is picked up automatically (sub-runs lineage / Layer 3 #7). Pass
@@ -314,9 +246,6 @@ class Papayya:
             partition_key_value = partition_key
         else:
             partition_key_value = None
-            partition_key_field = self._project_partition_key_field()
-            if partition_key_field is not None:
-                partition_key_value = _extract_partition_key(metadata, partition_key_field)
 
         resolved_store = store or self._store_override or self._auto_store()
 

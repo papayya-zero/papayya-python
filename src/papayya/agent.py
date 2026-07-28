@@ -172,10 +172,10 @@ class AgentRegistration:
     # whose version doesn't match the original run unless --latest.
     # ADR-0002 #7.
     agent_version: str = "unknown"
-    # Cap on concurrent in-flight items per partition_key value (where
-    # partition_key is the metadata field declared in papayya.yaml). When
-    # the cap is hit, additional items stay in runtime_pending until an
-    # in-flight one finishes. None disables the cap. Layer 3 #1.
+    # Cap on concurrent in-flight items per partition_key value (the
+    # partition_key passed to item()/map()). When the cap is hit,
+    # additional items stay in runtime_pending until an in-flight one
+    # finishes. None disables the cap. Layer 3 #1.
     concurrency_per_key: int | None = None
     # Cap on lease throughput per partition_key value, in requests/min.
     # Sliding window. None disables the cap. Layer 3 #2. Source format
@@ -185,9 +185,9 @@ class AgentRegistration:
     # Decorator-attached schedule + webhook metadata (Plan 11). Populated
     # by papayya.decorators.schedule / .trigger when those decorators
     # wrap an already-@agent-wrapped function. Empty by default — agents
-    # without @schedule / @trigger continue to declare triggers in
-    # papayya.yaml. Plan 12's bundler-harvest path reads these lists to
-    # synthesise the EnvSpec the reconciler consumes.
+    # declare schedules/triggers via @schedule / @trigger decorators.
+    # Plan 12's bundler-harvest path reads these lists to synthesise the
+    # EnvSpec the reconciler consumes.
     schedules: list[ScheduleSpec] = field(default_factory=list)
     webhooks: list[WebhookSpec] = field(default_factory=list)
     # Plan 35 — customer outcome checks (deterministic callables and/or
@@ -253,8 +253,8 @@ def _extract_item_id(args: tuple[Any, ...]) -> Any:
 def _extract_partition_key(kwargs: dict[str, Any]) -> Any:
     """Pull ``partition_key`` out of kwargs if the caller passed it.
 
-    The dispatcher resolves partition_key from papayya.yaml's
-    ``partition_key:`` field and threads it into the worker invocation;
+    The dispatcher resolves partition_key from the ``partition_key=``
+    passed to item()/map() and threads it into the worker invocation;
     when uncertain we return ``None`` and the mapper writes NULL — the
     UsageEvent still records provider/model/tokens, only workload
     attribution is missing.
@@ -451,10 +451,9 @@ def agent(
             partition_key value (Layer 3 #1). When the cap is hit, the
             hosted dispatcher keeps additional items in runtime_pending
             until one in-flight finishes. The bucket key is the
-            partition_key value declared in papayya.yaml's
-            ``partition_key:`` field; falls back to the calling
-            account_id when no partition_key is set. None disables the
-            cap.
+            partition_key value passed to item()/map(); falls back to the
+            calling account_id when no partition_key is set. None disables
+            the cap.
         rate_limit: Cap on lease throughput per partition_key value
             (Layer 3 #2). Format: ``"N/min"`` or ``"N/sec"``. Sliding
             window enforced server-side; uses the same bucket key as
@@ -705,26 +704,22 @@ def agent(
 
 
 def durable(fn: Callable | None = None, *, name: str | None = None, **kwargs: Any) -> Callable:
-    """The isolate boundary — register a function as a deployable durable workload.
+    """Back-compat alias for :func:`agent` with the name optional.
 
-    This is :func:`agent` with the signature freed and the name optional.
-    Durability is *ambient* inside the body: an ``@papayya.llm`` /
-    ``mark_degraded`` / structural outcome inspection resolves against the run
-    the decorator opens, with no ``run`` parameter threaded through your
-    signature and no per-call bookkeeping.
+    ``@agent`` is the public lead decorator — see :func:`agent`. This alias is
+    kept for older code; it is :func:`agent` with the signature freed and the
+    name defaulted to the function's ``__name__``. Durability is *ambient*
+    inside the body either way: an ``@papayya.llm`` / ``mark_degraded`` /
+    structural outcome inspection resolves against the run the decorator opens,
+    with no ``run`` parameter threaded through your signature and no per-call
+    bookkeeping.
 
-    Usage::
+    Prefer ``@agent`` in new code::
 
-        @papayya.durable
+        @papayya.agent(name="enrich", budget_usd=1.0)
         def enrich(company): ...
 
-        @papayya.durable(name="enrich", budget_usd=1.0)
-        def enrich(company): ...
-
-    ``name`` defaults to the function's ``__name__``. All other keyword
-    arguments pass straight through to :func:`agent`. ``@agent`` remains as a
-    lower-level alias (it requires an explicit ``name``); the public lead
-    decorator is ``@papayya.durable``.
+    All keyword arguments pass straight through to :func:`agent`.
     """
     # Support @papayya.durable("slug") as a positional-name form.
     if isinstance(fn, str):
