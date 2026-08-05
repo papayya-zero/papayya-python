@@ -104,6 +104,30 @@ def encode_user_value(value: Any, *, strict: bool = False) -> str:
         return json.dumps(repr(value))
 
 
+def bind_arguments(
+    sig: inspect.Signature | None,
+    args: tuple,
+    kwargs: dict,
+) -> dict | None:
+    """Bind args/kwargs against ``sig`` and return the LIVE argument values.
+
+    Sibling of :func:`build_input_snapshot`, which encodes the same binding
+    for storage. Conservation contracts (Plan 40 Unit 1) need the real
+    objects — counting rows off a JSON round-trip would be both wasteful
+    and wrong for inputs that aren't JSON-encodable. Returns ``None``,
+    never raises, when the signature is unavailable or ``bind()`` rejects
+    the call.
+    """
+    if sig is None:
+        return None
+    try:
+        bound = sig.bind(*args, **kwargs)
+    except TypeError:
+        return None
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
 def build_input_snapshot(
     sig: inspect.Signature | None,
     args: tuple,

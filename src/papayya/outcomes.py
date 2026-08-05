@@ -8,12 +8,21 @@ without any customer code change.
 Each inspector is independent. The orchestrator (inspect_result) runs them
 in order and returns the first 'degraded' verdict; if all return 'ok',
 the overall outcome is 'ok'.
+
+Plan 40 Unit 1 adds the first inspector that looks at **two** values —
+:func:`inspect_conservation` relates a step's output back to its input.
+Emptiness is decidable from the artifact alone; "half-empty" is not, so
+the truth has to be imported from somewhere else. Cheapest source is the
+input the step was handed.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Sequence
+
+log = logging.getLogger("papayya.outcomes")
 
 
 # Module-level switch. Reading the value at integration time in
@@ -108,14 +117,331 @@ def inspect_llm_stop_reason(usage: Any) -> OutcomeVerdict:
     return OK
 
 
-def inspect_result(result: Any, *, usage: Any = None) -> OutcomeVerdict:
+# --------------------------------------------------------------------- #
+#  Conservation contracts (Plan 40 Unit 1)                              #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ConservationContract:
+    """What a step declares its output must conserve about its input.
+
+    Built by ``run.step(..., expect_count=/expect_coverage=/expect_fields=)``;
+    absent by default. Absence means no check — a step that legitimately
+    drops rows is normal and must never false-positive (Plan 40 D4), so
+    there is no global "outputs must equal inputs" inference anywhere.
+
+    Fields:
+
+    * ``count`` — declared output cardinality. An ``int`` (preferred: the
+      number is usually already in a variable three lines up) or a callable
+      invoked with the step's bound arguments as keywords.
+    * ``coverage`` — a record-id key name. Every input record carrying that
+      key must appear in the output under the same key.
+    * ``fields`` — keys that must be present and non-blank on every output
+      record.
+    """
+
+    count: int | Callable[..., int] | None = None
+    coverage: str | None = None
+    fields: tuple[str, ...] | None = None
+
+
+def build_contract(
+    *,
+    expect_count: int | Callable[..., int] | None = None,
+    expect_coverage: str | None = None,
+    expect_fields: Sequence[str] | str | None = None,
+) -> ConservationContract | None:
+    """Normalize the ``expect_*`` step kwargs into a contract, or ``None``.
+
+    Lenient by construction: a malformed declaration is logged and dropped
+    rather than raised. Steps get wired up inside live runs, and the
+    observer invariant (a check never fails the run) has to hold at
+    declaration time too.
+    """
+    if expect_count is None and expect_coverage is None and expect_fields is None:
+        return None
+
+    count: int | Callable[..., int] | None = None
+    if expect_count is not None:
+        if callable(expect_count):
+            count = expect_count
+        else:
+            as_int = _as_int(expect_count)
+            if as_int is None:
+                log.warning(
+                    "papayya: expect_count=%r is neither an int nor a callable; "
+                    "ignoring the cardinality contract",
+                    expect_count,
+                )
+            count = as_int
+
+    coverage: str | None = None
+    if expect_coverage is not None:
+        if isinstance(expect_coverage, str) and expect_coverage:
+            coverage = expect_coverage
+        else:
+            log.warning(
+                "papayya: expect_coverage=%r is not a record-id key name; "
+                "ignoring the coverage contract",
+                expect_coverage,
+            )
+
+    fields: tuple[str, ...] | None = None
+    if expect_fields is not None:
+        # A bare string is the obvious single-field shorthand, not an
+        # iterable of one-character field names.
+        names = (expect_fields,) if isinstance(expect_fields, str) else tuple(expect_fields)
+        fields = tuple(n for n in names if isinstance(n, str) and n) or None
+        if fields is None:
+            log.warning(
+                "papayya: expect_fields=%r holds no field names; "
+                "ignoring the field-presence contract",
+                expect_fields,
+            )
+
+    if count is None and coverage is None and fields is None:
+        return None
+    return ConservationContract(count=count, coverage=coverage, fields=fields)
+
+
+def _as_int(value: Any) -> int | None:
+    """Coerce via ``__index__`` so numpy/other integer types work; ``None``
+    for anything that isn't an integer. ``bool`` is rejected — ``True`` as a
+    declared cardinality is always a typo."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return value.__index__()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _is_blank(value: Any) -> bool:
+    """Emptiness test for a *field* value, matching :func:`inspect_empty`'s
+    definition: numeric ``0`` is a legitimate value, not a blank."""
+    if value is None or value is False:
+        return True
+    if isinstance(value, (str, bytes, list, tuple, dict, set, frozenset)):
+        return len(value) == 0
+    return False
+
+
+def _output_cardinality(result: Any) -> int | None:
+    """How many records ``result`` holds, or ``None`` when undecidable.
+
+    ``str``/``bytes`` are excluded: their length is characters, and a step
+    declaring a cardinality never means "500 characters". Anything else
+    that answers ``len()`` counts — that covers dicts keyed by record id
+    plus DataFrames and arrays we can't otherwise introspect.
+    """
+    if isinstance(result, (str, bytes)):
+        return None
+    try:
+        return len(result)
+    except TypeError:
+        return None
+
+
+def _records_of(result: Any) -> list | None:
+    """Normalize a step result to a list of records, or ``None``.
+
+    A bare ``dict`` is ONE record (the common extraction shape), not a map
+    of records — a step returning many records returns a sequence of them.
+    """
+    if isinstance(result, dict):
+        return [result]
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    return None
+
+
+def _field_of(record: Any, key: str) -> Any:
+    """Read ``key`` off a dict record or an attribute off an object one."""
+    if isinstance(record, dict):
+        return record.get(key)
+    return getattr(record, key, None)
+
+
+def _ids_of(records: Sequence[Any], key: str) -> set | None:
+    """Collect the ``key`` value from every record, or ``None`` when no
+    record carries one (the caller then treats the relation as undeclared)."""
+    ids = set()
+    for record in records:
+        value = _field_of(record, key)
+        if value is None:
+            continue
+        try:
+            ids.add(value)
+        except TypeError:  # unhashable id — can't relate the two sides
+            return None
+    return ids or None
+
+
+def _find_input_collection(inputs: dict[str, Any], key: str) -> list | None:
+    """Find the bound argument that is a collection of records carrying ``key``.
+
+    Answers Plan 40's open question 2: coverage does not need the customer
+    to hand us the id list separately — naming the id key is enough to
+    locate the input side, because the input the step was called with is
+    already bound.
+    """
+    for value in inputs.values():
+        if not isinstance(value, (list, tuple)) or not value:
+            continue
+        if any(_field_of(record, key) is not None for record in value):
+            return list(value)
+    return None
+
+
+def _inspect_count(
+    result: Any, expected: int | Callable[..., int], inputs: dict[str, Any]
+) -> OutcomeVerdict:
+    if callable(expected):
+        # The callable form is the escape hatch; it receives the step's
+        # bound arguments as keywords, so its parameter names must match
+        # the step's (or it takes **kwargs).
+        expected_value = _as_int(expected(**inputs))
+    else:
+        expected_value = expected
+    if expected_value is None:
+        log.warning("papayya: expect_count callable returned a non-integer; treating as a pass")
+        return OK
+    actual = _output_cardinality(result)
+    if actual is None:
+        log.warning(
+            "papayya: expect_count declared but the result has no countable "
+            "length (%s); treating as a pass",
+            type(result).__name__,
+        )
+        return OK
+    if actual < expected_value:
+        return OutcomeVerdict("degraded", "conservation:count_short")
+    if actual > expected_value:
+        return OutcomeVerdict("degraded", "conservation:count_over")
+    return OK
+
+
+def _inspect_coverage(result: Any, key: str, inputs: dict[str, Any]) -> OutcomeVerdict:
+    source = _find_input_collection(inputs, key)
+    if source is None:
+        log.warning(
+            "papayya: expect_coverage=%r found no input collection carrying that "
+            "key; treating as a pass",
+            key,
+        )
+        return OK
+    expected_ids = _ids_of(source, key)
+    if not expected_ids:
+        return OK
+    produced = _records_of(result)
+    if produced is None:
+        log.warning(
+            "papayya: expect_coverage declared but the result isn't a record or "
+            "sequence of records (%s); treating as a pass",
+            type(result).__name__,
+        )
+        return OK
+    produced_ids = _ids_of(produced, key) or set()
+    if expected_ids - produced_ids:
+        return OutcomeVerdict("degraded", "conservation:coverage")
+    return OK
+
+
+def _inspect_fields(result: Any, fields: tuple[str, ...]) -> OutcomeVerdict:
+    records = _records_of(result)
+    if records is None:
+        log.warning(
+            "papayya: expect_fields declared but the result isn't a record or "
+            "sequence of records (%s); treating as a pass",
+            type(result).__name__,
+        )
+        return OK
+    # Fields outer, records inner: the reported field is the first DECLARED
+    # one that's missing anywhere, so the reason token doesn't depend on the
+    # order records happen to arrive in.
+    for field in fields:
+        for record in records:
+            if _is_blank(_field_of(record, field)):
+                return OutcomeVerdict("degraded", f"conservation:field:{field}")
+    return OK
+
+
+def inspect_conservation(
+    result: Any,
+    contract: ConservationContract | None,
+    inputs: dict[str, Any] | None = None,
+) -> OutcomeVerdict:
+    """Relate a step's output to the input it was handed.
+
+    Evaluates the declared relations smallest-first — cardinality, then
+    coverage, then the field-presence floor — and returns the first
+    degraded verdict. Reasons are namespaced ``conservation:`` so the
+    dashboard's reason histogram groups them (Plan 40 D2).
+
+    Observer, like every other inspector (D3): it marks degraded, it never
+    raises. A contract that blows up or can't be evaluated against this
+    result is logged and treated as a pass. Escalation is the Plan 33
+    fence's job.
+    """
+    if contract is None:
+        return OK
+    inputs = inputs or {}
+
+    if contract.count is not None:
+        try:
+            verdict = _inspect_count(result, contract.count, inputs)
+        except Exception:
+            log.exception("papayya: expect_count raised; treating as a pass (observer)")
+        else:
+            if verdict.status != "ok":
+                return verdict
+
+    if contract.coverage is not None:
+        try:
+            verdict = _inspect_coverage(result, contract.coverage, inputs)
+        except Exception:
+            log.exception("papayya: expect_coverage raised; treating as a pass (observer)")
+        else:
+            if verdict.status != "ok":
+                return verdict
+
+    if contract.fields is not None:
+        try:
+            verdict = _inspect_fields(result, contract.fields)
+        except Exception:
+            log.exception("papayya: expect_fields raised; treating as a pass (observer)")
+        else:
+            if verdict.status != "ok":
+                return verdict
+
+    return OK
+
+
+def inspect_result(
+    result: Any,
+    *,
+    usage: Any = None,
+    contract: ConservationContract | None = None,
+    inputs: dict[str, Any] | None = None,
+) -> OutcomeVerdict:
     """Run all inspectors and return the first degraded verdict.
 
     Order: stop-reason first (so LLM-shape signal wins over empty/zero
-    checks on the response object), then empty, then degenerate
-    embedding. Returns :data:`OK` when all inspectors pass.
+    checks on the response object), then conservation, then empty, then
+    degenerate embedding. Returns :data:`OK` when all inspectors pass.
+
+    Conservation outranks empty because a declared contract is the most
+    specific signal available: for a step declaring ``expect_count=500``,
+    ``conservation:count_short`` says strictly more than ``empty_sequence``
+    does. Steps without a contract are unaffected — the order they see is
+    unchanged.
     """
     verdict = inspect_llm_stop_reason(usage)
+    if verdict.status != "ok":
+        return verdict
+    verdict = inspect_conservation(result, contract, inputs)
     if verdict.status != "ok":
         return verdict
     verdict = inspect_empty(result)

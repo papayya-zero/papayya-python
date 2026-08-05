@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, overload
 
 from papayya import outcomes
-from papayya._serialize import build_input_snapshot
+from papayya._serialize import bind_arguments, build_input_snapshot
 from papayya.classify import classify_provider_error
 from papayya.errors import CreditExhausted, WorkloadPaused
 from papayya.llm_extract import LlmUsage, extract_llm_usage
@@ -328,6 +328,9 @@ class Item:
         item_id: str | None = None,
         snapshot: Any = _AUTO,
         kind: str | None = None,
+        expect_count: Any = None,
+        expect_coverage: str | None = None,
+        expect_fields: Any = None,
     ):
         """Wrap a function as a durable step. (Alias: ``run.step``.)
 
@@ -370,15 +373,49 @@ class Item:
           classification). Use ``run.llm_step(label, fn)`` instead;
           ``kind=`` will be removed in the next minor release.
 
+        Conservation contracts — what this step's output must conserve
+        about its input. All three default to absent, and absence means no
+        check: a step that legitimately drops records is normal, so nothing
+        is ever inferred. A declared contract that can't be evaluated is
+        logged and treated as a pass; contracts mark a step ``degraded``,
+        they never raise::
+
+            rows = run.step("extract", extract_rows,
+                            expect_count=len(docs),
+                            expect_fields=["name", "email"])(docs)
+
+        * ``expect_count`` — how many records the output must hold. Pass the
+          integer when you have it (you usually do, three lines up); a
+          callable is the escape hatch and is invoked with the step's bound
+          arguments as keywords. Under-delivery reads
+          ``conservation:count_short``, over-delivery ``count_over``.
+        * ``expect_coverage`` — the name of a record-id key. Every input
+          record carrying that key must come back out under it, so you
+          learn *which* records went missing, not just how many. The input
+          collection is located by the key itself; nothing extra to declare.
+        * ``expect_fields`` — keys that must be present and non-blank on
+          every output record, so a dict with three of eight fields
+          populated is degraded instead of passing. Numeric ``0`` counts as
+          populated; ``None``/``False``/``""``/``[]``/``{}`` do not.
+
         All kwargs are additive and optional.
         """
         if kind == "llm":
             self._warn_kind_llm_deprecated(
                 _label_for_warning(label_or_fn, fn)
             )
+        contract = outcomes.build_contract(
+            expect_count=expect_count,
+            expect_coverage=expect_coverage,
+            expect_fields=expect_fields,
+        )
+
         # Case 1: run.task("label", fn) — canonical, silent.
         if isinstance(label_or_fn, str) and fn is not None:
-            return self._wrap(label_or_fn, fn, item_id=item_id, snapshot=snapshot, kind=kind)
+            return self._wrap(
+                label_or_fn, fn, item_id=item_id, snapshot=snapshot, kind=kind,
+                contract=contract,
+            )
 
         # Case 2: run.task(fn) — DEPRECATED, label derived from fn.__name__.
         if callable(label_or_fn):
@@ -389,7 +426,10 @@ class Item:
                     "run.step('myLabel', lambda: ...)"
                 )
             self._warn_legacy_step_form("fn-only", label)
-            return self._wrap(label, label_or_fn, item_id=item_id, snapshot=snapshot, kind=kind)
+            return self._wrap(
+                label, label_or_fn, item_id=item_id, snapshot=snapshot, kind=kind,
+                contract=contract,
+            )
 
         # Case 3: @run.task("label") — DEPRECATED decorator form.
         if isinstance(label_or_fn, str):
@@ -398,9 +438,13 @@ class Item:
             _item_id = item_id
             _snapshot = snapshot
             _kind = kind
+            _contract = contract
 
             def decorator(f: Callable[..., T]) -> Callable[..., T]:
-                return self._wrap(label, f, item_id=_item_id, snapshot=_snapshot, kind=_kind)
+                return self._wrap(
+                    label, f, item_id=_item_id, snapshot=_snapshot, kind=_kind,
+                    contract=_contract,
+                )
 
             return decorator
 
@@ -456,6 +500,9 @@ class Item:
         *,
         item_id: str | None = None,
         snapshot: Any = _AUTO,
+        expect_count: Any = None,
+        expect_coverage: str | None = None,
+        expect_fields: Any = None,
     ) -> Callable[..., T]:
         """Wrap an LLM-call function as a durable step.
 
@@ -467,12 +514,22 @@ class Item:
         re-raised as ``CreditExhausted`` so the runtime pauses instead
         of failing.
 
+        The ``expect_*`` conservation contracts behave exactly as they do on
+        ``run.step`` — see its docstring. They read the value the step
+        returned, so on an LLM step they apply to the parsed records when
+        the wrapped fn returns them, not to the raw provider response.
+
         Canonical signature only — no ``__name__``-derived label or
         decorator form. ``run.step(..., kind="llm")`` keeps working for
         one release with a deprecation warning.
         """
         return self._wrap(
-            label, fn, item_id=item_id, snapshot=snapshot, kind="llm"
+            label, fn, item_id=item_id, snapshot=snapshot, kind="llm",
+            contract=outcomes.build_contract(
+                expect_count=expect_count,
+                expect_coverage=expect_coverage,
+                expect_fields=expect_fields,
+            ),
         )
 
     def _warn_kind_llm_deprecated(self, label: str) -> None:
@@ -519,6 +576,7 @@ class Item:
         item_id: str | None = None,
         snapshot: Any = _AUTO,
         kind: str | None = None,
+        contract: outcomes.ConservationContract | None = None,
     ) -> Callable[..., Any]:
         """Build the durable wrapper around ``fn``.
 
@@ -694,8 +752,21 @@ class Item:
             # embedding, degenerate LLM stop reason) is detected. The
             # parent run's worst_outcome/degraded_count aggregate updates
             # automatically inside the store on save_task.
+            #
+            # Plan 40 Unit 1: when the step declared a conservation
+            # contract, the inspectors also get the step's LIVE bound
+            # arguments — the input side of the relation. Bound here rather
+            # than reusing input_snapshot below because the snapshot is
+            # JSON-encoded, is skipped entirely without an item_id, and
+            # counting rows off a round-trip would be both wasteful and
+            # wrong for inputs that aren't JSON-encodable.
             if outcomes.ENABLE_STRUCTURAL_DETECTION:
-                verdict = outcomes.inspect_result(result, usage=usage)
+                inputs = (
+                    bind_arguments(sig, args, kwargs) if contract is not None else None
+                )
+                verdict = outcomes.inspect_result(
+                    result, usage=usage, contract=contract, inputs=inputs
+                )
             else:
                 verdict = outcomes.OK
             # Plan 35: fold customer checks into the same verdict — worst
