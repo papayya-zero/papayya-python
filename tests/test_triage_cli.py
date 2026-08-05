@@ -1,12 +1,14 @@
 """Tests for the hosted ``papayya triage`` CLI commands.
 
-v1→v2 cutover: the read feed (``triage list``) is durable-backed; the
-disposition commands act on the quarantine lane only (``retry`` → ``release``,
-``dismiss`` → ``discard``). DLQ-lane disposition (the old dlq_skip/replay/
-acknowledge dispatch) retired with the v1 DROP and is a deferred follow-up, so
-non-quarantine rows exit 2 with a "not yet available" message. We mock the
-Papayya client so these tests stay network-free — the SDK's resource methods
-have their own HTTP-level coverage in ``test_triage_resource.py``.
+Both lanes dispatch (Plan 41 R1, migration 070). The commands pick an endpoint
+from the row's lane, because the same operator intent reaches the two lanes
+differently: a quarantined run is non-terminal and its verbs move it
+(``retry`` → ``release``, ``dismiss`` → ``discard``), while a degraded/failed
+row is already terminal and its verbs record a disposition
+(``retry`` → ``replay``, ``dismiss`` → ``dismiss``, plus ``acknowledge``).
+These tests pin that dispatch. We mock the Papayya client so they stay
+network-free — the SDK's resource methods have their own HTTP-level coverage
+in ``test_triage_resource.py``.
 """
 
 from __future__ import annotations
@@ -42,6 +44,16 @@ class _FakeRuns:
 
     def quarantine(self, run_id: str, reason: str) -> dict:
         return self._record("quarantine", run_id, reason=reason)
+
+    # DLQ lane (Plan 41 R1).
+    def replay(self, run_id: str, **kwargs: Any) -> dict:
+        return self._record("replay", run_id, **kwargs)
+
+    def dismiss(self, run_id: str) -> dict:
+        return self._record("dismiss", run_id)
+
+    def acknowledge(self, run_id: str) -> dict:
+        return self._record("acknowledge", run_id)
 
 
 class _FakeTriage:
@@ -118,7 +130,7 @@ def test_triage_list_forwards_partition_key_and_tenant(monkeypatch) -> None:
     }]
 
 
-# ── retry (quarantine lane only) ──
+# ── retry (lane-dispatched) ──
 
 def test_triage_retry_dispatches_release_when_quarantine(monkeypatch) -> None:
     runs = _FakeRuns(get_response={"status": "quarantine"})
@@ -132,30 +144,32 @@ def test_triage_retry_dispatches_release_when_quarantine(monkeypatch) -> None:
     assert "release" in result.output
 
 
-def test_triage_retry_defers_dlq_lane(monkeypatch) -> None:
+def test_triage_retry_dispatches_replay_on_dlq_lane(monkeypatch) -> None:
     runs = _FakeRuns(get_response={"status": "failed"})
     _patch_client(monkeypatch, _FakeClient(runs))
 
     result = CliRunner().invoke(cli_module.main, ["triage", "retry", "r2"])
 
-    assert result.exit_code == 2
-    assert "failed" in result.output
-    # Only the upfront GET — no dispatch, the DLQ action is deferred.
-    assert [c[0] for c in runs.calls] == ["get"]
+    assert result.exit_code == 0, result.output
+    # Retry on a terminal row re-drives it; the server marks the source
+    # dlq_disposition='replayed' so it drains from the feed.
+    assert [c[0] for c in runs.calls] == ["get", "replay"]
 
 
-def test_triage_retry_errors_on_unsupported_status(monkeypatch) -> None:
+def test_triage_retry_replays_a_completed_but_degraded_run(monkeypatch) -> None:
+    """status='completed' is not the same as "worked" — a run completes with
+    degraded steps and lands in the dlq lane on worst_outcome_status. Retry
+    must reach it, which the pre-070 CLI refused to do."""
     runs = _FakeRuns(get_response={"status": "completed"})
     _patch_client(monkeypatch, _FakeClient(runs))
 
     result = CliRunner().invoke(cli_module.main, ["triage", "retry", "r4"])
 
-    assert result.exit_code == 2
-    assert "completed" in result.output
-    assert [c[0] for c in runs.calls] == ["get"]
+    assert result.exit_code == 0, result.output
+    assert [c[0] for c in runs.calls] == ["get", "replay"]
 
 
-# ── dismiss (quarantine lane only) ──
+# ── dismiss (lane-dispatched) ──
 
 def test_triage_dismiss_dispatches_discard_when_quarantine(monkeypatch) -> None:
     runs = _FakeRuns(get_response={"status": "quarantine"})
@@ -167,12 +181,26 @@ def test_triage_dismiss_dispatches_discard_when_quarantine(monkeypatch) -> None:
     assert [c[0] for c in runs.calls] == ["get", "discard"]
 
 
-def test_triage_dismiss_defers_dlq_lane(monkeypatch) -> None:
+def test_triage_dismiss_dispatches_dismiss_on_dlq_lane(monkeypatch) -> None:
     runs = _FakeRuns(get_response={"status": "failed"})
     _patch_client(monkeypatch, _FakeClient(runs))
 
     result = CliRunner().invoke(cli_module.main, ["triage", "dismiss", "r2"])
 
-    assert result.exit_code == 2
-    assert "failed" in result.output
-    assert [c[0] for c in runs.calls] == ["get"]
+    assert result.exit_code == 0, result.output
+    assert [c[0] for c in runs.calls] == ["get", "dismiss"]
+
+
+# ── acknowledge (dlq lane only) ──
+
+def test_triage_acknowledge_needs_no_lane_lookup(monkeypatch) -> None:
+    """Acknowledge is dlq-only — the quarantine lane deliberately doesn't
+    offer it (see deriveTriageRow's available_actions), so there is no lane
+    to dispatch on and the CLI skips the GET entirely."""
+    runs = _FakeRuns(get_response={"status": "failed"})
+    _patch_client(monkeypatch, _FakeClient(runs))
+
+    result = CliRunner().invoke(cli_module.main, ["triage", "acknowledge", "r5"])
+
+    assert result.exit_code == 0, result.output
+    assert [c[0] for c in runs.calls] == ["acknowledge"]

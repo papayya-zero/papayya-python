@@ -822,10 +822,11 @@ def _print_apply_result(result, *, api_base_url: str) -> None:
 # ---------------------------------------------------------------------------
 # triage — unified Needs Attention feed across DLQ + quarantine
 #
-# v1→v2 cutover: the read feed is durable-backed. Quarantine-lane actions
-# (release/discard) are live; the DLQ-lane disposition actions
-# (skip/acknowledge/replay) retired with the v1 DROP and their durable
-# replacement (dlq_disposition) is a deferred follow-up.
+# v1→v2 cutover: the read feed is durable-backed. Both lanes are live —
+# quarantine actions (release/discard) shipped with the cutover; the DLQ-lane
+# dispositions (replayed/skipped/acknowledged) came back in migration 070
+# (Plan 41 R1), which is what lets the feed drain instead of accumulating
+# every degraded run forever.
 # ---------------------------------------------------------------------------
 
 @main.group()
@@ -876,15 +877,12 @@ def triage_list(
         client.close()
 
 
-# DLQ-lane disposition (skip/acknowledge/replay) retired with the v1 DROP;
-# the durable replacement (dlq_disposition) is a deferred follow-up, so retry
-# and dismiss act on the quarantine lane only. Failed/degraded rows surface in
-# `triage list` but have no resolve action yet.
-_DLQ_DEFERRED_MSG = (
-    "DLQ disposition actions (retry/dismiss for failed/degraded runs) are not "
-    "yet available on durable runs — pending the dlq_disposition follow-up. "
-    "Only quarantined runs can be retried or dismissed today."
-)
+# Each verb dispatches on the row's lane, because the two lanes reach the same
+# operator intent through different endpoints: a quarantined run is non-terminal
+# and its verbs move it (release resumes, discard abandons), while a dlq row is
+# already terminal and its verbs only record what the operator decided. Keeping
+# the dispatch here rather than in the server preserves `available_actions` as
+# the single description of what a row supports.
 
 
 @triage.command("retry")
@@ -893,18 +891,17 @@ _DLQ_DEFERRED_MSG = (
 def triage_retry(ctx: click.Context, run_id: str) -> None:
     """Retry a triage row.
 
-    Resumes a quarantined run in-place (``/release``). Exits with code 2 on
-    any other status — DLQ-lane retry is a deferred follow-up.
+    Quarantined: resumes the run in-place (``/release``). Degraded/failed:
+    mints a new run that re-drives the captured item (``/replay``) and marks
+    the source ``dlq_disposition='replayed'`` so it leaves the feed.
     """
     client = _make_papayya_client(ctx)
     try:
         run = client.items.get(run_id)
-        status = run.get("status")
-        if status == "quarantine":
+        if run.get("status") == "quarantine":
             out = client.items.release(run_id)
         else:
-            click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
-            sys.exit(2)
+            out = client.items.replay(run_id)
         click.echo(json.dumps(out, indent=2))
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
@@ -919,18 +916,37 @@ def triage_retry(ctx: click.Context, run_id: str) -> None:
 def triage_dismiss(ctx: click.Context, run_id: str) -> None:
     """Dismiss a triage row.
 
-    Abandons a quarantined run (``/discard``). Exits with code 2 on any
-    other status — DLQ-lane dismiss is a deferred follow-up.
+    Quarantined: abandons the run (``/discard``). Degraded/failed: drains it
+    from the feed without re-driving (``dlq_disposition='skipped'``).
     """
     client = _make_papayya_client(ctx)
     try:
         run = client.items.get(run_id)
-        status = run.get("status")
-        if status == "quarantine":
+        if run.get("status") == "quarantine":
             out = client.items.discard(run_id)
         else:
-            click.echo(f"Error: run {run_id} is status={status!r}; {_DLQ_DEFERRED_MSG}", err=True)
-            sys.exit(2)
+            out = client.items.dismiss(run_id)
+        click.echo(json.dumps(out, indent=2))
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+
+@triage.command("acknowledge")
+@click.argument("run_id")
+@click.pass_context
+def triage_acknowledge(ctx: click.Context, run_id: str) -> None:
+    """Acknowledge a degraded/failed triage row.
+
+    Records that it was seen and drains it from the feed
+    (``dlq_disposition='acknowledged'``) without re-driving or declining it.
+    Quarantine rows don't offer this — see `available_actions` on the row.
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        out = client.items.acknowledge(run_id)
         click.echo(json.dumps(out, indent=2))
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)

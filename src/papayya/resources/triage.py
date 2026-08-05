@@ -7,11 +7,13 @@ keyset-paginated stream. Each row is
 available_actions, occurred_at}``. The dashboard's "Needs attention" lane and
 the ``papayya triage`` CLI read from this endpoint.
 
-Quarantine-lane actions (``runs.release`` / ``runs.discard``) are live on the
-durable surface. The DLQ-lane disposition actions (skip/acknowledge/replay)
-are a deferred follow-up — the durable model has no ``dlq_disposition`` column
-yet — so this resource exposes only the read surface and the auto-paging
-iterator the CLI uses.
+Both lanes drain: a row leaves the feed once it carries a disposition.
+Quarantine-lane actions are ``items.release`` / ``items.discard``; DLQ-lane
+actions are ``items.replay`` / ``items.dismiss`` / ``items.acknowledge``
+(migration 070, Plan 41 R1). This resource stays read-only — it exposes the
+feed and the auto-paging iterator, and each row's ``available_actions`` names
+the verbs that row supports, so the action dispatch lives with the caller
+rather than being duplicated here.
 """
 from __future__ import annotations
 

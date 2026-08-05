@@ -192,6 +192,48 @@ class Items:
         ``cancelled``. 409 if the run is not currently in quarantine."""
         return self._api._request("POST", f"/v1/durable/runs/{run_id}/discard")
 
+    # DLQ lane (Plan 41 R1) — the triage feed's other half: degraded/failed
+    # runs that were never quarantined. These drain a row without changing
+    # its status, because a terminal run's outcome is a historical fact and
+    # the disposition is operator state. The third action the feed
+    # advertises, "retry", is ``replay()`` — it writes
+    # ``dlq_disposition='replayed'`` on the source run for you.
+
+    def replay(
+        self,
+        run_id: str,
+        *,
+        tenant: str | None = None,
+        latest: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Re-drive a run's captured item as a NEW run, linked back via
+        ``replayed_from``, and mark the source ``dlq_disposition='replayed'``
+        so it drains from the triage feed.
+
+        The lane-aware counterpart to ``release`` — this is what "retry"
+        means for a terminal degraded/failed row. Delegates to the same
+        endpoint as the top-level ``papayya replay`` command.
+        """
+        return self._api.replay_run(
+            run_id, tenant=tenant, latest=latest, force=force
+        )
+
+    def dismiss(self, run_id: str) -> dict[str, Any]:
+        """Drain a degraded/failed run out of the triage feed without
+        re-driving it. Returns the updated run with
+        ``dlq_disposition='skipped'``. 409 if the run isn't an un-triaged
+        degraded/failed run, 404 if it doesn't exist."""
+        return self._api._request("POST", f"/v1/durable/runs/{run_id}/dismiss")
+
+    def acknowledge(self, run_id: str) -> dict[str, Any]:
+        """Drain a degraded/failed run out of the triage feed, recording
+        that it was seen rather than declined. Returns the updated run with
+        ``dlq_disposition='acknowledged'``. Same preconditions as
+        ``dismiss``; the difference is operator intent, preserved so a later
+        audit can tell "I looked at this" from "I chose not to fix it"."""
+        return self._api._request("POST", f"/v1/durable/runs/{run_id}/acknowledge")
+
     # Auto-pause (Plan 33) — the system-initiated counterpart to the
     # operator-initiated quarantine lane above. A run a degradation/budget
     # fence paused is resumed here; replay skips already-saved steps.
