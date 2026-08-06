@@ -1368,7 +1368,6 @@ def schedules() -> None:
 @click.option("--cron", required=True, help="Cron expression (e.g. '0 */6 * * *')")
 @click.option("--timezone", default=None, help="IANA timezone (e.g. 'America/Toronto')")
 @click.option("--input", "input_str", default=None, help="Run input passed each time the schedule fires")
-@click.option("--max-steps", type=int, default=None, help="Per-run max steps override")
 @click.option("--budget", type=float, default=None, help="Per-run budget cap in whole dollars")
 @click.pass_context
 def schedules_create(
@@ -1377,10 +1376,14 @@ def schedules_create(
     cron: str,
     timezone: str | None,
     input_str: str | None,
-    max_steps: int | None,
     budget: float | None,
 ) -> None:
-    """Create a cron schedule on an agent."""
+    """Create a cron schedule on an agent.
+
+    No --max-steps: the step ceiling belongs to the deployed bundle,
+    ``@agent(name=..., max_steps=N)``. The flag existed, was stored, and was
+    never applied; the server now rejects the field.
+    """
     client = _make_papayya_client(ctx)
     try:
         sched = client.schedules.create(
@@ -1388,7 +1391,6 @@ def schedules_create(
             cron,
             timezone=timezone,
             input=input_str,
-            max_steps=max_steps,
             budget_cents=_dollars_to_cents(budget),
         )
     except PapayyaAPIError as e:
@@ -1441,7 +1443,6 @@ def schedules_get(ctx: click.Context, schedule_id: str) -> None:
 @click.option("--cron", default=None, help="New cron expression")
 @click.option("--timezone", default=None, help="New timezone")
 @click.option("--input", "input_str", default=None, help="New run input")
-@click.option("--max-steps", type=int, default=None, help="New per-run max-steps")
 @click.option("--budget", type=float, default=None, help="New per-run budget cap (whole dollars)")
 @click.pass_context
 def schedules_update(
@@ -1450,10 +1451,12 @@ def schedules_update(
     cron: str | None,
     timezone: str | None,
     input_str: str | None,
-    max_steps: int | None,
     budget: float | None,
 ) -> None:
-    """Patch fields on an existing schedule (only fields you pass are sent)."""
+    """Patch fields on an existing schedule (only fields you pass are sent).
+
+    No --max-steps — see `schedules create`.
+    """
     patch: dict[str, Any] = {}
     if cron is not None:
         patch["cron"] = cron
@@ -1461,13 +1464,11 @@ def schedules_update(
         patch["timezone"] = timezone
     if input_str is not None:
         patch["input"] = input_str
-    if max_steps is not None:
-        patch["max_steps"] = max_steps
     if budget is not None:
         patch["budget_cents"] = _dollars_to_cents(budget)
 
     if not patch:
-        click.echo("Error: pass at least one of --cron / --timezone / --input / --max-steps / --budget", err=True)
+        click.echo("Error: pass at least one of --cron / --timezone / --input / --budget", err=True)
         sys.exit(1)
 
     client = _make_papayya_client(ctx)

@@ -6,6 +6,15 @@ if TYPE_CHECKING:
 
 
 class Schedules:
+    """Hosted cron schedules.
+
+    A schedule owns *when* an agent runs, plus the input and the budget for
+    each fire. It does not own the agent's step ceiling: ``max_steps`` lives
+    on ``@agent(name=..., max_steps=N)`` in the deployed bundle, which is what
+    the worker actually reads. The parameter used to be accepted here and
+    stored server-side while nothing applied it; the server now rejects it.
+    """
+
     def __init__(self, api: APIClient) -> None:
         self._api = api
 
@@ -16,7 +25,6 @@ class Schedules:
         *,
         timezone: str | None = None,
         input: str | None = None,
-        max_steps: int | None = None,
         budget_cents: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"cron_expression": cron}
@@ -24,8 +32,6 @@ class Schedules:
             body["timezone"] = timezone
         if input:
             body["input"] = input
-        if max_steps:
-            body["max_steps"] = max_steps
         if budget_cents:
             body["budget_cents"] = budget_cents
         return self._api._request("POST", f"/v1/agents/{agent_id}/schedules", json=body)
@@ -46,8 +52,6 @@ class Schedules:
             body["timezone"] = kwargs["timezone"]
         if "input" in kwargs:
             body["input"] = kwargs["input"]
-        if "max_steps" in kwargs:
-            body["max_steps"] = kwargs["max_steps"]
         if "budget_cents" in kwargs:
             body["budget_cents"] = kwargs["budget_cents"]
         if "enabled" in kwargs:

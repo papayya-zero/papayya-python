@@ -89,7 +89,6 @@ def test_create_converts_budget_dollars_to_cents(fake_client: _FakeClient) -> No
         "--cron", "0 */6 * * *",
         "--timezone", "America/Toronto",
         "--input", "hello",
-        "--max-steps", "20",
         "--budget", "5",
     ])
     assert result.exit_code == 0, result.output
@@ -99,8 +98,20 @@ def test_create_converts_budget_dollars_to_cents(fake_client: _FakeClient) -> No
     assert kwargs["cron"] == "0 */6 * * *"
     assert kwargs["timezone"] == "America/Toronto"
     assert kwargs["input"] == "hello"
-    assert kwargs["max_steps"] == 20
     assert kwargs["budget_cents"] == 500  # $5 → 500¢
+    assert "max_steps" not in kwargs
+
+
+def test_max_steps_is_not_a_schedule_flag() -> None:
+    """The step ceiling belongs to @agent(max_steps=N) in the deployed
+    bundle. --max-steps was accepted here and stored server-side while
+    nothing ever applied it; the server now rejects the field, so the flag
+    must not survive as a way to trigger that 400."""
+    for cmd in (["schedules", "create", "--agent", "a", "--cron", "* * * * *"],
+                ["schedules", "update", "s1"]):
+        result = _run([*cmd, "--max-steps", "20"])
+        assert result.exit_code != 0
+        assert "No such option: --max-steps" in result.output
 
 
 def test_list_forwards_agent_filter(fake_client: _FakeClient) -> None:
