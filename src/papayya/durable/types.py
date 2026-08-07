@@ -56,6 +56,57 @@ class TaskEntry:
     # control-pane writes; this plan only writes 'ok' / 'degraded'.
     outcome_status: str = "ok"
     outcome_reason: str | None = None
+    # Plan 41 R3 — the execution identity.
+    #
+    # ``execution_token`` identifies one *execution* of this step. The
+    # server derives the checkpoint row's primary key from it, namespaced
+    # by the run, so a re-delivery of the same execution (a network retry
+    # or a journal drain) lands on the same row and its aggregates are
+    # skipped — ADR-0002 #8 — while a genuine re-execution becomes its own
+    # row. Attempt 1 uses the deterministic ``"{label}|1"`` so a client
+    # that predates this field and one that sends it derive the SAME id
+    # for a first execution; only attempt >= 2 is random. It must be a
+    # ``str`` and never a ``uuid.UUID``: the journal's ``to_json_line``
+    # raises on the object, and only on the journal path, i.e. only under
+    # an outage.
+    #
+    # ``attempt`` is the number the provider idempotency key was built
+    # from: at the moment this execution started, the highest attempt
+    # visible for this (run, effective label) was ``attempt - 1``. It is
+    # NOT unique — two executions legitimately share a number when the
+    # first one's write was journaled and therefore invisible.
+    execution_token: str = ""
+    attempt: int = 1
+
+
+def latest_per_label(tasks: list[TaskEntry]) -> list[TaskEntry]:
+    """Collapse several executions of a step to the latest one.
+
+    Ordered by ``(attempt, completed_at)`` — the client's own stamps —
+    and NOT by list position. A step whose lineage write was journaled
+    drains *after* the execution that replaced it, so the stored order
+    ends with the OLDER execution and a last-one-wins collapse would take
+    the stale result. That is the same trap a server-side INSERT sequence
+    walks into, which is why the control pane orders on completed_at too.
+
+    Relative order of distinct labels is preserved (first appearance
+    wins), so a collapsed list is still positionally meaningful — which
+    ``_replay._resolve_from_step`` depends on.
+
+    Lives here rather than on PapayyaRun because both the run's hydration
+    and the replay path need it, and importing run.py from _replay.py
+    would close an import cycle.
+    """
+    latest: dict[str, TaskEntry] = {}
+    order: list[str] = []
+    for entry in tasks:
+        prior = latest.get(entry.label)
+        if prior is None:
+            order.append(entry.label)
+            latest[entry.label] = entry
+        elif (entry.attempt, entry.completed_at) >= (prior.attempt, prior.completed_at):
+            latest[entry.label] = entry
+    return [latest[label] for label in order]
 
 
 _OUTCOME_SEVERITY = {"ok": 0, "degraded": 1, "failed": 2}

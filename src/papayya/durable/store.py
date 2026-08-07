@@ -57,6 +57,12 @@ class FileStore:
                     result=t["result"],
                     duration_ms=t["duration_ms"],
                     completed_at=t["completed_at"],
+                    # Plan 41 R3. Defaulted rather than required so files
+                    # written before v13 still load. Without these two the
+                    # execution identity round-trips to nothing and every
+                    # execution recomputes attempt 1 forever.
+                    execution_token=t.get("execution_token", ""),
+                    attempt=t.get("attempt", 1),
                 )
                 for t in data.get("tasks", [])
             ],
@@ -94,6 +100,8 @@ class FileStore:
                     "result": t.result,
                     "duration_ms": t.duration_ms,
                     "completed_at": t.completed_at,
+                    "execution_token": t.execution_token,
+                    "attempt": t.attempt,
                 }
                 for t in run.tasks
             ],

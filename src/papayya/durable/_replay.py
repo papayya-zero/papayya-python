@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 from papayya.durable import _schema
 from papayya.durable.sqlite_store import SQLiteStore
-from papayya.durable.types import TaskEntry
+from papayya.durable.types import TaskEntry, latest_per_label
 
 
 class ReplayError(Exception):
@@ -417,8 +417,15 @@ def replay(
             raise ReplayError(
                 f"Run {run_id!r} could not be loaded for from_step rewind."
             )
-        prefix_count = _resolve_from_step(from_step, checkpoint.tasks, run_id)
-        prepopulated = checkpoint.tasks[:prefix_count]
+        # Collapse re-executions before resolving the index (Plan 41 R3).
+        # _resolve_from_step works on label POSITION, so a step that ran
+        # twice would otherwise occupy two slots and shift every later
+        # step's index — "replay from step 5" would land somewhere else
+        # entirely. The replay wants each step's final state, which is
+        # exactly what the collapse yields.
+        replay_tasks = latest_per_label(checkpoint.tasks)
+        prefix_count = _resolve_from_step(from_step, replay_tasks, run_id)
+        prepopulated = replay_tasks[:prefix_count]
         new_run_id = str(uuid.uuid4())
         hydration_token = _REPLAY_HYDRATION.set((new_run_id, prepopulated))
 

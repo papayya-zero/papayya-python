@@ -32,6 +32,7 @@ from .types import (
     DurableRunResult,
     RunCheckpoint,
     TaskEntry,
+    latest_per_label,
 )
 
 T = TypeVar("T")
@@ -188,6 +189,21 @@ class Item:
         # body from the top, recomputing the same sequence, so computed keys
         # line up with stored labels positionally.
         self._label_occurrences: dict[str, int] = {}
+        # Per-EFFECTIVE-label re-execution counter (Plan 41 R3). Distinct
+        # from _label_occurrences above and easy to confuse with it: that
+        # one separates call N of a repeated label within a single pass (a
+        # loop — "draft", "draft#2"), this one separates re-executions of
+        # the same logical step ACROSS passes. They compose, so a loop's
+        # second iteration re-executed once is ("draft#2", attempt=2) —
+        # which only holds because this is keyed on the effective label
+        # rather than the bare one.
+        #
+        # Their seeding rules are OPPOSITE, which is the reason they are
+        # two dicts. _label_occurrences is never seeded from stored
+        # entries (replay re-executes the body from the top and recomputes
+        # the same sequence). _attempts is seeded from stored entries and
+        # from nothing else — see init().
+        self._attempts: dict[str, int] = {}
         # Track which (label, deprecation-kind) pairs already emitted a
         # warning this run, so repeated calls don't spam the log.
         self._deprecation_seen: set[str] = set()
@@ -244,7 +260,19 @@ class Item:
             # originally spawned).
             if existing.parent_run_id is not None:
                 self._parent_run_id = existing.parent_run_id
-            for entry in existing.tasks:
+            # Plan 41 R3. Seed _attempts from the RAW loaded list, before
+            # and independently of any cache filter.
+            #
+            # This is R3's contract with R7. R7's entire mechanism is
+            # removing invalidated entries from _cache at hydration so the
+            # step re-executes. If _attempts were derived from _cache, an
+            # invalidated label would have no entry, the next attempt
+            # would compute as 1, and the re-execution would reuse the
+            # recorded attempt's provider idempotency key — the exact bug
+            # this unit exists to fix, on the exact path it was built for.
+            # Pinned by test_attempts_survive_a_suppressed_cache_entry.
+            self._seed_attempts(existing.tasks)
+            for entry in self._latest_per_label(existing.tasks):
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
         else:
@@ -265,7 +293,8 @@ class Item:
             # rows live only in memory; the new run's tasks table starts
             # empty and only fills with steps the replay re-executes.
             if self._prepopulated_tasks:
-                for entry in self._prepopulated_tasks:
+                self._seed_attempts(self._prepopulated_tasks)
+                for entry in self._latest_per_label(self._prepopulated_tasks):
                     self._cache[entry.label] = entry
                     self._task_call_order.append(entry.label)
 
@@ -470,6 +499,74 @@ class Item:
         n = self._label_occurrences.get(label, 0) + 1
         return label if n == 1 else f"{label}#{n}"
 
+    def _seed_attempts(self, tasks: list[TaskEntry]) -> None:
+        """Seed the per-label attempt counter from stored task rows.
+
+        MAX, not count (Plan 41 R3 §T1). The two diverge in the case this
+        unit exists for: after a journal collision two rows both carry
+        attempt 1, so a third execution is 2 under max and 3 under count.
+        Max is right and cheaper — the only requirement on the derived
+        provider key is that it differ from every key already used, and
+        both rows already used ``:1``.
+        """
+        for entry in tasks:
+            prior = self._attempts.get(entry.label, 0)
+            if entry.attempt > prior:
+                self._attempts[entry.label] = entry.attempt
+
+    # Collapse happens at HYDRATION and never at read: a read-side
+    # collapse would leave _cache and _task_call_order disagreeing about
+    # how many times a label appears.
+    _latest_per_label = staticmethod(latest_per_label)
+
+    def _next_execution(self, effective_label: str) -> tuple[str, int]:
+        """Mint the identity for a new execution of ``effective_label``.
+
+        Returns ``(execution_token, attempt)``. Attempt 1's token is the
+        deterministic ``"{label}|1"`` — byte-identical to what the server
+        derives for a client that sends no token at all — so a pre-R3 and
+        a post-R3 SDK writing the same first execution land on the SAME
+        derived row id. Without that, ADR-0002 #8's re-delivery
+        idempotency would hold inside each SDK generation and never across
+        it, and the worker service rolls at
+        deployment_minimum_healthy_percent = 50, so mixed-SDK workers
+        overlap by design.
+
+        Attempt >= 2 is a random uuid4 *string*. It must be a str and not
+        a uuid.UUID: the lineage journal's to_json_line raises on the
+        object, and only on the journal path — i.e. only under an outage,
+        which is the one time the write must not fail.
+        """
+        attempt = self._attempts.get(effective_label, 0) + 1
+        self._attempts[effective_label] = attempt
+        token = f"{effective_label}|1" if attempt == 1 else str(uuid.uuid4())
+        return token, attempt
+
+    def _version_for_attempt(self, attempt: int) -> str | None:
+        """Agent version to stamp on a step row (ADR-0002 #7).
+
+        #7 promises every step row records the agent version it ran on.
+        The run-level version is *pinned* across a resume
+        (``self._agent_version = existing.agent_version`` in init), which
+        is right for ``--latest`` gating and wrong here: a step
+        re-executed after the customer deployed a fix — the exact loop R7
+        exists to create — would record the ORIGINAL version, making
+        attempt 2 indistinguishable from attempt 1 by version, precisely
+        where the distinction matters most.
+
+        So a re-execution records the LIVE registration's version. The
+        first execution keeps the pinned one, because that genuinely is
+        the version the run started on. Falls back to the pin when no
+        registration is in scope (scripts, tests, MemoryStore use).
+        """
+        if attempt < 2:
+            return self._agent_version
+        from papayya.agent import get_agent as _get_agent
+
+        registration = _get_agent(self.agent)
+        live = getattr(registration, "agent_version", None) if registration else None
+        return live if live is not None else self._agent_version
+
     def idempotency_key(self, label: str) -> str:
         """Return a stable per-step idempotency token for this run.
 
@@ -491,7 +588,8 @@ class Item:
         immediately before the step call it protects. This is a seam, not
         exactly-once: Papayya cannot dedupe a side effect it does not own.
         """
-        return f"{self.run_id}:{self._peek_step_label(label)}"
+        effective = self._peek_step_label(label)
+        return f"{self.run_id}:{effective}:{self._attempts.get(effective, 0) + 1}"
 
     def llm_step(
         self,
@@ -801,6 +899,7 @@ class Item:
                 input_snapshot = None
                 output_snapshot = None
 
+            execution_token, attempt = self._next_execution(ctx.effective_label)
             entry = TaskEntry(
                 label=ctx.effective_label,
                 result=result,
@@ -816,11 +915,13 @@ class Item:
                 llm_model=llm_model,
                 llm_stop_reason=llm_stop_reason,
                 llm_provider_shape=llm_provider_shape,
-                agent_version=self._agent_version,
+                agent_version=self._version_for_attempt(attempt),
                 metadata=self._metadata,
                 partition_key=self._partition_key,
                 outcome_status=outcome_status,
                 outcome_reason=outcome_reason,
+                execution_token=execution_token,
+                attempt=attempt,
             )
 
             self._cache[ctx.effective_label] = entry

@@ -105,7 +105,9 @@ class TestSustained5xxJournals:
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["kind"] == "save_task"
-        assert record["idempotency_key"] == "r1:enrich"
+        # Per EXECUTION, not per step (Plan 41 R3): two executions of one
+        # label are two distinct writes and must not dedupe into each other.
+        assert record["idempotency_key"] == "r1:enrich:1"
         assert record["attempts"] == 5
         assert record["payload"]["label"] == "enrich"
         assert record["last_error"].startswith("HTTPStatusError")

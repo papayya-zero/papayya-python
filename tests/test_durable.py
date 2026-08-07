@@ -198,14 +198,23 @@ class TestRepeatedLabels:
         assert outputs == ["thought about t-0", "thought about t-1"]
 
     def test_idempotency_key_tracks_occurrence(self) -> None:
+        """The occurrence suffix and the attempt are ORTHOGONAL axes.
+
+        ``label#N`` separates call N of a repeated label within one pass —
+        a loop, where each call is a different logical step. ``attempt``
+        separates re-executions of the same logical step across passes.
+        They compose, and the composition only holds because the attempt
+        counter is keyed on the EFFECTIVE label rather than the bare one
+        (Plan 41 R3 §T4). This test is the only coverage of that axis.
+        """
         run = PapayyaRun(DurableRunConfig(agent="test", store=MemoryStore()))
 
         key1 = run.idempotency_key("draft")
         run.step("draft", lambda: "v1")()
         key2 = run.idempotency_key("draft")
 
-        assert key1 == f"{run.run_id}:draft"
-        assert key2 == f"{run.run_id}:draft#2"
+        assert key1 == f"{run.run_id}:draft:1"
+        assert key2 == f"{run.run_id}:draft#2:1"
         assert key1 != key2
 
 

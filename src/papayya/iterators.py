@@ -655,6 +655,18 @@ def _write_synthetic_entry(run: "PapayyaRun", verdict: OutcomeVerdict) -> None:
     Plan 01's ``save_task`` aggregation picks up the entry and updates
     the parent run's ``worst_outcome_status`` / ``degraded_count``
     automatically on stores that support it.
+
+    This is a THIRD writer, bypassing ``_post_call_success`` entirely, so
+    it has to stamp its own execution identity (Plan 41 R3 §T7). It
+    deliberately does NOT touch ``run._attempts``: the label here is a
+    fresh uuid every call, so it is never re-executed and has no attempt
+    sequence to track — and polluting the dict would be indistinguishable
+    from a real step to everything downstream.
+
+    The bypass itself is a standing fragility: any per-step bookkeeping
+    added to ``_post_call_success`` will silently miss ``papayya.mark_*``
+    unless it is duplicated here. Worth a shared helper the next time
+    something is added there.
     """
     label = f"papayya.mark/{uuid.uuid4().hex[:8]}"
     entry = TaskEntry(
@@ -666,6 +678,8 @@ def _write_synthetic_entry(run: "PapayyaRun", verdict: OutcomeVerdict) -> None:
         partition_key=run._partition_key,
         outcome_status=verdict.status,
         outcome_reason=verdict.reason,
+        execution_token=f"{label}|1",
+        attempt=1,
     )
     try:
         run._store.save_task(run.run_id, entry)

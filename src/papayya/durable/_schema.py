@@ -100,6 +100,11 @@ COL_STEP_METADATA = "metadata"
 COL_STEP_PARTITION_KEY = "partition_key"
 COL_STEP_OUTCOME_STATUS = "outcome_status"
 COL_STEP_OUTCOME_REASON = "outcome_reason"
+# v13 (Plan 41 R3): the execution identity. execution_token identifies one
+# execution of a step and is what the local idempotency guard keys on;
+# attempt is the discriminator the provider idempotency key was built from.
+COL_STEP_EXECUTION_TOKEN = "execution_token"
+COL_STEP_ATTEMPT = "attempt"
 
 
 # Disposition values — contract with the UI's DLQ section and the hosted CP.
@@ -109,7 +114,7 @@ DLQ_ACKNOWLEDGED = "acknowledged"
 
 
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 
 # Indexes (v12 names) — named explicitly so tests can check their presence.

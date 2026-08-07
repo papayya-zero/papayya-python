@@ -106,6 +106,17 @@ def _discover_agents(path: str) -> list:
     return agents
 
 
+def _distinct_step_count(checkpoints: Any) -> int:
+    """How many STEPS a run has completed, from its checkpoint list.
+
+    Not ``len(checkpoints)`` (Plan 41 R3 §T9). A step can be recorded more
+    than once — a re-execution is its own checkpoint row — so the raw
+    length counts executions and would report progress past the agent's
+    own step count, which reads as a bug rather than as information.
+    """
+    return len({c.get("label") for c in (checkpoints or [])})
+
+
 def _resolve_project_id(ctx_obj: dict) -> str | None:
     """Resolve project ID from flag, env, or the current env's saved config."""
     pid = os.environ.get("PAPAYYA_PROJECT_ID")
@@ -1049,7 +1060,7 @@ def replay_cmd(
             time.sleep(2)
             status_resp = api.get_run(new_run_id)
             state = status_resp.get("status", "unknown")
-            done = len(status_resp.get("checkpoints", []) or [])
+            done = _distinct_step_count(status_resp.get("checkpoints"))
             click.echo(f"  {done} step(s) — {state}")
             if state in ("completed", "failed", "quarantined", "paused"):
                 click.echo(f"\nFinal status: {state}")
@@ -2157,7 +2168,7 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
             time.sleep(2)
             status_resp = api.get_run(run_id)
             state = status_resp.get("status", "unknown")
-            done = len(status_resp.get("checkpoints", []) or [])
+            done = _distinct_step_count(status_resp.get("checkpoints"))
             click.echo(f"  {done} step(s) — {state}")
 
             if state in ("completed", "failed", "cancelled", "budget_exceeded"):
@@ -2169,6 +2180,11 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
         checkpoints = api.get_steps(run_id)
         for c in checkpoints:
             label = c.get("label", "?")
+            # Mark re-executions, or two rows with the same label read as
+            # a duplicate rather than as the second attempt (Plan 41 R3).
+            attempt = c.get("attempt", 1)
+            if attempt > 1:
+                label = f"{label} (attempt {attempt})"
             result = c.get("result")
             content = (
                 result.get("content", "")

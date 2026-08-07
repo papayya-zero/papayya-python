@@ -206,7 +206,9 @@ CREATE TABLE IF NOT EXISTS {_schema.TBL_STEPS} (
     {_schema.COL_STEP_METADATA}        TEXT,
     {_schema.COL_STEP_PARTITION_KEY}   TEXT,
     {_schema.COL_STEP_OUTCOME_STATUS}  TEXT NOT NULL DEFAULT 'ok',
-    {_schema.COL_STEP_OUTCOME_REASON}  TEXT
+    {_schema.COL_STEP_OUTCOME_REASON}  TEXT,
+    {_schema.COL_STEP_EXECUTION_TOKEN} TEXT NOT NULL DEFAULT '',
+    {_schema.COL_STEP_ATTEMPT}         INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -658,6 +660,28 @@ def _apply_v11_to_v12(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "12")
 
 
+def _apply_v12_to_v13(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Plan 41 R3: the execution identity on step rows.
+
+    Plain ADD COLUMNs — no rebuild. Existing rows take the defaults, and
+    ``execution_token = ''`` is exactly right for them: they predate the
+    concept, and the guard below treats an empty token as "fall back to
+    (item, label)", which is the pre-R3 behaviour those rows were written
+    under.
+    """
+    _backup_db(db_path, "12")
+    with conn:
+        conn.execute(
+            f"ALTER TABLE {_schema.TBL_STEPS} "
+            f"ADD COLUMN {_schema.COL_STEP_EXECUTION_TOKEN} TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            f"ALTER TABLE {_schema.TBL_STEPS} "
+            f"ADD COLUMN {_schema.COL_STEP_ATTEMPT} INTEGER NOT NULL DEFAULT 1"
+        )
+        _set_schema_version(conn, "13")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
@@ -701,6 +725,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "11":
             _apply_v11_to_v12(conn, db_path)
             current = "12"
+        elif current == "12":
+            _apply_v12_to_v13(conn, db_path)
+            current = "13"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -841,6 +868,8 @@ class SQLiteStore:
                 partition_key=t[_schema.COL_STEP_PARTITION_KEY],
                 outcome_status=t[_schema.COL_STEP_OUTCOME_STATUS],
                 outcome_reason=t[_schema.COL_STEP_OUTCOME_REASON],
+                execution_token=t[_schema.COL_STEP_EXECUTION_TOKEN],
+                attempt=t[_schema.COL_STEP_ATTEMPT],
             )
             for t in step_rows
         ]
@@ -868,17 +897,34 @@ class SQLiteStore:
         input_snapshot_json = _encode_snapshot(entry.input_snapshot)
         output_snapshot_json = _encode_snapshot(entry.output_snapshot)
         with self._conn:
-            # Idempotency guard (parity with the control-plane SaveCheckpoint
-            # xmax=0 fix): a re-delivery of the same (item, label) must not
-            # insert a duplicate step row or double-count the item aggregates
-            # below. The local step cache normally prevents re-execution, so
-            # this is defensive; first-writer-wins matches the cloud path's
-            # ON CONFLICT (run_id, label) semantics.
-            already = self._conn.execute(
-                f"SELECT 1 FROM {_schema.TBL_STEPS} "
-                f"WHERE {_schema.COL_STEP_ITEM_ID} = ? AND label = ? LIMIT 1",
-                (run_id, entry.label),
-            ).fetchone()
+            # Idempotency guard, keyed on the EXECUTION (Plan 41 R3 §T11).
+            # A re-delivery of the same execution must not insert a
+            # duplicate step row or double-count the item aggregates below;
+            # a genuine re-execution must. Keyed on (item, label) — as it
+            # was before R3 — those are the same event, so a re-executed
+            # step's new result was never recorded locally at all. That is
+            # a different bug from the cloud one, which did ON CONFLICT
+            # ... DO UPDATE and skipped only the aggregates; here the whole
+            # write returned early. Mirrors the control plane's conflict
+            # target, which is now the derived row id.
+            #
+            # Empty token = a row written before v13, or a caller that
+            # builds TaskEntry directly. Fall back to (item, label), which
+            # is exactly the semantics those rows were written under.
+            if entry.execution_token:
+                already = self._conn.execute(
+                    f"SELECT 1 FROM {_schema.TBL_STEPS} "
+                    f"WHERE {_schema.COL_STEP_ITEM_ID} = ? "
+                    f"AND {_schema.COL_STEP_EXECUTION_TOKEN} = ? LIMIT 1",
+                    (run_id, entry.execution_token),
+                ).fetchone()
+            else:
+                already = self._conn.execute(
+                    f"SELECT 1 FROM {_schema.TBL_STEPS} "
+                    f"WHERE {_schema.COL_STEP_ITEM_ID} = ? AND label = ? "
+                    f"AND {_schema.COL_STEP_EXECUTION_TOKEN} = '' LIMIT 1",
+                    (run_id, entry.label),
+                ).fetchone()
             if already is not None:
                 return
             self._conn.execute(
@@ -899,8 +945,10 @@ class SQLiteStore:
                    {_schema.COL_STEP_METADATA},
                    {_schema.COL_STEP_PARTITION_KEY},
                    {_schema.COL_STEP_OUTCOME_STATUS},
-                   {_schema.COL_STEP_OUTCOME_REASON})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_STEP_OUTCOME_REASON},
+                   {_schema.COL_STEP_EXECUTION_TOKEN},
+                   {_schema.COL_STEP_ATTEMPT})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -923,6 +971,8 @@ class SQLiteStore:
                     entry.partition_key,
                     entry.outcome_status,
                     entry.outcome_reason,
+                    entry.execution_token,
+                    entry.attempt,
                 ),
             )
             self._conn.execute(

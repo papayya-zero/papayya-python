@@ -4,6 +4,10 @@ Mirrors the control-plane SaveCheckpoint xmax=0 guard — a re-delivery of the
 same step must not insert a duplicate task row or double-count the run-level
 worst_outcome_status / degraded_count aggregates. The local step cache
 normally prevents re-execution, so this is defensive; first-writer-wins.
+
+Plan 41 R3 moved the key from (run_id, label) to the per-execution token,
+so "the same step" and "the same execution of a step" are no longer the
+same thing: a re-delivery still collapses, a genuine re-execution does not.
 """
 
 from __future__ import annotations
@@ -53,9 +57,15 @@ def test_redelivery_does_not_double_count_aggregates(tmp_path):
         store.close()
 
 
-def test_idempotency_key_is_deterministic_per_run_and_label():
+def test_idempotency_key_is_deterministic_per_run_label_and_attempt():
     run = PapayyaRun(DurableRunConfig(agent="a", run_id="run-123", store=MemoryStore()))
-    assert run.idempotency_key("draft") == "run-123:draft"
-    # Stable across calls (so a re-executed step yields the same provider key).
+    # The attempt is part of the key (Plan 41 R3). Without it a deliberate
+    # re-execution would re-send the key the first execution already used
+    # and the provider would replay its response instead of doing the work.
+    assert run.idempotency_key("draft") == "run-123:draft:1"
+    # Stable across calls. Note what this pins: with nothing recorded, the
+    # key does NOT move — so a crash between a step's side effect and its
+    # checkpoint re-sends the same key on resume and the provider dedupes
+    # the retry. That is the case the key exists for.
     assert run.idempotency_key("draft") == run.idempotency_key("draft")
     assert run.idempotency_key("draft") != run.idempotency_key("polish")

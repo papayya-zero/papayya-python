@@ -370,10 +370,16 @@ class TestV11ToV12Migration:
             conn.close()
         assert _version_of(tmp_db) == "11"
 
-    def test_v11_bumps_to_v12(self, tmp_db: Path) -> None:
+    def test_v11_chains_to_current(self, tmp_db: Path) -> None:
+        """A v11 DB walks the whole remaining chain, not just one hop.
+
+        Asserted against SCHEMA_VERSION rather than a literal so adding a
+        migration does not need this edited — the point of the test is
+        that long-dormant DBs catch up completely.
+        """
         self._build_v11_db(tmp_db)
         SQLiteStore(str(tmp_db))
-        assert _version_of(tmp_db) == "12"
+        assert _version_of(tmp_db) == _schema.SCHEMA_VERSION
 
     def test_v11_tables_renamed(self, tmp_db: Path) -> None:
         self._build_v11_db(tmp_db)

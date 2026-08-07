@@ -81,6 +81,25 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _is_schema_rejection(entry: "JournalEntry", exc: BaseException) -> bool:
+    """Did the control pane reject a journaled write for its *shape*?
+
+    Narrow on purpose: a 400 on a checkpoint write. That is the signature
+    of an SDK sending a field the server does not know yet — the
+    new-SDK-against-old-API direction of a rollout, or a rollback past the
+    release that added the field.
+
+    Such an entry is NOT invalid; the server is. Retaining it (rather than
+    dropping it as an ordinary terminal error) is what keeps a rollback
+    from silently destroying the lineage writes ADR-0002 #8 protects. A
+    genuinely malformed payload also lands here, but it costs bounded disk
+    and stays visible in the journal instead of vanishing into a log line.
+    """
+    if entry.kind != "save_task":
+        return False
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 400
+
+
 @dataclass
 class CloudStoreConfig:
     """Configuration for the cloud checkpoint store."""
@@ -165,6 +184,14 @@ class CloudStore:
                     # versions (pre-Plan-03) round-trip cleanly.
                     outcome_status=cp.get("outcome_status", "ok"),
                     outcome_reason=cp.get("outcome_reason"),
+                    # Plan 41 R3. A control pane predating 072 sends
+                    # neither, and the defaults are exactly right there:
+                    # one execution per label, attempt 1. The server does
+                    # not echo the execution token (it is an input to the
+                    # row-id derivation, not row state), so hydration
+                    # leaves it empty — nothing downstream reads it off a
+                    # loaded row, only off one being written.
+                    attempt=cp.get("attempt", 1),
                 )
                 for cp in body.get("checkpoints") or []
             ],
@@ -216,13 +243,29 @@ class CloudStore:
             "llm_provider_shape": entry.llm_provider_shape,
             "outcome_status": entry.outcome_status,
             "outcome_reason": entry.outcome_reason,
+            # Plan 41 R3 — the execution identity. The server derives the
+            # checkpoint row's primary key from (run_id, execution_token),
+            # so this payload IS the idempotency of the write: a journal
+            # drain reissues this exact dict and therefore lands on the
+            # same row, which is what preserves ADR-0002 #8.
+            #
+            # completed_at is the client's own stamp, and sending it is
+            # load-bearing rather than cosmetic — the server used to
+            # substitute its own clock at request entry, which cannot
+            # order a late-drained journal write against the execution
+            # that replaced it.
+            "execution_token": entry.execution_token,
+            "attempt": entry.attempt,
+            "completed_at": entry.completed_at,
         }
         self._execute(
             kind="save_task",
             method="POST",
             url=f"{self._runs_base}/{run_id}/checkpoints",
             payload=payload,
-            idempotency_key=f"{run_id}:{entry.label}",
+            # Per EXECUTION, not per step: two executions of one label are
+            # two distinct writes and must not dedupe into each other.
+            idempotency_key=f"{run_id}:{entry.label}:{entry.attempt}",
         )
 
     def set_status(self, run_id: str, status: str, output: Any = None) -> None:
@@ -306,6 +349,17 @@ class CloudStore:
         new POST gets to journal in correct order. Drops entries that
         fail with a terminal error (rare — implies the journaled
         payload is now invalid, e.g. tenant deleted).
+
+        EXCEPT a 400 on a checkpoint write, which is RETAINED rather than
+        dropped (Plan 41 R3 §T12). Dropping those makes rollback destroy
+        lineage: if the control pane is rolled back past the release that
+        accepts a field this SDK sends, every drained entry 400s,
+        ``_is_transient`` says false, and we would permanently and
+        silently discard exactly the writes ADR-0002 #8 exists to protect
+        — at the worst possible moment, since the journal only has
+        entries because the server was already failing. A retained entry
+        costs a bounded amount of disk and drains itself once the schema
+        catches up.
         """
         if self._journal.is_empty():
             return
@@ -326,6 +380,15 @@ class CloudStore:
                 if _is_transient(exc):
                     log.debug(
                         "drain halted on %s after transient error: %s",
+                        entry.idempotency_key, exc,
+                    )
+                    halt = True
+                    remaining.append(entry)
+                elif _is_schema_rejection(entry, exc):
+                    log.warning(
+                        "retaining journal entry %s — the control pane rejected "
+                        "its shape (%s). This is the rollback case: the write is "
+                        "valid and will drain once the server accepts it again.",
                         entry.idempotency_key, exc,
                     )
                     halt = True

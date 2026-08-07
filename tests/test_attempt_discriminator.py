@@ -30,9 +30,17 @@ def _now() -> str:
 
 
 def _entry(label: str, attempt: int = 1, result: object = "v") -> TaskEntry:
+    """A TaskEntry as the SDK's write path would build it.
+
+    The token is deterministic per (label, attempt) so a test can re-deliver
+    "the same execution" simply by building the same entry twice. The real
+    path only uses this form for attempt 1 and goes random above it; that
+    difference is pinned separately by
+    test_attempt_one_token_is_deterministic.
+    """
     return TaskEntry(
         label=label, result=result, duration_ms=1, completed_at=_now(),
-        attempt=attempt,
+        attempt=attempt, execution_token=f"{label}|{attempt}",
     )
 
 
