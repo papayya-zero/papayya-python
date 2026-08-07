@@ -4,6 +4,38 @@ All notable changes to the `papayya` Python package.
 
 ## Unreleased
 
+> **Requires a control plane at migration 073 or later.** This release
+> sends three new fields on every checkpoint write. The release that
+> applied migration 072 accepts and ignores them; anything older rejects
+> them outright, and a rejected checkpoint write is not transient, so the
+> step raises rather than degrading. Upgrade the control plane first.
+
+Every step execution now has its own identity, which is what lets a
+re-executed step be told apart from a re-*delivered* one:
+
+- **`run.idempotency_key()` is now per execution, not per step.** The key
+  is `(run_id, effective_label, attempt)`, and `attempt` counts what the
+  run can *see* recorded. The behaviour customers depend on is unchanged
+  and now stated: a crash between a step's side effect and its checkpoint
+  leaves nothing recorded, so the resumed step sends the **same** key and
+  the provider replays its response instead of billing twice. What
+  changes is the other case — deliberately re-executing a step that *was*
+  recorded now sends a **new** key, so the provider actually redoes the
+  work. Previously both cases sent the same key, so a re-run silently got
+  the old response back.
+- **The lineage journal's drain is idempotent on the payload.** A
+  checkpoint write carries an `execution_token`; the server derives the
+  row's primary key from it, so a journaled write reissued after an
+  outage lands on its own row rather than overwriting the execution that
+  replaced it while the server was unreachable (ADR-0002 #8).
+- **A drained journal entry rejected with a 4xx is now retained**, not
+  dropped. Dropping it discarded exactly the writes the journal exists to
+  protect, at the one moment the server was already failing.
+- **`TaskEntry` gains `execution_token` and `attempt`**, both round-tripped
+  by every store (cloud, SQLite — schema v13 —, file, memory). A step
+  re-executed after a redeploy records the **live** agent version rather
+  than the version the run was pinned to (ADR-0002 #7).
+
 Hosted off-cycle path ergonomics — submit a run from a web handler, then
 poll/stream/callback for the result:
 

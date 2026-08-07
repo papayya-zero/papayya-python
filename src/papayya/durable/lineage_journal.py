@@ -15,11 +15,20 @@ reads on macOS APFS); (2) "successful POST" is itself proof the server
 is reachable, which is exactly the signal the reconciler needs.
 
 Concurrent-process safety is best-effort. Two SDK processes sharing a
-cwd may both attempt to drain the same journal; idempotency keys
-(``(run_id, label)`` for save_task, ``run_id`` for set_status / create
-once the server-side ``ON CONFLICT (run_id) DO NOTHING`` lands) make
-duplicate drain a server-side no-op. The alternative — fcntl/flock —
-is ergonomic friction for a corner case the keys already handle.
+cwd may both attempt to drain the same journal; a duplicate drain is a
+server-side no-op because the *payload* carries the write's identity.
+For save_task that is the ``execution_token`` minted per execution
+(Plan 41 R3): the server derives the checkpoint row's primary key from
+``(run_id, token)``, so reissuing the same journaled payload lands on
+the same row and its aggregates are skipped, while a genuine
+re-execution of that step carries a different token and gets its own
+row. For set_status / create it is ``run_id``. The alternative —
+fcntl/flock — is ergonomic friction for a corner case the payload
+already handles.
+
+``JournalEntry.idempotency_key`` below is a *local* audit label, never
+sent on the wire; it names the write in logs. It is per execution, not
+per step, so two executions of one label are two lines rather than one.
 """
 
 from __future__ import annotations

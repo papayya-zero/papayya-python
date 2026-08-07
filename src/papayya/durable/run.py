@@ -568,7 +568,7 @@ class Item:
         return live if live is not None else self._agent_version
 
     def idempotency_key(self, label: str) -> str:
-        """Return a stable per-step idempotency token for this run.
+        """Return a per-execution idempotency token for this step.
 
         The durable runtime is **at-least-once**: if a worker crashes
         between executing a step's side effect and persisting its
@@ -581,11 +581,34 @@ class Item:
             resp = run.llm_step("draft", lambda: client.messages.create(
                 ..., extra_headers={"Idempotency-Key": key}))
 
-        The token is deterministic in ``(run_id, label, occurrence)`` so
-        the same logical step yields the same key across re-executions,
-        while call N of a repeated label (an agent loop) gets its own key
-        — matching the ``label#N`` keying of the step itself. Call it
-        immediately before the step call it protects. This is a seam, not
+        **What the token discriminates.** It is
+        ``(run_id, effective_label, attempt)``, where ``attempt`` is one
+        more than the highest attempt this run can *see* recorded for the
+        step. So the key turns on whether the previous execution left a
+        record, which is the distinction that matters:
+
+        - A crash before the checkpoint persisted leaves nothing recorded,
+          so the resumed execution sends the **same** key and the provider
+          replays its stored response. That is the point of the key — it
+          is what stops the retry billing your provider account twice.
+        - A **deliberate** re-execution of a step that *was* recorded — an
+          operator re-running it — sends a **new** key, so the provider
+          does the work again. Asking for a step to be re-run and getting
+          the old response replayed back would be the wrong outcome.
+
+        Two executions can legitimately share an attempt number: a write
+        journaled during an outage is by definition invisible to the
+        execution that replaces it. So this is a provider key and not a
+        unique record id — the record's identity is a separate token the
+        SDK mints per execution (Plan 41 R3).
+
+        Composes with the ``label#N`` occurrence suffix rather than
+        colliding with it: iteration 2 of a loop, re-executed once, keys
+        on ``"<run_id>:draft#2:2"``.
+
+        Call it **immediately before** the step call it protects — it
+        reads the counter as of now, so a call made after that step
+        returns yields the *next* execution's key. This is a seam, not
         exactly-once: Papayya cannot dedupe a side effect it does not own.
         """
         effective = self._peek_step_label(label)
