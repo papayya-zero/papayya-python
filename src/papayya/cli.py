@@ -1070,6 +1070,132 @@ def replay_cmd(
 
 
 # ---------------------------------------------------------------------------
+# pull — materialize a production incident as local fixtures
+#
+# Plan 41 R4; ADR 0009 D7b. The cohort's records already carry input, the real
+# bad output, verdict, tenant and timestamp — which IS a fixture set. Written
+# to disk, the production failure becomes reproducible locally, offline and
+# deterministically: fix against it, verify against it before spending a cent
+# of inference, then re-drive only that cohort.
+# ---------------------------------------------------------------------------
+
+@main.command("pull")
+@click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
+@click.option("--tenant", default=None,
+              help="Narrow to one partition key (the customer's own tenant id).")
+@click.option("--run", "run_id", default=None,
+              help="Narrow to one run's records. One predicate term among "
+                   "several, not the addressing scheme.")
+@click.option("--outcome", default=None,
+              type=click.Choice(["not_ok", "any", "degraded", "failed"]),
+              help="Verdict axis. Default not_ok — everything that didn't work.")
+@click.option("--since", default=None, help="Window start (RFC3339).")
+@click.option("--until", default=None, help="Window end (RFC3339).")
+@click.option("--include-triaged", is_flag=True, default=False,
+              help="Re-admit records someone already dispositioned. Off by "
+                   "default so a pull doesn't resurrect handled work.")
+@click.option("--limit", type=int, default=None,
+              help="Cap the number of fixtures written.")
+@click.option("--out", "out_dir", default="./fixtures",
+              help="Directory to write fixtures into (default ./fixtures).")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what the predicate selects without writing anything.")
+@click.pass_context
+def pull_cmd(
+    ctx: click.Context,
+    agent: str | None,
+    tenant: str | None,
+    run_id: str | None,
+    outcome: str | None,
+    since: str | None,
+    until: str | None,
+    include_triaged: bool,
+    limit: int | None,
+    out_dir: str,
+    dry_run: bool,
+) -> None:
+    """Pull a cohort of failed records to disk as reproducible fixtures.
+
+    \b
+      papayya pull --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
+      papayya verify --fixtures ./fixtures --agent-module app
+    """
+    from papayya.fixtures import fixture_from_record, write_fixtures
+
+    scope = _env_scope(ctx.obj)
+    config = APIConfig(api_key=_require_api_key(scope), base_url=scope.base_url)
+    api = APIClient(config)
+
+    try:
+        predicate = {
+            "agent": agent, "tenant": tenant, "run_id": run_id,
+            "outcome": outcome or "not_ok", "since": since, "until": until,
+            "include_triaged": include_triaged,
+        }
+        try:
+            resp = api.get_cohort(
+                agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
+                since=since, until=until, include_triaged=include_triaged,
+                limit=limit,
+            )
+        except PapayyaAPIError as exc:
+            click.echo(f"Error: cohort selection failed ({exc.status}): {exc}", err=True)
+            sys.exit(1)
+        members = resp.get("members", [])
+        total = resp.get("total", len(members))
+
+        if not members:
+            click.echo("No records matched. Nothing to pull.")
+            click.echo("  Widen the window with --since, or pass --outcome any.")
+            return
+
+        # Say the truncation out loud. An operator who reads "wrote 100
+        # fixtures" and acts as though that is the incident has been misled
+        # by us, not by the data.
+        if resp.get("truncated"):
+            click.echo(
+                f"NOTE: cohort is {total} records; pulling {len(members)}. "
+                f"Raise --limit to take the rest.",
+                err=True,
+            )
+
+        if dry_run:
+            click.echo(f"Would pull {len(members)} of {total} record(s) into {out_dir}:")
+            for m in members[:20]:
+                click.echo(f"  {m.get('item_id') or m.get('id')}  {m.get('worst_outcome_status')}")
+            if len(members) > 20:
+                click.echo(f"  … and {len(members) - 20} more")
+            return
+
+        fixtures = []
+        no_input = 0
+        for m in members:
+            try:
+                steps = api.get_steps(m["id"])
+            except Exception as exc:  # noqa: BLE001
+                # One unreadable record must not cost the operator the
+                # cohort — the whole point is to get the incident on disk.
+                click.echo(f"  ! {m.get('item_id') or m['id']}: steps unavailable ({exc})", err=True)
+                steps = []
+            fx = fixture_from_record(m, steps, cohort=predicate)
+            if fx.input is None:
+                no_input += 1
+            fixtures.append(fx)
+
+        paths = write_fixtures(fixtures, out_dir)
+        click.echo(f"Pulled {len(paths)} of {total} record(s) into {out_dir}/")
+        if no_input:
+            click.echo(
+                f"  {no_input} fixture(s) have no recorded input and cannot be "
+                f"re-run by `papayya verify` — they are kept for their trace.",
+                err=True,
+            )
+        click.echo(f"\nNext: papayya verify --fixtures {out_dir} --agent-module <module>")
+    finally:
+        api.close()
+
+
+# ---------------------------------------------------------------------------
 # runs — run (invocation) ops, and items — per-item inspection
 #
 # Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
@@ -2613,9 +2739,13 @@ main.add_command(batch)
 # deactivated local surfaces — dropped from the help tiers.
 main.sections = [
     ("Getting started", ["deploy", "replay", "login"]),
+    # `pull` sits beside `triage` and `replay` deliberately: it is the
+    # recovery loop's first verb (Plan 41 R4 / ADR 0009 D7b), and an
+    # operator looking for "what do I do about these failures" should meet
+    # it in the same section they found the failures in.
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
-      "triggers", "triage"]),
+      "triggers", "triage", "pull"]),
     ("Account & platform ops",
      ["signup", "logout", "envs", "secrets", "projects",
       "deployments", "api-keys", "usage", "rate-card"]),

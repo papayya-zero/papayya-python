@@ -258,6 +258,54 @@ class Items:
         params = {"partition_key": partition_key} if partition_key else {}
         return self._api._request("GET", "/v1/durable/runs/clusters", params=params)
 
+    # Cohort lane (Plan 41 R4, ADR 0009 D7) — "every record where predicate P
+    # held over window W". Distinct from every method above, which takes ONE
+    # record's id. This is the input type of the recovery verbs.
+
+    def cohort(
+        self,
+        *,
+        agent: str | None = None,
+        tenant: str | None = None,
+        run_id: str | None = None,
+        outcome: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        include_triaged: bool = False,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Select the records matching a predicate over a window.
+
+        Returns ``{members, total, truncated}``. ``total`` is the FULL
+        cohort size ignoring ``limit``, and ``truncated`` says plainly
+        whether ``members`` is the whole of it — read both before acting on
+        a cohort, or you will act on a page and believe it was the set.
+
+        ``run_id`` is one optional term rather than the addressing scheme:
+        nothing in the product mints a multi-item run, so a run-keyed
+        selection returns that single record. ``tenant`` is the customer's
+        own partition key. ``since`` / ``until`` are RFC3339. Records an
+        operator already dispositioned are excluded unless
+        ``include_triaged=True`` — re-driving those would refill the triage
+        feed.
+        """
+        params: dict[str, Any] = {}
+        for key, val in (
+            ("agent", agent),
+            ("tenant", tenant),
+            ("run_id", run_id),
+            ("outcome", outcome),
+            ("from", since),
+            ("to", until),
+        ):
+            if val is not None:
+                params[key] = val
+        if include_triaged:
+            params["include_triaged"] = "true"
+        if limit is not None:
+            params["limit"] = str(limit)
+        return self._api._request("GET", "/v1/durable/cohorts", params=params)
+
 
 def _parse_sse(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
     """Parse the SSE wire format into ``{event, data, id?}`` dicts.

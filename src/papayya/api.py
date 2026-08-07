@@ -227,6 +227,43 @@ class APIClient:
             "POST", f"/v1/durable/runs/{run_id}/replay", params=params
         )
 
+    def get_cohort(
+        self,
+        *,
+        agent: str | None = None,
+        tenant: str | None = None,
+        run_id: str | None = None,
+        outcome: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        include_triaged: bool = False,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Select records by predicate over a window (Plan 41 R4, ADR 0009 D7).
+
+        Returns ``{members, total, truncated}``. ``total`` is the FULL
+        cohort size ignoring ``limit``; ``truncated`` says whether
+        ``members`` is the whole of it. Read both — acting on a page while
+        believing it is the set is the mistake this response shape exists
+        to prevent.
+
+        ``run_id`` is one optional predicate term, not the addressing
+        scheme: nothing in the product mints a multi-item run, so a
+        run-keyed selection returns that single record.
+        """
+        params: dict[str, str] = {}
+        for key, val in (
+            ("agent", agent), ("tenant", tenant), ("run_id", run_id),
+            ("outcome", outcome), ("from", since), ("to", until),
+        ):
+            if val is not None:
+                params[key] = val
+        if include_triaged:
+            params["include_triaged"] = "true"
+        if limit is not None:
+            params["limit"] = str(limit)
+        return self._request("GET", "/v1/durable/cohorts", params=params)
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         # v1→v2 cutover: a triggered run is now a durable_run. The v1
         # /v1/runs/{id} surface reads the (now-unfed) runs table, so poll
