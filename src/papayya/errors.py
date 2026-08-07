@@ -23,14 +23,13 @@ class CreditExhausted(Exception):
     Pauses the run rather than failing it, and all durable checkpoints are
     preserved — so no completed work is lost and nothing is re-paid for.
 
-    .. warning::
+    The worker releases its lease back to the queue (parked) and marks the
+    run ``paused`` with ``pause_reason="credit"``. Top up the provider
+    account and resume the run: it re-drives from where it stopped, skipping
+    every checkpointed step.
 
-       **Resuming does not yet re-drive the run on the hosted path.** The
-       paused run completes its lease with ``error_category="paused"``, so
-       the item leaves the queue; ``POST /resume`` flips the run's status
-       back to ``running`` and nothing re-enqueues it. Top up the provider
-       account and replay the run rather than resuming it. Plan 41 R6
-       makes resume actually re-drive.
+    Papayya cannot know when your provider account is funded again, so it
+    does not retry on a timer. The resume is the signal.
     """
     pass
 

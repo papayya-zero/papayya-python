@@ -6,6 +6,8 @@ localhost that:
   • accepts items via POST /enqueue (or .enqueue() in-process)
   • leases items to workers via GET /lease?worker_id=X
   • records completion via POST /complete
+  • parks a paused item via POST /release
+  • records heartbeats via POST /heartbeat
   • exposes a snapshot via GET /stats
 
 Workers connect to it the same way they will eventually connect to the
@@ -112,6 +114,14 @@ class LocalDispatcher:
         self._pending: deque[_PendingItem] = deque()
         self._leased: dict[str, _LeasedRecord] = {}
         self._completed: dict[str, dict[str, Any]] = {}
+        # Items released by a paused worker (POST /release). The hosted
+        # dispatcher parks these in runtime_pending at
+        # available_at='infinity'; there is no available_at here, so the
+        # park is a separate dict — same observable property, which is the
+        # one that matters: a parked item is NOT leasable and only an
+        # operator resume brings it back. Local dev has no resume verb, so
+        # nothing does; the items sit here and show up in stats().
+        self._parked: dict[str, dict[str, Any]] = {}
         self._enqueued_total = 0
         self._on_event = on_event or (lambda _kind, _data: None)
         # When set, lease/complete/heartbeat require X-Api-Key to match.
@@ -219,6 +229,7 @@ class LocalDispatcher:
                 "leased": len(self._leased),
                 "completed": sum(1 for v in self._completed.values() if v["status"] == "completed"),
                 "failed": sum(1 for v in self._completed.values() if v["status"] != "completed"),
+                "parked": len(self._parked),
             }
 
     def completed_count(self) -> int:
@@ -347,6 +358,25 @@ class LocalDispatcher:
                     self._send_json(200, None)
                     return
 
+                if parsed.path == "/release":
+                    if not self._check_auth():
+                        return
+                    body = self._read_json()
+                    if body is None or "lease_id" not in body:
+                        self._send_json(400, {"error": "lease_id required"})
+                        return
+                    reason = body.get("reason") or "paused"
+                    if reason not in ("paused", "credit"):
+                        self._send_json(400, {"error": "reason must be 'paused' or 'credit'"})
+                        return
+                    outcome = dispatcher._release_lease(
+                        lease_id=body["lease_id"],
+                        reason=reason,
+                        worker_id=body.get("worker_id"),
+                    )
+                    self._send_json(200, {"outcome": outcome})
+                    return
+
                 if parsed.path == "/heartbeat":
                     if not self._check_auth():
                         return
@@ -440,6 +470,51 @@ class LocalDispatcher:
             "duration_ms": duration_ms,
         })
         return True
+
+    def _release_lease(
+        self, *, lease_id: str, reason: str, worker_id: str | None
+    ) -> str:
+        """Hand a lease back to the queue, PARKED. Plan 41 R6.
+
+        The counterpart of :meth:`_mark_complete`, and the distinction is
+        the whole point: a completed lease is terminal, a released one is
+        not. A worker that stops because the run was paused must not
+        complete its lease, or the item can never be re-driven.
+
+        Returns the hosted dispatcher's vocabulary so the two agree on the
+        wire — ``"released"`` / ``"duplicate"`` (the lease already has a
+        completion) / ``"stale"`` (unknown; the reaper got there first, or
+        this is the worker's own retry after the first release re-minted
+        the lease_id).
+
+        A fresh lease_id is minted for the parked item, symmetric with the
+        reaper: a zombie worker reporting against the old id gets stale.
+        """
+        with self._lock:
+            record = self._leased.pop(lease_id, None)
+            if record is None:
+                if lease_id in self._completed:
+                    outcome = "duplicate"
+                else:
+                    outcome = "stale"
+            else:
+                new_lease_id = uuid.uuid4().hex
+                self._parked[new_lease_id] = {
+                    "agent": record.item.agent,
+                    "item_id": record.item.item_id,
+                    "payload": record.item.payload,
+                    "agent_version": record.item.agent_version,
+                    "reason": reason,
+                    "released_from": lease_id,
+                }
+                outcome = "released"
+        self._on_event("released" if outcome == "released" else "stale_release", {
+            "lease_id": lease_id,
+            "reason": reason,
+            "worker_id": worker_id,
+            "outcome": outcome,
+        })
+        return outcome
 
     def _record_heartbeat(self, *, lease_id: str, worker_id: str) -> str:
         """Update last_heartbeat for a lease.

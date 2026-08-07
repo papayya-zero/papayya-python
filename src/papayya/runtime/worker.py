@@ -13,6 +13,11 @@ The dispatcher protocol is intentionally minimal for Phase 1:
 
   GET  /lease?worker_id=X     -> 200 JSON {lease_id, agent, item_id} or 204
   POST /complete              -> 200 JSON {}, body {lease_id, status, error?}
+  POST /release               -> 200 JSON {outcome}, body {lease_id, reason}
+
+/complete and /release are the two ways a lease ends, and the difference is
+the point: /complete is terminal, /release hands the item back to the queue
+parked so an operator resume can re-drive it.
 
 Future phases add: heartbeats, lease TTL, code-distribution version
 negotiation, hot-reload signaling. None of that exists yet — Phase 1
@@ -876,6 +881,90 @@ class Worker:
                 time.sleep(wait)
                 wait = min(wait * 2.0, 2.0)
 
+    def _report_release(self, lease_id: str, reason: str) -> None:
+        """Hand a lease BACK to the queue instead of completing it.
+
+        POST /release {lease_id, worker_id, reason}. The dispatcher parks the
+        item at ``available_at='infinity'`` so an operator resume can unpark
+        it and a worker replays the run from its saved checkpoints.
+
+        This is the fix for the pause path's oldest lie. Until Plan 41 R6 a
+        paused run reported ``/complete`` with ``error_category="paused"``:
+        the item landed in ``runtime_completed``, which is terminal by
+        construction, so nothing could ever re-queue it. ``POST /resume``
+        flipped the run to ``running`` and left it with no lease and no
+        worker — "a human is needed here" rewritten as "work is in progress",
+        in the product whose whole wedge is silent failure.
+
+        ``reason`` is ``"paused"`` (a fence stopped the run; the server
+        already knows and wrote the status) or ``"credit"`` (the provider
+        reported credit exhaustion, which is classified entirely client-side,
+        so this call is the only way the server learns of it at all).
+
+        Never raises. Same bounded retry as :meth:`_report_complete`, and
+        safe for the same reason: the dispatcher's release is idempotent on
+        lease_id, returning 200 for duplicate and stale alike.
+        """
+        body = {"lease_id": lease_id, "worker_id": self.worker_id, "reason": reason}
+        data = json.dumps(body).encode("utf-8")
+        req = urllib_request.Request(
+            f"{self.dispatcher_url}/release",
+            data=data,
+            headers={"Content-Type": "application/json", **self._auth_headers()},
+            method="POST",
+        )
+
+        attempts = 5
+        wait = 0.1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib_request.urlopen(req, timeout=2.0):
+                    return
+            except urllib_error.HTTPError as exc:
+                if exc.code in (404, 405):
+                    # The dispatcher predates the release verb. Don't retry a
+                    # route that doesn't exist, and don't leave the lease
+                    # dangling either: a dangling lease expires in ~30s, the
+                    # reaper re-queues it, and a worker picks the PAUSED run
+                    # straight back up — worse than the bug we're fixing,
+                    # because a re-leased run doesn't re-read its own paused
+                    # status. So resolve the lease the old way and say
+                    # plainly what the operator has lost.
+                    log.warning(
+                        "dispatcher has no /release (HTTP %d) — completing lease %s "
+                        "instead. The run's item leaves the queue permanently and "
+                        "resume will NOT re-drive it; replay the run instead.",
+                        exc.code, lease_id,
+                    )
+                    self._report_complete(
+                        lease_id,
+                        status="failed",
+                        error=f"paused ({reason}); dispatcher has no /release",
+                        error_category="paused",
+                    )
+                    return
+                if attempt == attempts:
+                    log.error(
+                        "failed to release lease %s after %d attempts: %s",
+                        lease_id, attempts, exc,
+                    )
+                    return
+                time.sleep(wait)
+                wait = min(wait * 2.0, 2.0)
+            except urllib_error.URLError as exc:
+                if attempt == attempts:
+                    log.error(
+                        "failed to release lease %s after %d attempts: %s",
+                        lease_id, attempts, exc,
+                    )
+                    return
+                log.debug(
+                    "release attempt %d/%d failed: %s; retrying in %.2fs",
+                    attempt, attempts, exc, wait,
+                )
+                time.sleep(wait)
+                wait = min(wait * 2.0, 2.0)
+
     def _mark_run_running(self, run_id: str) -> None:
         """Best-effort flip the durable run queued→running on lease pickup
         (v1→v2 cutover). PATCH /v1/runtime/runs/{run_id} {status:running} on
@@ -1153,8 +1242,10 @@ class Worker:
         Terminal paths:
           - Success: report completed lease → ``("completed", result)``.
           - _AgentTimeout: report failed (category=timeout) → ``("failed", None)``.
-          - WorkloadPaused / CreditExhausted: report failed lease (preserving
-            prior behavior) but leave the run status alone → ``(None, None)``.
+          - WorkloadPaused / CreditExhausted: RELEASE the lease back to the
+            queue (parked) and leave the run status alone → ``(None, None)``.
+            Not a completion: a completed lease is terminal and resume would
+            have nothing to re-drive (Plan 41 R6).
           - Any other exception: report failed → ``("failed", None)``.
 
         The signal arming is local to this call. ``setitimer(0)`` and
@@ -1207,20 +1298,21 @@ class Worker:
             )
             return "failed", None
         except (WorkloadPaused, CreditExhausted) as exc:
-            # Not a body failure: the run is paused (or provider-stopped) and
-            # its status is authoritative server-side. Preserve the prior
-            # lease-completion behavior but do NOT flip the run terminal.
+            # Not a body failure: the run stopped, its checkpoints are all
+            # saved, and it must be resumable. RELEASE the lease — do not
+            # complete it. Completing it puts the item in runtime_completed,
+            # which is terminal by construction, so resume would have
+            # nothing to re-drive (Plan 41 R6). The two exceptions differ
+            # only in the reason they carry: a fence pause the server
+            # already recorded, versus a provider-credit stop it can learn
+            # about nowhere else.
             duration_ms = int((time.monotonic() - started_at) * 1000)
+            reason = "credit" if isinstance(exc, CreditExhausted) else "paused"
             log.warning(
-                "paused   %s item=%s duration=%dms %s: %s",
-                short, lease.item_id, duration_ms, type(exc).__name__, exc,
+                "paused   %s item=%s duration=%dms reason=%s %s: %s",
+                short, lease.item_id, duration_ms, reason, type(exc).__name__, exc,
             )
-            self._report_complete(
-                lease.lease_id,
-                status="failed",
-                error=f"{type(exc).__name__}: {exc}",
-                error_category="paused",
-            )
+            self._report_release(lease.lease_id, reason=reason)
             return None, None
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -1289,8 +1381,8 @@ class Worker:
             doesn't catch it; without an explicit branch this would
             propagate out of ``_handle_lease`` and the lease would only
             recover via TTL.
-          - WorkloadPaused / CreditExhausted: report failed lease but leave
-            the run status alone → ``(None, None)``.
+          - WorkloadPaused / CreditExhausted: RELEASE the lease back to the
+            queue (parked), leaving the run status alone → ``(None, None)``.
           - Any other ``Exception``: existing stringified-error path.
         """
         from papayya.runtime import _bundle_loader
@@ -1334,17 +1426,16 @@ class Worker:
             )
             return "failed", None
         except (WorkloadPaused, CreditExhausted) as exc:
+            # Mirrors the sync path exactly: release the lease so the item
+            # goes back to the queue parked, rather than completing it into
+            # a terminal table resume can't reach (Plan 41 R6).
             duration_ms = int((time.monotonic() - started_at) * 1000)
+            reason = "credit" if isinstance(exc, CreditExhausted) else "paused"
             log.warning(
-                "paused   %s item=%s duration=%dms %s: %s",
-                short, lease.item_id, duration_ms, type(exc).__name__, exc,
+                "paused   %s item=%s duration=%dms reason=%s %s: %s",
+                short, lease.item_id, duration_ms, reason, type(exc).__name__, exc,
             )
-            self._report_complete(
-                lease.lease_id,
-                status="failed",
-                error=f"{type(exc).__name__}: {exc}",
-                error_category="paused",
-            )
+            self._report_release(lease.lease_id, reason=reason)
             return None, None
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
