@@ -1308,6 +1308,209 @@ def verify_cmd(
 
 
 # ---------------------------------------------------------------------------
+# release — re-drive the cohort, and show the diff
+#
+# Plan 41 R4 C5/C6/C7. The last verb of pull → verify → release, and the one
+# that answers "did the fix work, on which records, at what cost" — including
+# the column that earns the diff: how many records the fix NEWLY BROKE.
+# ---------------------------------------------------------------------------
+
+@main.command("release")
+@click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
+@click.option("--tenant", default=None,
+              help="Narrow to one partition key (the customer's own tenant id).")
+@click.option("--run", "run_id", default=None,
+              help="Narrow to one run's records. One predicate term among "
+                   "several, not the addressing scheme.")
+@click.option("--outcome", default=None,
+              type=click.Choice(["not_ok", "any", "degraded", "failed"]),
+              help="Verdict axis. Default not_ok — everything that didn't work.")
+@click.option("--since", default=None, help="Window start (RFC3339).")
+@click.option("--until", default=None, help="Window end (RFC3339).")
+@click.option("--include-triaged", is_flag=True, default=False,
+              help="Re-admit records someone already dispositioned.")
+@click.option("--latest", is_flag=True, default=False,
+              help="Re-drive the whole cohort on the agent's CURRENT version. "
+                   "This is the 'I shipped the fix' flag. Without it each "
+                   "record replays on the version it originally ran.")
+@click.option("--wait/--no-wait", "wait", default=True,
+              help="Poll the re-driven records to completion and print the "
+                   "diff (default), or return the manifest immediately.")
+@click.option("--timeout", "timeout_s", type=int, default=600,
+              help="Seconds to wait for the cohort to finish (default 600).")
+@click.option("--yes", "-y", is_flag=True, default=False,
+              help="Skip the confirmation prompt.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the diff as JSON.")
+@click.pass_context
+def release_cmd(
+    ctx: click.Context,
+    agent: str | None,
+    tenant: str | None,
+    run_id: str | None,
+    outcome: str | None,
+    since: str | None,
+    until: str | None,
+    include_triaged: bool,
+    latest: bool,
+    wait: bool,
+    timeout_s: int,
+    yes: bool,
+    as_json: bool,
+) -> None:
+    """Re-drive a cohort of failed records, then show what changed.
+
+    \b
+      papayya pull    --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
+      papayya verify  --fixtures ./fixtures
+      papayya release --agent enrich --tenant acme --since 2026-08-01T00:00:00Z --latest
+
+    The cohort is the same predicate `pull` and the dashboard use, so what
+    you previewed is what you re-drive. Quota is reserved for the WHOLE
+    cohort up front: if it doesn't fit, NOTHING is released and you're told
+    how far the quota went — a half-released cohort mid-incident is worse
+    than none.
+    """
+    from papayya.cohort_diff import (
+        NEWLY_BROKEN, PENDING, RECOVERED, STILL_NOT_OK, STILL_OK,
+        diff_from_release, merge_runs, pending_run_ids,
+    )
+
+    scope = _env_scope(ctx.obj)
+    config = APIConfig(api_key=_require_api_key(scope), base_url=scope.base_url)
+    api = APIClient(config)
+
+    try:
+        # Preview before acting. A re-drive is the one verb here with a
+        # production side effect, so the operator sees the size of it first.
+        try:
+            preview = api.get_cohort(
+                agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
+                since=since, until=until, include_triaged=include_triaged,
+                limit=0,
+            )
+        except PapayyaAPIError as exc:
+            click.echo(f"Error: cohort selection failed ({exc.status}): {exc}", err=True)
+            sys.exit(1)
+        total = preview.get("total", 0)
+        if not total:
+            click.echo("No records matched. Nothing to release.")
+            return
+        if not yes:
+            version_note = ("the agent's CURRENT version" if latest
+                            else "the version each record originally ran")
+            click.confirm(
+                f"Re-drive {total} record(s) on {version_note}?", abort=True
+            )
+
+        try:
+            release = api.release_cohort(
+                agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
+                since=since, until=until, include_triaged=include_triaged,
+                latest=latest,
+            )
+        except PapayyaAPIError as exc:
+            click.echo(f"Error: release failed ({exc.status}): {exc}", err=True)
+            sys.exit(1)
+
+        diff = diff_from_release(release)
+        if not as_json:
+            # --json emits the diff and NOTHING else on stdout: every fact in
+            # these lines is in the payload, and a progress line ahead of it
+            # makes the output unparseable for the caller who asked for JSON.
+            click.echo(f"Released {len(diff.records)} of {diff.cohort_total} record(s).")
+        _echo_release_skips(diff)
+
+        if wait:
+            deadline = time.time() + timeout_s
+            while True:
+                pending = pending_run_ids(diff)
+                if not pending:
+                    break
+                fetched = []
+                for rid in pending:
+                    try:
+                        fetched.append((rid, api.get_run(rid)))
+                    except PapayyaAPIError:
+                        # One unreadable run must not cost the operator the
+                        # diff; it stays PENDING and is counted as such.
+                        continue
+                merge_runs(diff, fetched)
+                # Read BEFORE sleeping — a short cohort on a warm worker pool
+                # can already be terminal by the time the manifest returns,
+                # and sleeping first would charge every release two seconds
+                # it did not need.
+                if not pending_run_ids(diff):
+                    break
+                if time.time() >= deadline:
+                    click.echo(
+                        f"\nTimed out with {len(pending_run_ids(diff))} record(s) "
+                        f"still running. They are re-driving; re-read them in "
+                        f"the dashboard or raise --timeout.",
+                        err=True,
+                    )
+                    break
+                time.sleep(2)
+
+        if as_json:
+            click.echo(json.dumps(diff.to_dict(), indent=2, default=str))
+            return
+
+        _MARK = {RECOVERED: "RECOVERED", STILL_NOT_OK: "STILL NOT OK",
+                 NEWLY_BROKEN: "NEWLY BROKEN", STILL_OK: "ok", PENDING: "…running"}
+        for rec in diff.records:
+            label = rec.item_id or rec.source_id
+            click.echo(
+                f"  {_MARK.get(rec.verdict, rec.verdict):<13} {label}  "
+                f"[{rec.before_status} -> {rec.after_status or '-'}]  "
+                f"${rec.before_cost_usd:.4f} -> ${rec.after_cost_usd:.4f}"
+            )
+
+        counts = diff.counts
+        click.echo(
+            f"\n{len(diff.records)} record(s): "
+            f"{counts.get(RECOVERED, 0)} recovered, "
+            f"{counts.get(STILL_NOT_OK, 0)} still not ok, "
+            f"{counts.get(NEWLY_BROKEN, 0)} newly broken, "
+            f"{counts.get(STILL_OK, 0)} still ok"
+            + (f", {counts[PENDING]} still running" if counts.get(PENDING) else "")
+        )
+        click.echo(
+            f"Cost of the re-drive: ${diff.after_cost_usd:.4f} "
+            f"(the originals cost ${diff.before_cost_usd:.4f})"
+        )
+        if diff.cost_note:
+            click.echo(f"  {diff.cost_note}")
+        if counts.get(NEWLY_BROKEN):
+            # Loudest line in the output, deliberately. It is the fact an
+            # operator is least likely to look for and most needs.
+            click.echo(
+                f"\n{counts[NEWLY_BROKEN]} record(s) were fine before this "
+                f"re-drive and are not now.",
+                err=True,
+            )
+    finally:
+        api.close()
+
+
+def _echo_release_skips(diff: Any) -> None:
+    """Say what the release did NOT touch. Named, never silent."""
+    if diff.skipped_not_terminal:
+        click.echo(
+            f"  {diff.skipped_not_terminal} record(s) are still running and "
+            f"were not re-driven — they stay in the cohort, so release again "
+            f"once they land.",
+            err=True,
+        )
+    if diff.skipped_agent_missing:
+        click.echo(
+            f"  {diff.skipped_agent_missing} record(s) have no agent to route "
+            f"to and were not re-driven.",
+            err=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # runs — run (invocation) ops, and items — per-item inspection
 #
 # Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
@@ -2857,7 +3060,7 @@ main.sections = [
     # them in the same section they found the failures in.
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
-      "triggers", "triage", "pull", "verify"]),
+      "triggers", "triage", "pull", "verify", "release"]),
     ("Account & platform ops",
      ["signup", "logout", "envs", "secrets", "projects",
       "deployments", "api-keys", "usage", "rate-card"]),

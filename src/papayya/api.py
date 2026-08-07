@@ -264,6 +264,45 @@ class APIClient:
             params["limit"] = str(limit)
         return self._request("GET", "/v1/durable/cohorts", params=params)
 
+    def release_cohort(
+        self,
+        *,
+        agent: str | None = None,
+        tenant: str | None = None,
+        run_id: str | None = None,
+        outcome: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        include_triaged: bool = False,
+        latest: bool = False,
+    ) -> dict[str, Any]:
+        """Re-drive every record the predicate selects (Plan 41 R4 C5, C6).
+
+        Same predicate parser as :meth:`get_cohort` on the server, so what
+        an operator previews is what they re-drive. Deliberately takes no
+        ``limit``: a release acts on the WHOLE cohort or fails, and the
+        server refuses one larger than it will re-drive in a single call
+        rather than silently acting on a page.
+
+        Returns ``{released, cohort_total, members, skipped_not_terminal,
+        skipped_agent_missing, cost_note}``. Raises with a count when the
+        cohort exceeds the remaining plan quota — nothing is released in
+        that case, because a half-released cohort mid-incident is the worst
+        available outcome.
+        """
+        params: dict[str, str] = {}
+        for key, val in (
+            ("agent", agent), ("tenant", tenant), ("run_id", run_id),
+            ("outcome", outcome), ("from", since), ("to", until),
+        ):
+            if val is not None:
+                params[key] = val
+        if include_triaged:
+            params["include_triaged"] = "true"
+        if latest:
+            params["latest"] = "true"
+        return self._request("POST", "/v1/durable/cohorts/replay", params=params)
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         # v1→v2 cutover: a triggered run is now a durable_run. The v1
         # /v1/runs/{id} surface reads the (now-unfed) runs table, so poll
