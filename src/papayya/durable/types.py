@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 # Sentinel for DurableRunConfig.input_snapshot. Distinguishes "caller did
@@ -166,6 +166,17 @@ class RunCheckpoint:
     # attribute name — at the Unit 5 physical rename this dataclass's
     # `run_id` becomes `id` and this field takes the `run_id` name.
     invocation_id: str | None = None
+    # Plan 41 R7: the step executions the degraded-streak fence counted, as
+    # ``[(label, attempt), ...]``. Recorded server-side at pause time;
+    # ``PapayyaRun.init()`` drops a matching entry from the step cache so the
+    # step RE-EXECUTES on resume instead of replaying the output the fence
+    # objected to. Empty for a budget pause (its outputs were fine) and for
+    # any run that never paused.
+    #
+    # The attempt is what makes this self-consuming: once a step re-runs it
+    # carries attempt+1, the recorded pair no longer matches, and the entry is
+    # spent. Nothing ever clears it, and nothing needs to.
+    pause_invalidated: list[tuple[str, int]] = field(default_factory=list)
 
 
 @dataclass

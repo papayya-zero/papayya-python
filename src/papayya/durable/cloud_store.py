@@ -204,6 +204,15 @@ class CloudStore:
             parent_run_id=body.get("parent_run_id"),
             worst_outcome_status=body.get("worst_outcome_status", "ok"),
             degraded_count=body.get("degraded_count", 0),
+            # Plan 41 R7. A control pane predating 077 sends no such key and
+            # the empty default is exactly right there: nothing is
+            # invalidated and the run resumes as it did before R7, which is
+            # the behaviour that binary's own resume expects.
+            pause_invalidated=[
+                (e["label"], e["attempt"])
+                for e in (body.get("pause_invalidated") or [])
+                if isinstance(e, dict) and "label" in e and "attempt" in e
+            ],
         )
 
     def create(self, checkpoint: RunCheckpoint) -> None:

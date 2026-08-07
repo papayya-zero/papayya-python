@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import time as _time
 import uuid
 import warnings
@@ -34,6 +35,9 @@ from .types import (
     TaskEntry,
     latest_per_label,
 )
+
+
+log = logging.getLogger("papayya.durable")
 
 T = TypeVar("T")
 
@@ -225,10 +229,35 @@ class Item:
         # Plan 33: register the per-run fence threshold with a store that
         # supports it (local SQLite). Duck-typed so cloud/memory stores, whose
         # K is server-side or absent, are unaffected.
+        #
+        # Plan 41 R7 §W9: a store that does NOT support it now says so. The
+        # hosted CloudStore has no set_run_fence, and hosted is the only
+        # execution path — so `papayya().run(..., pause_after_degraded=5)` has
+        # always been a silent no-op there. A kwarg that quietly does nothing
+        # is the failure class this whole product exists to remove, so it is
+        # not left silent.
+        #
+        # NOT plumbed to the server, deliberately. A per-run fence the SDK can
+        # set is a policy the operator cannot see: the dashboard reads agent
+        # config, and the fence is an operator control. Two sources of truth
+        # for one policy is worse than one inconvenient source, so the warning
+        # names the key that does work instead.
         if self._pause_after_degraded is not None:
             _setter = getattr(self._store, "set_run_fence", None)
             if callable(_setter):
                 _setter(self.run_id, self._pause_after_degraded)
+            else:
+                log.warning(
+                    "pause_after_degraded=%s is not supported by %s and was "
+                    "IGNORED. On the hosted path the run-level fence is an "
+                    "operator control set per agent, not per run — set "
+                    "pause_after_degraded in the agent's config "
+                    "(`papayya agents update <agent-id> --config "
+                    "'{\"pause_after_degraded\": %s}'`).",
+                    self._pause_after_degraded,
+                    type(self._store).__name__,
+                    self._pause_after_degraded,
+                )
 
         # Plan 35: resolve custom outcome checks — run-scoped config checks
         # first, then the @agent registration's checks. Resolved on both fresh
@@ -272,7 +301,38 @@ class Item:
             # this unit exists to fix, on the exact path it was built for.
             # Pinned by test_attempts_survive_a_suppressed_cache_entry.
             self._seed_attempts(existing.tasks)
+
+            # Plan 41 R7 — the whole point of this unit.
+            #
+            # Without this filter a resumed run cache-hits the very steps the
+            # fence stopped it for: _pre_call returns cached.result for any
+            # hydrated label, with no outcome filter, so the operator fixes
+            # the prompt, resumes, and gets the same degraded outputs back.
+            #
+            # The set is (label, attempt) pairs the server recorded AT PAUSE
+            # TIME — not a client-side walk back over the loaded rows, which
+            # plan 40's A4 killed for three separate reasons (arbitrary
+            # concurrent save order, void side-effect steps being permanently
+            # degraded, and synthetic papayya.mark/* labels that can never
+            # re-execute).
+            #
+            # Matching on the ATTEMPT is what makes it spend itself exactly
+            # once. After the step re-runs it carries attempt+1, the recorded
+            # pair stops matching, and a later unrelated recovery — a lease
+            # reap, a worker death — re-hydrates without re-executing it a
+            # second time and billing the provider twice for it.
+            invalidated = set(getattr(existing, "pause_invalidated", None) or ())
             for entry in self._latest_per_label(existing.tasks):
+                if (entry.label, entry.attempt) in invalidated:
+                    # Deliberately skips _task_call_order too: the step
+                    # appends itself there when it re-executes, so the order
+                    # stays honest instead of listing a step that hasn't run.
+                    log.info(
+                        "re-executing %s (attempt %d): the fence that paused "
+                        "this run counted it",
+                        entry.label, entry.attempt,
+                    )
+                    continue
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
         else:
