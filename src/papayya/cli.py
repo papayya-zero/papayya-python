@@ -1196,6 +1196,118 @@ def pull_cmd(
 
 
 # ---------------------------------------------------------------------------
+# verify — run the patched function against pulled fixtures, offline
+#
+# Plan 41 R4 C8. The middle verb of the recovery loop: pull the incident,
+# fix, PROVE the fix against the real records, then release. No control-plane
+# call, no API key, no store — see papayya/verify.py for what that costs and
+# what it deliberately does not claim about API spend.
+# ---------------------------------------------------------------------------
+
+@main.command("verify")
+@click.option("--fixtures", "fixtures_path", default="./fixtures",
+              help="Fixture file or directory (default ./fixtures).")
+@click.option("--agent-module", "agent_module", default=None,
+              help="Module your @agent lives in. Defaults to ./agent.py.")
+@click.option("--strict", is_flag=True, default=False,
+              help="Fail when a fixture could not be verified at all (no "
+                   "recorded input, unknown agent, input that doesn't fit "
+                   "the signature). The CI setting.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the full result as JSON instead of a report.")
+def verify_cmd(
+    fixtures_path: str,
+    agent_module: str | None,
+    strict: bool,
+    as_json: bool,
+) -> None:
+    """Verify a fix against pulled fixtures — offline, no re-drive.
+
+    \b
+      papayya pull   --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
+      papayya verify --fixtures ./fixtures
+      papayya verify --fixtures ./fixtures --strict     # in CI
+
+    Runs your function over each fixture's recorded input in this process and
+    re-derives the verdict with the same inspectors production used, so
+    "fixed" means what "ok" means in the dashboard. Nothing is sent, nothing
+    is stored, no record is re-driven. Exits non-zero when any fixture is
+    still not ok (or, under --strict, when any could not be verified).
+
+    \b
+    NOTE ON API SPEND: verify stops Papayya spending and stops the re-drive
+    from touching production. It does NOT stop YOUR function from calling
+    your LLM provider — that is your code, your keys, your process. Fixtures
+    are free to verify only when the failure reproduces without the provider.
+    """
+    from papayya.verify import (
+        FIXED, NEWLY_BROKEN, STILL_NOT_OK, STILL_OK,
+        VerifyError, verify as run_verify,
+    )
+
+    try:
+        summary = run_verify(
+            fixtures_path, agent_module=agent_module, strict=strict
+        )
+    except VerifyError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(summary.to_dict(), indent=2, default=str))
+        sys.exit(0 if summary.ok else 1)
+
+    _MARK = {FIXED: "FIXED", STILL_NOT_OK: "STILL NOT OK",
+             NEWLY_BROKEN: "NEWLY BROKEN", STILL_OK: "ok"}
+    for r in summary.results:
+        label = r.item_id or r.record_id
+        mark = _MARK.get(r.verdict, r.verdict.replace("_", " ").upper())
+        line = f"  {mark:<13} {label}  [{r.recorded_status} -> {r.new_status or '-'}]"
+        if r.new_reason:
+            line += f" {r.new_reason}"
+        click.echo(line)
+        if r.raised:
+            click.echo(f"                raised {r.raised}")
+        if r.verdict == STILL_NOT_OK and r.output_changed is False:
+            # Says more than the verdict does: the fix never reached this path.
+            click.echo("                output is UNCHANGED — the fix did not "
+                       "touch this record's path")
+        if r.note:
+            click.echo(f"                {r.note}")
+        if (r.current_agent_version and r.recorded_agent_version
+                and r.current_agent_version != r.recorded_agent_version):
+            # Reported, never refused: verify exists to run changed code.
+            click.echo(f"                version {r.recorded_agent_version} "
+                       f"-> {r.current_agent_version}")
+
+    counts = summary.counts
+    click.echo(
+        f"\n{len(summary.results)} fixture(s): "
+        f"{counts.get(FIXED, 0)} fixed, "
+        f"{counts.get(STILL_NOT_OK, 0)} still not ok, "
+        f"{counts.get(NEWLY_BROKEN, 0)} newly broken, "
+        f"{counts.get(STILL_OK, 0)} still ok"
+    )
+    if summary.unanswered:
+        click.echo(
+            f"{summary.unanswered} fixture(s) could not be verified and are "
+            f"NOT counted as passing"
+            + ("." if strict else " (pass --strict to fail on these)."),
+            err=True,
+        )
+    if summary.answered == 0:
+        # Never print "Verified" over a run that verified nothing.
+        click.echo(
+            "\nNothing was verified — every fixture is in the list above with "
+            "the reason it could not run.",
+            err=True,
+        )
+    elif summary.ok:
+        click.echo("\nVerified. Re-drive the cohort with `papayya release`.")
+    sys.exit(0 if summary.ok else 1)
+
+
+# ---------------------------------------------------------------------------
 # runs — run (invocation) ops, and items — per-item inspection
 #
 # Plural is deliberate. Top-level `papayya run` (workflow: create+wait+tail)
@@ -2739,13 +2851,13 @@ main.add_command(batch)
 # deactivated local surfaces — dropped from the help tiers.
 main.sections = [
     ("Getting started", ["deploy", "replay", "login"]),
-    # `pull` sits beside `triage` and `replay` deliberately: it is the
-    # recovery loop's first verb (Plan 41 R4 / ADR 0009 D7b), and an
+    # `pull` and `verify` sit beside `triage` and `replay` deliberately: they
+    # are the recovery loop's verbs (Plan 41 R4 / ADR 0009 D7b), and an
     # operator looking for "what do I do about these failures" should meet
-    # it in the same section they found the failures in.
+    # them in the same section they found the failures in.
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
-      "triggers", "triage", "pull"]),
+      "triggers", "triage", "pull", "verify"]),
     ("Account & platform ops",
      ["signup", "logout", "envs", "secrets", "projects",
       "deployments", "api-keys", "usage", "rate-card"]),
