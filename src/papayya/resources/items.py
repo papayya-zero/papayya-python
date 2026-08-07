@@ -239,9 +239,16 @@ class Items:
     # fence paused is resumed here; replay skips already-saved steps.
 
     def resume(self, run_id: str) -> dict[str, Any]:
-        """Resume a run auto-paused by a degradation/budget fence (Plan 33).
-        paused→running; replay picks up exactly where the pause landed. 409 if
-        the run is not paused."""
+        """Clear the pause on a run auto-paused by a fence (Plan 33).
+
+        Transitions paused→running. 409 if the run is not paused.
+
+        **This does not re-drive the run.** A paused run completes its
+        lease with ``error_category="paused"``, so its item is no longer
+        queued; clearing the status does not put it back. The run then
+        reads as ``running`` with nothing working on it, which is worse
+        than it reads. Use :meth:`replay` to actually re-drive the
+        captured item. Plan 41 R6 makes this verb re-enqueue."""
         return self._api._request("POST", f"/v1/durable/runs/{run_id}/resume")
 
     def clusters(self, partition_key: str | None = None) -> dict[str, Any]:

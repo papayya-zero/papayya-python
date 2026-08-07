@@ -20,8 +20,17 @@ from __future__ import annotations
 class CreditExhausted(Exception):
     """Raised when the LLM provider reports credit/quota exhaustion.
 
-    Pauses the run rather than failing it. The user tops up their provider
-    account and resumes; all durable checkpoints are preserved.
+    Pauses the run rather than failing it, and all durable checkpoints are
+    preserved — so no completed work is lost and nothing is re-paid for.
+
+    .. warning::
+
+       **Resuming does not yet re-drive the run on the hosted path.** The
+       paused run completes its lease with ``error_category="paused"``, so
+       the item leaves the queue; ``POST /resume`` flips the run's status
+       back to ``running`` and nothing re-enqueues it. Top up the provider
+       account and replay the run rather than resuming it. Plan 41 R6
+       makes resume actually re-drive.
     """
     pass
 
