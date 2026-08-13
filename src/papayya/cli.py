@@ -1097,6 +1097,10 @@ def replay_cmd(
 @click.option("--outcome", default=None,
               type=click.Choice(["not_ok", "any", "degraded", "failed"]),
               help="Verdict axis. Default not_ok — everything that didn't work.")
+@click.option("--flagged", is_flag=True, default=False,
+              help="Only records a human said were wrong — a thumbs-down, a "
+                   "ticket, a refund. IMPLIES --outcome any unless you pass "
+                   "one: what people flag usually completed fine.")
 @click.option("--since", default=None, help="Window start (RFC3339).")
 @click.option("--until", default=None, help="Window end (RFC3339).")
 @click.option("--include-triaged", is_flag=True, default=False,
@@ -1118,6 +1122,7 @@ def pull_cmd(
     tenant: str | None,
     run_id: str | None,
     outcome: str | None,
+    flagged: bool,
     since: str | None,
     until: str | None,
     include_triaged: bool,
@@ -1136,6 +1141,11 @@ def pull_cmd(
       papayya pull --like 9c21e8b4-...        # what selects everything like it?
       papayya pull --probe bf88-...           # pull the one you picked
       papayya verify --fixtures ./fixtures --agent-module app
+
+    \b
+    Or take what the world complained about, and compose it with either:
+      papayya pull --agent enrich --flagged
+      papayya pull --probe bf88-... --flagged   # like this one AND flagged
     """
     from papayya.fixtures import fixture_from_record, write_fixtures
 
@@ -1163,18 +1173,27 @@ def pull_cmd(
             _echo_probe_proposals(api, like_record, since, until)
             return
 
+        # The fixture's record of what it was pulled by. `outcome` states the
+        # EFFECTIVE axis, not the flag the operator typed: --flagged implies
+        # `any` server-side, and a fixture claiming it came from a not_ok
+        # cohort while holding records that completed ok would be a small lie
+        # in the one artifact meant to be re-read weeks later.
         predicate = {
             "probe": probe_id, "drift_episode": drift_episode,
             "agent": agent, "tenant": tenant, "run_id": run_id,
-            "outcome": outcome or "not_ok", "since": since, "until": until,
+            "outcome": outcome or ("any" if flagged else "not_ok"),
+            "flagged": flagged, "since": since, "until": until,
             "include_triaged": include_triaged,
         }
+        if flagged and outcome is None:
+            click.echo("Selecting flagged records at --outcome any: what a "
+                       "human flags usually completed fine.", err=True)
         try:
             resp = api.get_cohort(
                 probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
-                since=since, until=until, include_triaged=include_triaged,
-                limit=limit,
+                since=since, until=until, flagged=flagged,
+                include_triaged=include_triaged, limit=limit,
             )
         except ValueError as exc:
             # The mutually-exclusive-doors rule, refused client-side before it
@@ -1197,6 +1216,12 @@ def pull_cmd(
             if probe_id or drift_episode:
                 click.echo("  This predicate selects its own window. Derive a "
                            "fresh one with --like <record>, or widen it there.")
+            elif flagged:
+                # --outcome any is already applied, so naming it here would be
+                # a dead end — the same class of wrong advice the two lines
+                # above exist to avoid.
+                click.echo("  Nobody has flagged a record matching this yet. "
+                           "Drop --flagged, or widen the window with --since.")
             else:
                 click.echo("  Widen the window with --since, or pass --outcome any.")
             return
@@ -1439,6 +1464,10 @@ def verify_cmd(
 @click.option("--outcome", default=None,
               type=click.Choice(["not_ok", "any", "degraded", "failed"]),
               help="Verdict axis. Default not_ok — everything that didn't work.")
+@click.option("--flagged", is_flag=True, default=False,
+              help="Only records a human said were wrong. On a hand-written "
+                   "predicate this REQUIRES --outcome: unlike `pull`, a "
+                   "re-drive will not widen its own selection for you.")
 @click.option("--since", default=None, help="Window start (RFC3339).")
 @click.option("--until", default=None, help="Window end (RFC3339).")
 @click.option("--include-triaged", is_flag=True, default=False,
@@ -1465,6 +1494,7 @@ def release_cmd(
     tenant: str | None,
     run_id: str | None,
     outcome: str | None,
+    flagged: bool,
     since: str | None,
     until: str | None,
     include_triaged: bool,
@@ -1504,14 +1534,28 @@ def release_cmd(
     api = APIClient(config)
 
     try:
+        # REFUSED BEFORE THE PREVIEW, not at the release call. `pull --flagged`
+        # implies --outcome any; a re-drive will not, because the records people
+        # flag usually completed fine and the flag would silently widen what
+        # gets re-executed. Raising later would show the operator a count, take
+        # their confirmation, and only then refuse — which teaches them a number
+        # that was never releasable.
+        if flagged and outcome is None and not (probe_id or drift_episode):
+            click.echo(
+                "Error: --flagged selects records that completed ok, so a "
+                "re-drive would act on records the default predicate excludes. "
+                "Pass --outcome any to re-drive them, or --outcome not_ok for "
+                "the flagged records that also failed.", err=True)
+            sys.exit(1)
+
         # Preview before acting. A re-drive is the one verb here with a
         # production side effect, so the operator sees the size of it first.
         try:
             preview = api.get_cohort(
                 probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
-                since=since, until=until, include_triaged=include_triaged,
-                limit=0,
+                since=since, until=until, flagged=flagged,
+                include_triaged=include_triaged, limit=0,
             )
         except ValueError as exc:
             click.echo(f"Error: {exc}", err=True)
@@ -1550,8 +1594,8 @@ def release_cmd(
             release = api.release_cohort(
                 probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
-                since=since, until=until, include_triaged=include_triaged,
-                latest=latest,
+                since=since, until=until, flagged=flagged,
+                include_triaged=include_triaged, latest=latest,
             )
         except ValueError as exc:
             click.echo(f"Error: {exc}", err=True)

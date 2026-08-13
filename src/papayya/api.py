@@ -254,6 +254,7 @@ class APIClient:
         outcome: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        flagged: bool = False,
         include_triaged: bool = False,
         limit: int | None = None,
     ) -> dict[str, str]:
@@ -286,6 +287,13 @@ class APIClient:
         (1000) is reachable, so without them the server's own "narrow the
         window and release in passes" advice would name a flag that did not
         exist.
+
+        ``flagged`` is legal alongside a selector on every door — it selects
+        records a human said were wrong (plan 43 B1, ADR 0009 D3), and
+        "everything like this record that someone also complained about" is the
+        query backflow and search-by-example make together. On a selector door
+        it can only ever remove records, because the resolved outcome is
+        already ``any``.
         """
         if probe and drift_episode:
             raise ValueError(
@@ -327,6 +335,12 @@ class APIClient:
                 if val is not None:
                     params[key] = val
 
+        # Legal alongside a selector for the reason in the docstring: on a door
+        # that resolves its own predicate, `flagged` intersects an already-`any`
+        # selection and can only remove records from it.
+        if flagged:
+            params["flagged"] = "true"
+
         # Neither of these describes WHICH records the predicate picks out, so
         # both are legal alongside a selector: include_triaged re-admits work
         # someone already dispositioned, and limit pages the response.
@@ -347,6 +361,7 @@ class APIClient:
         outcome: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        flagged: bool = False,
         include_triaged: bool = False,
         limit: int | None = None,
     ) -> dict[str, Any]:
@@ -362,12 +377,17 @@ class APIClient:
         scheme: nothing in the product mints a multi-item run, so a
         run-keyed selection returns that single record.
 
+        ``flagged=True`` narrows to records a human said were wrong (plan 43
+        B1). It IMPLIES ``outcome="any"`` unless you pass one: the records
+        people flag are usually the ones that completed ok, so the default
+        would answer zero and read as good news.
+
         See :meth:`_cohort_params` for the three mutually-exclusive doors.
         """
         return self._request("GET", "/v1/durable/cohorts", params=self._cohort_params(
             probe=probe, drift_episode=drift_episode, agent=agent, tenant=tenant,
             run_id=run_id, outcome=outcome, since=since, until=until,
-            include_triaged=include_triaged, limit=limit,
+            flagged=flagged, include_triaged=include_triaged, limit=limit,
         ))
 
     def derive_probes(
@@ -415,6 +435,7 @@ class APIClient:
         outcome: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        flagged: bool = False,
         include_triaged: bool = False,
         latest: bool = False,
     ) -> dict[str, Any]:
@@ -439,11 +460,26 @@ class APIClient:
         them, so nobody is offered a re-drive of a re-drive. It can only
         ever remove from what was previewed, never add, so nothing unseen
         is released.
+
+        ``flagged`` DOES NOT IMPLY AN OUTCOME HERE, unlike
+        :meth:`get_cohort`. On a hand-written predicate the flag is
+        outcome-widening — the records people flag are usually the ones that
+        completed ok — so a release that inherited the preview's implied
+        ``any`` would re-drive records the operator's own predicate excludes.
+        Say which you mean. The server refuses the same request; this is the
+        earlier, better-worded copy.
         """
+        if flagged and outcome is None and not (probe or drift_episode):
+            raise ValueError(
+                "flagged selects records that completed ok, so a re-drive "
+                "would act on records the default predicate excludes. Pass "
+                "outcome='any' to re-drive them, or outcome='not_ok' for the "
+                "flagged records that also failed."
+            )
         return self._request("POST", "/v1/durable/cohorts/replay", params=self._cohort_params(
             probe=probe, drift_episode=drift_episode, agent=agent, tenant=tenant,
             run_id=run_id, outcome=outcome, since=since, until=until,
-            include_triaged=include_triaged,
+            flagged=flagged, include_triaged=include_triaged,
         ) | ({"latest": "true"} if latest else {}))
 
     def get_run(self, run_id: str) -> dict[str, Any]:
