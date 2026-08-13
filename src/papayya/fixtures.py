@@ -21,12 +21,16 @@ on each path:
 
 * Local (SQLite ledger): the `items` table has its own ``input_snapshot``,
   written at the item boundary by ``papayya.iter``.
-* Hosted: ``durable_runs`` has **no** input column. The hosted worker invokes
-  ``fn(item_id)`` and the request input is never persisted separately, so the
-  closest recorded thing is the ``input_snapshot`` of the item's FIRST
-  checkpoint — the bound call args of its first durable step.
+* Hosted: ``durable_runs.input`` is the submitted request, verbatim (migration
+  089). It is what the worker hands the ``@agent`` function and what a replay
+  re-executes, so a fixture built from it re-runs the real thing.
+* Hosted, before 089: there **was** no input column. The worker invoked
+  ``fn(item_id)`` and the request was never persisted, so the closest recorded
+  thing was the ``input_snapshot`` of the item's FIRST checkpoint — the bound
+  call args of its first durable step. Records from that era still resolve this
+  way, and a bare ``@agent`` that never checkpointed has nothing at all.
 
-The second is a *reconstruction*, not the original request, and a fixture that
+The third is a *reconstruction*, not the original request, and a fixture that
 quietly claimed otherwise would be the same class of lie plan 41 R2 spent a step
 removing. So every fixture records ``input_source`` and every consumer can say
 what it is replaying.
@@ -51,6 +55,9 @@ FIXTURE_VERSION = 1
 
 # Where the input came from. Named on every fixture rather than inferred.
 INPUT_FROM_ITEM = "item_snapshot"
+# The submitted request itself (durable_runs.input, migration 089) — the only
+# source that is the original rather than a reconstruction of it.
+INPUT_FROM_SUBMISSION = "submitted_input"
 INPUT_FROM_FIRST_CHECKPOINT = "first_checkpoint_snapshot"
 INPUT_MISSING = "none"
 
@@ -182,9 +189,15 @@ def fixture_from_record(
     checkpoints = checkpoints or []
     first, last = _first_and_last(checkpoints)
 
-    # Input: the record's own snapshot when the ledger kept one (local),
-    # otherwise the first step's bound args (hosted reconstruction).
-    if record.get("input_snapshot") is not None:
+    # Input, best source first: what was actually submitted (hosted, 089+),
+    # then the local ledger's own snapshot, then the first step's bound args —
+    # a reconstruction, and named as one.
+    #
+    # `"input" in record` rather than a truthiness test: a submitted input is
+    # legitimately null, 0, "" or [], and every one of them is falsy.
+    if "input" in record:
+        raw_input, source = record["input"], INPUT_FROM_SUBMISSION
+    elif record.get("input_snapshot") is not None:
         raw_input, source = record["input_snapshot"], INPUT_FROM_ITEM
     elif first is not None and first.get("input_snapshot") is not None:
         raw_input, source = first["input_snapshot"], INPUT_FROM_FIRST_CHECKPOINT
@@ -291,6 +304,7 @@ def read_fixtures(path: str | Path) -> list[Fixture]:
 __all__ = [
     "FIXTURE_VERSION",
     "INPUT_FROM_ITEM",
+    "INPUT_FROM_SUBMISSION",
     "INPUT_FROM_FIRST_CHECKPOINT",
     "INPUT_MISSING",
     "Fixture",

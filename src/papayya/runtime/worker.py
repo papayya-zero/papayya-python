@@ -6,7 +6,9 @@ The worker process:
    ``@agent`` decorator registration).
 2. Loops: long-polls the dispatcher for the next leased item, looks
    up the registered ``@agent`` function by name, calls it with the
-   ``item_id``, reports completion (or failure).
+   item's submitted **input** (see :attr:`Lease.agent_argument` — it
+   was the ``item_id`` until plan 43 B2a), reports completion (or
+   failure).
 3. Exits cleanly on SIGTERM / SIGINT.
 
 The dispatcher protocol is intentionally minimal for Phase 1:
@@ -105,6 +107,38 @@ class Lease:
     # ``None`` for LocalDispatcher leases.
     account_id: str | None = None
     project_id: str | None = None
+
+    @property
+    def agent_argument(self) -> Any:
+        """What the customer's ``@agent`` function is called with.
+
+        THE SUBMITTED INPUT, when the lease carries one — plan 43 B2a. The
+        hosted dispatcher has published ``payload.input`` since the v2 cutover
+        and this worker parsed it into :attr:`payload` and then ignored it,
+        calling ``fn(item_id)`` instead. ``item_id`` on that path is
+        ``dispatch.InputToItemID(input)``: a JSON *string* input arrives
+        unquoted, and **any other shape arrives as its compact JSON text**. So
+        a customer submitting ``{"order_id": …}`` had their function handed a
+        string to re-parse, while the parsed object sat in the same lease.
+
+        The docs never described that. quickstart.mdx has
+        ``def triage(ticket: dict)`` with ``item_id=`` as *"your identity for
+        each item"* — this restores the contract the docs already promise, and
+        it is a change that can only be made once, before hosted deploys.
+
+        KEY PRESENCE, NOT TRUTHINESS. ``input`` is legitimately ``null``,
+        ``""``, ``0``, ``false``, ``{}`` or ``[]``, all of which are falsy in
+        Python; ``payload.get("input") or item_id`` would send the *wrong*
+        argument for every one of them, and the customer's function would
+        receive a stringified id where it expected an empty list.
+
+        The fallback exists for leases minted before the submitted input was
+        persisted — LocalDispatcher leases, and any hosted path that sets no
+        input. It is not a permanent dual contract.
+        """
+        if self.payload is not None and "input" in self.payload:
+            return self.payload["input"]
+        return self.item_id
 
 
 @dataclass
@@ -1229,7 +1263,7 @@ class Worker:
         max_duration: float | None,
         short: str,
     ) -> tuple[str | None, Any]:
-        """Run ``fn(lease.item_id)``; arm SIGALRM if max_duration is set.
+        """Run ``fn(lease.agent_argument)``; arm SIGALRM if max_duration is set.
 
         Returns ``(run_status, output)`` for the caller to flip the durable
         run's terminal state on the hosted path (Plan 37 Unit 1 — the
@@ -1283,7 +1317,7 @@ class Worker:
             # against the right version's siblings. ``None`` is a
             # no-op so local-dev / LocalDispatcher leases pay nothing.
             with _bundle_loader.activate(lease.agent_version):
-                result = fn(lease.item_id)
+                result = fn(lease.agent_argument)
         except _AgentTimeout:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
@@ -1354,7 +1388,7 @@ class Worker:
         max_duration: float | None,
         short: str,
     ) -> tuple[str | None, Any]:
-        """Run a coroutine ``fn(lease.item_id)`` to completion.
+        """Run a coroutine ``fn(lease.agent_argument)`` to completion.
 
         Returns ``(run_status, output)`` on the same contract as
         :meth:`_invoke_with_timeout` — the caller flips the durable run's
@@ -1388,7 +1422,7 @@ class Worker:
         from papayya.runtime import _bundle_loader
         from papayya.errors import CreditExhausted, WorkloadPaused
 
-        coro = fn(lease.item_id)
+        coro = fn(lease.agent_argument)
         try:
             # Same activate-scope rationale as the sync path; mirrored
             # here because ``asyncio.run`` runs the coroutine on a new

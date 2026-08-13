@@ -49,6 +49,7 @@ class Items:
         agent_id: str,
         input: Any,
         *,
+        item_id: str | None = None,
         model: str | None = None,
         max_steps: int | None = None,
         budget_cents: int | None = None,
@@ -63,8 +64,16 @@ class Items:
         pass it to :meth:`get`, :meth:`steps`, or :meth:`stream`, or supply a
         ``callback_url`` to have the terminal outcome POSTed to you instead of
         polling. For many items in one shot use ``Papayya().runs.create``.
+
+        ``item_id`` is YOUR id for this record — an order id, a ticket id,
+        whatever you key your world on. Optional, at most 256 bytes, and kept
+        separate from ``input``: this route used to write the input onto that
+        column, which is why a record could never be looked up by the id its
+        owner actually knows it by.
         """
         body: dict[str, Any] = {"input": input}
+        if item_id is not None:
+            body["item_id"] = item_id
         if model:
             body["model"] = model
         if max_steps:
