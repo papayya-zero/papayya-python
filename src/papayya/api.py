@@ -227,9 +227,120 @@ class APIClient:
             "POST", f"/v1/durable/runs/{run_id}/replay", params=params
         )
 
+    # -- Cohorts (Plan 41 R4 + Plan 39 S3; ADR 0009 D7 and §4 step 3) --------
+    #
+    # THERE IS EXACTLY ONE PARAMS BUILDER BELOW, AND THAT IS THE POINT. The
+    # three cohort verbs take the same selection, and the server parses it with
+    # one shared function so an operator cannot approve one cohort and re-drive
+    # a different one. A client that re-encoded the rules per method would give
+    # that guarantee back at the edge — and this file used to have two copies of
+    # the loop already. Plan 39 S3 added two more selector doors, which would
+    # have made six. One builder; every verb calls it.
+    #
+    # The dashboard's `predicateQuery` (dashboard/src/lib/api/cohorts.ts) is the
+    # same function in TypeScript, with the same early-return shape. If you
+    # change the rules, change all three.
+
+    _COHORT_TERMS = ("agent", "tenant", "run_id", "outcome", "from", "to")
+
+    @staticmethod
+    def _cohort_params(
+        *,
+        probe: str | None = None,
+        drift_episode: str | None = None,
+        agent: str | None = None,
+        tenant: str | None = None,
+        run_id: str | None = None,
+        outcome: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        include_triaged: bool = False,
+        limit: int | None = None,
+    ) -> dict[str, str]:
+        """Build the query params for any cohort verb.
+
+        THREE DOORS, MUTUALLY EXCLUSIVE. A selection comes from exactly one
+        of:
+
+        * ``probe`` — a frozen by-example predicate (Plan 39 S3). Every term
+          it stands for (bare label, window, condition token, borrowed floor)
+          lives server-side on the ``cohort_probes`` row.
+        * ``drift_episode`` — the change-detection handoff (Plan 40 U3 C6),
+          resolved server-side off the episode row.
+        * the descriptive terms — agent/tenant/run/outcome/window.
+
+        The first two are opaque on purpose: emitting their terms for a
+        client to pass back would make the preview and the re-drive two
+        client-built selections that can disagree, and would put a
+        server-learned floor on the wire for a verb that re-executes work.
+
+        Passing a selector *and* a descriptive term raises here rather than
+        travelling: the operator has two different selections in mind, and
+        quietly letting one win is how someone approves one cohort and
+        re-drives another. The server refuses it too — this is the earlier,
+        better-worded copy of the same refusal, not the authority.
+
+        ``since``/``until`` are the exception on the probe path, where they
+        NARROW the frozen window rather than describing a selection. A
+        by-example probe is unbounded by construction, and the release cap
+        (1000) is reachable, so without them the server's own "narrow the
+        window and release in passes" advice would name a flag that did not
+        exist.
+        """
+        if probe and drift_episode:
+            raise ValueError(
+                "pass either probe or drift_episode, not both — each selects "
+                "its own records"
+            )
+
+        selector = "probe" if probe else ("drift_episode" if drift_episode else None)
+        if selector is not None:
+            described = {
+                "agent": agent, "tenant": tenant, "run_id": run_id,
+                "outcome": outcome,
+            }
+            # since/until narrow a probe's frozen window; they still describe a
+            # selection on the drift path, where the episode owns the window.
+            if selector == "drift_episode":
+                described["since"] = since
+                described["until"] = until
+            offending = sorted(k for k, v in described.items() if v is not None)
+            if offending:
+                raise ValueError(
+                    f"{selector} selects its own records; remove "
+                    + ", ".join(offending)
+                )
+
+        params: dict[str, str] = {}
+        if probe:
+            params["probe"] = probe
+            for key, val in (("from", since), ("to", until)):
+                if val is not None:
+                    params[key] = val
+        elif drift_episode:
+            params["drift_episode"] = drift_episode
+        else:
+            for key, val in (
+                ("agent", agent), ("tenant", tenant), ("run_id", run_id),
+                ("outcome", outcome), ("from", since), ("to", until),
+            ):
+                if val is not None:
+                    params[key] = val
+
+        # Neither of these describes WHICH records the predicate picks out, so
+        # both are legal alongside a selector: include_triaged re-admits work
+        # someone already dispositioned, and limit pages the response.
+        if include_triaged:
+            params["include_triaged"] = "true"
+        if limit is not None:
+            params["limit"] = str(limit)
+        return params
+
     def get_cohort(
         self,
         *,
+        probe: str | None = None,
+        drift_episode: str | None = None,
         agent: str | None = None,
         tenant: str | None = None,
         run_id: str | None = None,
@@ -250,23 +361,54 @@ class APIClient:
         ``run_id`` is one optional predicate term, not the addressing
         scheme: nothing in the product mints a multi-item run, so a
         run-keyed selection returns that single record.
+
+        See :meth:`_cohort_params` for the three mutually-exclusive doors.
         """
-        params: dict[str, str] = {}
-        for key, val in (
-            ("agent", agent), ("tenant", tenant), ("run_id", run_id),
-            ("outcome", outcome), ("from", since), ("to", until),
-        ):
+        return self._request("GET", "/v1/durable/cohorts", params=self._cohort_params(
+            probe=probe, drift_episode=drift_episode, agent=agent, tenant=tenant,
+            run_id=run_id, outcome=outcome, since=since, until=until,
+            include_triaged=include_triaged, limit=limit,
+        ))
+
+    def derive_probes(
+        self,
+        record: str,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
+        """Search by example: what selects everything like this record?
+
+        ADR 0009 §4 step 3 — *"paste one known-bad record, get everything
+        like it across the last 60 days. Writing a predicate against history
+        is the power-user path; pointing at a bad one is what actually
+        happens at 2am."*
+
+        Returns ``{record, agent, from, to, proposals, refusals,
+        window_note}``. Each proposal carries a ``probe`` id to hand to
+        :meth:`get_cohort` or :meth:`release_cohort`, and a ``count`` — the
+        blast radius, which is what makes it something to decide about.
+
+        ``refusals`` are conditions that could have applied and could not be
+        derived, each with its reason (most often: the population's baseline
+        is still forming, so there is no trustworthy floor to compare
+        against). They are returned rather than dropped because a silently
+        missing proposal is indistinguishable from a condition the record
+        did not satisfy.
+
+        Writes nothing but the saved predicates; re-executes nothing.
+        """
+        params = {"record": record}
+        for key, val in (("from", since), ("to", until)):
             if val is not None:
                 params[key] = val
-        if include_triaged:
-            params["include_triaged"] = "true"
-        if limit is not None:
-            params["limit"] = str(limit)
-        return self._request("GET", "/v1/durable/cohorts", params=params)
+        return self._request("POST", "/v1/durable/cohorts/like", params=params)
 
     def release_cohort(
         self,
         *,
+        probe: str | None = None,
+        drift_episode: str | None = None,
         agent: str | None = None,
         tenant: str | None = None,
         run_id: str | None = None,
@@ -289,19 +431,20 @@ class APIClient:
         cohort exceeds the remaining plan quota — nothing is released in
         that case, because a half-released cohort mid-incident is the worst
         available outcome.
+
+        ON THE PROBE PATH, THIS SELECTS SLIGHTLY FEWER RECORDS THAN THE
+        PREVIEW, deliberately. A by-example preview admits records that are
+        themselves re-drives — an operator asking "what else looks like
+        this" wants the truth about their whole history. Release excludes
+        them, so nobody is offered a re-drive of a re-drive. It can only
+        ever remove from what was previewed, never add, so nothing unseen
+        is released.
         """
-        params: dict[str, str] = {}
-        for key, val in (
-            ("agent", agent), ("tenant", tenant), ("run_id", run_id),
-            ("outcome", outcome), ("from", since), ("to", until),
-        ):
-            if val is not None:
-                params[key] = val
-        if include_triaged:
-            params["include_triaged"] = "true"
-        if latest:
-            params["latest"] = "true"
-        return self._request("POST", "/v1/durable/cohorts/replay", params=params)
+        return self._request("POST", "/v1/durable/cohorts/replay", params=self._cohort_params(
+            probe=probe, drift_episode=drift_episode, agent=agent, tenant=tenant,
+            run_id=run_id, outcome=outcome, since=since, until=until,
+            include_triaged=include_triaged,
+        ) | ({"latest": "true"} if latest else {}))
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         # v1→v2 cutover: a triggered run is now a durable_run. The v1

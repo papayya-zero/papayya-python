@@ -1080,6 +1080,14 @@ def replay_cmd(
 # ---------------------------------------------------------------------------
 
 @main.command("pull")
+@click.option("--like", "like_record", default=None,
+              help="SEARCH BY EXAMPLE: paste one record id you know is bad and "
+                   "see what selects everything like it, with the blast radius "
+                   "of each. Writes nothing — pick one and pass --probe.")
+@click.option("--probe", "probe_id", default=None,
+              help="Pull the cohort a derived predicate selects (from --like).")
+@click.option("--drift-episode", "drift_episode", default=None,
+              help="Pull the records a detected change moved.")
 @click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
 @click.option("--tenant", default=None,
               help="Narrow to one partition key (the customer's own tenant id).")
@@ -1103,6 +1111,9 @@ def replay_cmd(
 @click.pass_context
 def pull_cmd(
     ctx: click.Context,
+    like_record: str | None,
+    probe_id: str | None,
+    drift_episode: str | None,
     agent: str | None,
     tenant: str | None,
     run_id: str | None,
@@ -1117,7 +1128,13 @@ def pull_cmd(
     """Pull a cohort of failed records to disk as reproducible fixtures.
 
     \b
+    Describe the cohort yourself:
       papayya pull --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
+
+    \b
+    Or point at one bad record and let the predicate be derived:
+      papayya pull --like 9c21e8b4-...        # what selects everything like it?
+      papayya pull --probe bf88-...           # pull the one you picked
       papayya verify --fixtures ./fixtures --agent-module app
     """
     from papayya.fixtures import fixture_from_record, write_fixtures
@@ -1127,17 +1144,43 @@ def pull_cmd(
     api = APIClient(config)
 
     try:
+        # SEARCH BY EXAMPLE (ADR 0009 §4 step 3). This branch DERIVES and
+        # PRINTS; it never writes a fixture, for the same reason --dry-run is
+        # the documented default workflow — see the blast radius, then decide.
+        #
+        # It deliberately does not auto-pick the largest proposal and pull it.
+        # The proposals are different definitions of "like this" (the SDK's own
+        # verdict token, a hollow field, a short output), they routinely nest,
+        # and choosing between them is the operator's judgement about their own
+        # domain. Picking for them and then re-driving what we picked is the
+        # failure this product exists to catch, wearing the shape of
+        # convenience.
+        if like_record:
+            if probe_id or drift_episode:
+                click.echo("Error: --like derives a predicate; --probe and "
+                           "--drift-episode use one. Pass one at a time.", err=True)
+                sys.exit(1)
+            _echo_probe_proposals(api, like_record, since, until)
+            return
+
         predicate = {
+            "probe": probe_id, "drift_episode": drift_episode,
             "agent": agent, "tenant": tenant, "run_id": run_id,
             "outcome": outcome or "not_ok", "since": since, "until": until,
             "include_triaged": include_triaged,
         }
         try:
             resp = api.get_cohort(
+                probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
                 since=since, until=until, include_triaged=include_triaged,
                 limit=limit,
             )
+        except ValueError as exc:
+            # The mutually-exclusive-doors rule, refused client-side before it
+            # travels. The server refuses it too; this is the earlier copy.
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
         except PapayyaAPIError as exc:
             click.echo(f"Error: cohort selection failed ({exc.status}): {exc}", err=True)
             sys.exit(1)
@@ -1146,7 +1189,16 @@ def pull_cmd(
 
         if not members:
             click.echo("No records matched. Nothing to pull.")
-            click.echo("  Widen the window with --since, or pass --outcome any.")
+            # The advice has to match the door. On a derived predicate the
+            # window is frozen server-side and --outcome is refused outright,
+            # so telling an operator to widen or loosen it names two flags that
+            # cannot help — and an empty cohort in a silent-failure product is
+            # exactly the moment to not send someone down a dead end.
+            if probe_id or drift_episode:
+                click.echo("  This predicate selects its own window. Derive a "
+                           "fresh one with --like <record>, or widen it there.")
+            else:
+                click.echo("  Widen the window with --since, or pass --outcome any.")
             return
 
         # Say the truncation out loud. An operator who reads "wrote 100
@@ -1193,6 +1245,54 @@ def pull_cmd(
         click.echo(f"\nNext: papayya verify --fixtures {out_dir} --agent-module <module>")
     finally:
         api.close()
+
+
+def _echo_probe_proposals(
+    api: Any, record: str, since: str | None, until: str | None,
+) -> None:
+    """Render `papayya pull --like <record>` — ADR 0009 §4 step 3.
+
+    The output IS the deliverable here, the same way the cohort report is for
+    a pull. An operator at 2am has one bad record and needs to know what it is
+    an example OF, and how much of it there is.
+    """
+    try:
+        d = api.derive_probes(record, since=since, until=until)
+    except PapayyaAPIError as exc:
+        click.echo(f"Error: could not read that record ({exc.status}): {exc}", err=True)
+        sys.exit(1)
+
+    proposals = d.get("proposals", [])
+    refusals = d.get("refusals", [])
+
+    click.echo(f"Records like {record} — agent {d.get('agent')}")
+    click.echo(f"  window {d.get('from')} → {d.get('to')}\n")
+
+    if not proposals:
+        # A REAL ANSWER, NOT AN ERROR. It means the platform's vocabulary has
+        # no word for what is wrong with this output — which is worth saying
+        # plainly rather than dressing up as a failure to try.
+        click.echo("No predicate fits this record.")
+        click.echo("  Nothing about its recorded output is expressible in the "
+                   "vocabulary this platform will commit to (missing, empty, "
+                   "short, truncated, or a verdict something already made).")
+    for p in proposals:
+        click.echo(f"  {p.get('count'):>7,}  {p.get('why')}")
+        click.echo(f"           papayya pull --probe {p.get('probe')}")
+
+    # Refusals are printed, not swallowed. "Your baseline is still forming" and
+    # "this record looks fine on that axis" are completely different answers,
+    # and only one of them means come back later.
+    if refusals:
+        click.echo("\nNot available for this record:")
+        for r in refusals:
+            click.echo(f"  {r.get('condition')}: {r.get('reason')}")
+
+    if note := d.get("window_note"):
+        click.echo(f"\n({note})")
+    if proposals:
+        click.echo("\nProposals can overlap — a hollow field and the verdict "
+                   "that flagged it often select the same records.")
 
 
 # ---------------------------------------------------------------------------
@@ -1316,6 +1416,13 @@ def verify_cmd(
 # ---------------------------------------------------------------------------
 
 @main.command("release")
+@click.option("--probe", "probe_id", default=None,
+              help="Re-drive the cohort a derived predicate selects "
+                   "(from `papayya pull --like`). Excludes records that are "
+                   "themselves re-drives, so this is slightly narrower than "
+                   "the same probe's pull.")
+@click.option("--drift-episode", "drift_episode", default=None,
+              help="Re-drive the records a detected change moved.")
 @click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
 @click.option("--tenant", default=None,
               help="Narrow to one partition key (the customer's own tenant id).")
@@ -1345,6 +1452,8 @@ def verify_cmd(
 @click.pass_context
 def release_cmd(
     ctx: click.Context,
+    probe_id: str | None,
+    drift_episode: str | None,
     agent: str | None,
     tenant: str | None,
     run_id: str | None,
@@ -1364,6 +1473,13 @@ def release_cmd(
       papayya pull    --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
       papayya verify  --fixtures ./fixtures
       papayya release --agent enrich --tenant acme --since 2026-08-01T00:00:00Z --latest
+
+    \b
+    Or re-drive a derived predicate end to end:
+      papayya pull    --like 9c21e8b4-...
+      papayya pull    --probe bf88-...
+      papayya verify  --fixtures ./fixtures
+      papayya release --probe bf88-... --latest
 
     The cohort is the same predicate `pull` and the dashboard use, so what
     you previewed is what you re-drive. Quota is reserved for the WHOLE
@@ -1385,10 +1501,14 @@ def release_cmd(
         # production side effect, so the operator sees the size of it first.
         try:
             preview = api.get_cohort(
+                probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
                 since=since, until=until, include_triaged=include_triaged,
                 limit=0,
             )
+        except ValueError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
         except PapayyaAPIError as exc:
             click.echo(f"Error: cohort selection failed ({exc.status}): {exc}", err=True)
             sys.exit(1)
@@ -1399,16 +1519,36 @@ def release_cmd(
         if not yes:
             version_note = ("the agent's CURRENT version" if latest
                             else "the version each record originally ran")
-            click.confirm(
-                f"Re-drive {total} record(s) on {version_note}?", abort=True
-            )
+            # ON THE PROBE PATH THIS COUNT IS AN UPPER BOUND, and saying so is
+            # not pedantry — it is the one place the preview and the release
+            # legitimately disagree. A by-example preview admits records that
+            # are themselves re-drives, because an operator asking "what else
+            # looks like this" wants their whole history; release excludes them
+            # so nobody re-drives a re-drive. Without this line the prompt
+            # names a number the release will not honour, which is precisely
+            # the "approve one cohort, re-drive another" failure the shared
+            # predicate exists to prevent.
+            if probe_id:
+                click.echo(
+                    f"  {total} record(s) match this probe. Records that are "
+                    f"themselves re-drives are excluded from a release, so "
+                    f"fewer may go."
+                )
+                ask = f"Re-drive up to {total} record(s) on {version_note}?"
+            else:
+                ask = f"Re-drive {total} record(s) on {version_note}?"
+            click.confirm(ask, abort=True)
 
         try:
             release = api.release_cohort(
+                probe=probe_id, drift_episode=drift_episode,
                 agent=agent, tenant=tenant, run_id=run_id, outcome=outcome,
                 since=since, until=until, include_triaged=include_triaged,
                 latest=latest,
             )
+        except ValueError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
         except PapayyaAPIError as exc:
             click.echo(f"Error: release failed ({exc.status}): {exc}", err=True)
             sys.exit(1)
