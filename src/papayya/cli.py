@@ -1265,7 +1265,14 @@ def _echo_probe_proposals(
     proposals = d.get("proposals", [])
     refusals = d.get("refusals", [])
 
-    click.echo(f"Records like {record} — agent {d.get('agent')}")
+    # THE SCOPE, NOT JUST THE AGENT. A count means a different incident
+    # depending on whether it spans one tenant or all of them, and a NULL
+    # partition means no filter at all — agent-wide — rather than "the records
+    # with no tenant". Saying "all tenants" out loud beats omitting the line and
+    # letting the operator assume whichever they were already thinking about.
+    scope = (f"tenant {d['partition_key']}" if d.get("partition_key")
+             else "all tenants")
+    click.echo(f"Records like {record} — agent {d.get('agent')}, {scope}")
     click.echo(f"  window {d.get('from')} → {d.get('to')}\n")
 
     if not proposals:
