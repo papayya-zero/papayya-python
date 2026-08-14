@@ -56,6 +56,16 @@ class TaskEntry:
     # control-pane writes; this plan only writes 'ok' / 'degraded'.
     outcome_status: str = "ok"
     outcome_reason: str | None = None
+    # v14 / ADR 0009 D6: input provenance, NOT a verdict. Set when this step
+    # consumed the output of a degraded step of the same run — tainted_by is
+    # that step's label, tainted_reason its reason ('empty_sequence'), so
+    # blast radius groups by root cause without a join. Populated only when
+    # outcome_status is 'ok'; a step with its own degradation keeps the more
+    # specific verdict. Deliberately separate from outcome_status so that
+    # every existing reader of it (both degraded-streak fences, drift rates,
+    # cluster keys, the reason histogram) sees today's row unchanged.
+    tainted_by: str | None = None
+    tainted_reason: str | None = None
     # Plan 41 R3 — the execution identity.
     #
     # ``execution_token`` identifies one *execution* of this step. The

@@ -451,3 +451,117 @@ def inspect_result(
     if verdict.status != "ok":
         return verdict
     return OK
+
+
+# ---------------------------------------------------------------------------
+# D6 taint — provenance, not a verdict
+# ---------------------------------------------------------------------------
+
+# Reasons whose result value is not worth propagating. `empty_none` is here on
+# the control pane's own existing judgement (`CountedDegradedSteps`, plan 41 R7):
+# a step returning None is "overwhelmingly a void side effect (send_email,
+# write_row)", which is why it is already excluded from re-execution. Tainting
+# off a value the platform has declared meaningless would be backwards.
+_NON_PROPAGATING_REASONS = frozenset({"empty_none"})
+
+
+def _identity_is_meaningful(value: Any) -> bool:
+    """True when ``x is value`` distinguishes this object from an unrelated one.
+
+    CPython interns ``None``/``True``/``False``, the empty str/bytes/tuple and
+    small ints, so identity against them fires on any argument that merely
+    happens to hold the same singleton. ``[]`` and ``{}`` are freshly allocated
+    per call and are safe — fortunate, because the empty *collection* is the
+    shape of the incident D6 exists for (a context fetch returning no rows).
+
+    Excluding a singleton source is a deliberate false negative: an unmarked
+    step, rather than a mark on a step that never saw the value.
+    """
+    if value is None or value is True or value is False:
+        return False
+    if isinstance(value, (str, bytes)) and len(value) == 0:
+        return False
+    if isinstance(value, tuple) and len(value) == 0:
+        return False
+    if isinstance(value, int) and -5 <= value <= 256:
+        return False
+    return True
+
+
+def _flatten_one_level(bound: dict[str, Any]) -> list[Any]:
+    """Bound arguments, plus one level into containers.
+
+    ``Signature.bind`` nests variadics one level down — ``def f(*chunks)`` binds
+    to ``{"chunks": (value,)}`` — so comparing against ``bound.values()`` alone
+    tests the tuple and never the element. The same is true of a value the
+    caller wrapped on the way in (``answer(context={"docs": docs})``).
+
+    One level, not recursive: a value buried deeper, or transformed by a pure
+    function between steps, is a miss. The alternative is an unbounded walk of
+    customer data on every step of every run.
+    """
+    out: list[Any] = []
+    for arg in bound.values():
+        out.append(arg)
+        if isinstance(arg, (list, tuple)):
+            out.extend(arg)
+        elif isinstance(arg, dict):
+            out.extend(arg.values())
+    return out
+
+
+def inspect_taint(
+    bound: dict[str, Any] | None,
+    prior: Sequence[Any],
+) -> tuple[str | None, str | None]:
+    """ADR 0009 D6: did this step consume a degraded step's output?
+
+    Returns ``(tainted_by, tainted_reason)`` — the **root** degraded step's
+    label and its reason — or ``(None, None)``. Every step in a taint chain
+    names the same root, so a blast radius is one equality predicate rather
+    than a walk.
+
+    This is **not** a verdict on this step's output; nothing looked at the
+    output. It is a statement about the provenance of its input, which is why
+    it lands in its own columns and leaves ``outcome_status`` alone. Every
+    existing reader of ``outcome_status`` (both degraded-streak fences, the
+    drift rates learned against a floor, the failure-cluster keys, the reason
+    histogram) therefore sees exactly the row it sees today.
+
+    Matching is by identity, not equality: cheap, allocation-free, and free of
+    false positives from two equal-but-unrelated values. It is transitive by
+    construction — a tainted step's own result is cached carrying its taint, so
+    its consumers taint in turn, which is D6's "blast radius is a graph
+    traversal" with no graph to build.
+
+    ``prior`` is the run's already-completed entries (duck-typed:
+    ``.outcome_status`` / ``.outcome_reason`` / ``.result`` / ``.label``).
+    """
+    if not bound or not prior:
+        return (None, None)
+    sources: list[tuple[Any, str, str | None]] = []
+    for e in prior:
+        if not _identity_is_meaningful(getattr(e, "result", None)):
+            continue
+        if getattr(e, "outcome_status", "ok") != "ok":
+            reason = getattr(e, "outcome_reason", None)
+            if reason in _NON_PROPAGATING_REASONS:
+                continue
+            # A degraded step is a ROOT: it names itself.
+            sources.append((e, e.label, reason))
+        elif getattr(e, "tainted_by", None) is not None:
+            # An already-tainted step is a CARRIER. It passes the root
+            # through rather than naming itself — transitivity does not
+            # come free once taint stops being a status value, and the
+            # root is what an operator groups a blast radius by. Every
+            # step in a chain therefore answers the same question the
+            # same way: "which bad fetch touched this?"
+            sources.append((e, e.tainted_by, getattr(e, "tainted_reason", None)))
+    if not sources:
+        return (None, None)
+    candidates = _flatten_one_level(bound)
+    for entry, root_label, root_reason in sources:
+        for arg in candidates:
+            if arg is entry.result:
+                return (root_label, root_reason)
+    return (None, None)

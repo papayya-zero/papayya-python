@@ -208,7 +208,9 @@ CREATE TABLE IF NOT EXISTS {_schema.TBL_STEPS} (
     {_schema.COL_STEP_OUTCOME_STATUS}  TEXT NOT NULL DEFAULT 'ok',
     {_schema.COL_STEP_OUTCOME_REASON}  TEXT,
     {_schema.COL_STEP_EXECUTION_TOKEN} TEXT NOT NULL DEFAULT '',
-    {_schema.COL_STEP_ATTEMPT}         INTEGER NOT NULL DEFAULT 1
+    {_schema.COL_STEP_ATTEMPT}         INTEGER NOT NULL DEFAULT 1,
+    {_schema.COL_STEP_TAINTED_BY}      TEXT,
+    {_schema.COL_STEP_TAINTED_REASON}  TEXT
 );
 """
 
@@ -682,6 +684,28 @@ def _apply_v12_to_v13(conn: sqlite3.Connection, db_path: Path) -> None:
         _set_schema_version(conn, "13")
 
 
+def _apply_v13_to_v14(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Plan 44 / ADR 0009 D6: input provenance on step rows.
+
+    Plain ADD COLUMNs, both nullable — no rebuild, no default. NULL is exactly
+    right for existing rows: they predate the concept, and "not tainted" is
+    what every reader should conclude about them. Nothing else on the row
+    changes, which is the whole point of the design (§2) — a taint must not
+    disturb outcome_status, the fence below, or any aggregate derived from it.
+    """
+    _backup_db(db_path, "13")
+    with conn:
+        conn.execute(
+            f"ALTER TABLE {_schema.TBL_STEPS} "
+            f"ADD COLUMN {_schema.COL_STEP_TAINTED_BY} TEXT"
+        )
+        conn.execute(
+            f"ALTER TABLE {_schema.TBL_STEPS} "
+            f"ADD COLUMN {_schema.COL_STEP_TAINTED_REASON} TEXT"
+        )
+        _set_schema_version(conn, "14")
+
+
 def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
     """Forward-only migrations. Idempotent: safe to call on any schema version.
 
@@ -728,6 +752,9 @@ def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
         elif current == "12":
             _apply_v12_to_v13(conn, db_path)
             current = "13"
+        elif current == "13":
+            _apply_v13_to_v14(conn, db_path)
+            current = "14"
         else:
             raise RuntimeError(
                 f"Unknown schema version {current!r}; expected {_SCHEMA_VERSION!r}. "
@@ -870,6 +897,8 @@ class SQLiteStore:
                 outcome_reason=t[_schema.COL_STEP_OUTCOME_REASON],
                 execution_token=t[_schema.COL_STEP_EXECUTION_TOKEN],
                 attempt=t[_schema.COL_STEP_ATTEMPT],
+                tainted_by=t[_schema.COL_STEP_TAINTED_BY],
+                tainted_reason=t[_schema.COL_STEP_TAINTED_REASON],
             )
             for t in step_rows
         ]
@@ -947,8 +976,10 @@ class SQLiteStore:
                    {_schema.COL_STEP_OUTCOME_STATUS},
                    {_schema.COL_STEP_OUTCOME_REASON},
                    {_schema.COL_STEP_EXECUTION_TOKEN},
-                   {_schema.COL_STEP_ATTEMPT})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   {_schema.COL_STEP_ATTEMPT},
+                   {_schema.COL_STEP_TAINTED_BY},
+                   {_schema.COL_STEP_TAINTED_REASON})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     entry.label,
@@ -973,6 +1004,8 @@ class SQLiteStore:
                     entry.outcome_reason,
                     entry.execution_token,
                     entry.attempt,
+                    entry.tainted_by,
+                    entry.tainted_reason,
                 ),
             )
             self._conn.execute(

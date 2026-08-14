@@ -961,6 +961,30 @@ class Item:
             outcome_status = verdict.status
             outcome_reason = verdict.reason
 
+            # ADR 0009 D6: did this step consume a degraded step's output?
+            #
+            # Only when this step's own verdict came back clean. A step that
+            # degraded on its own output keeps that verdict — it is the more
+            # specific signal, and taint is about the INPUT's provenance, not
+            # a second opinion on the output.
+            #
+            # Deliberately its own pair of fields rather than a status value or
+            # a reason token: outcome_status is read by two independent
+            # degraded-streak fences, by drift rates learned against a floor,
+            # by the failure-cluster key and by the reason histogram, and a
+            # taint is signal to none of them. See plans/44-D6-taint.md §2.
+            #
+            # bind_arguments is computed here only when there is an eligible
+            # source to match against — i.e. never on a clean run.
+            tainted_by = tainted_reason = None
+            if outcomes.ENABLE_STRUCTURAL_DETECTION and outcome_status == "ok":
+                prior = list(self._cache.values())
+                if any(e.outcome_status != "ok" for e in prior):
+                    tainted_by, tainted_reason = outcomes.inspect_taint(
+                        inputs if contract is not None else bind_arguments(sig, args, kwargs),
+                        prior,
+                    )
+
             # Snapshots only populate when an item_id is in effect — the
             # lineage view has no home for snapshots that aren't attached
             # to an item, and we'd rather not bloat the DB with noise.
@@ -1003,6 +1027,8 @@ class Item:
                 partition_key=self._partition_key,
                 outcome_status=outcome_status,
                 outcome_reason=outcome_reason,
+                tainted_by=tainted_by,
+                tainted_reason=tainted_reason,
                 execution_token=execution_token,
                 attempt=attempt,
             )

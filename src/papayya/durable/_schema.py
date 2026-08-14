@@ -105,6 +105,11 @@ COL_STEP_OUTCOME_REASON = "outcome_reason"
 # attempt is the discriminator the provider idempotency key was built from.
 COL_STEP_EXECUTION_TOKEN = "execution_token"
 COL_STEP_ATTEMPT = "attempt"
+# v14 (Plan 44 / ADR 0009 D6): input provenance. Set when this step consumed a
+# degraded step's output. Its own columns, not a value of outcome_status —
+# see plans/44-D6-taint.md §2.
+COL_STEP_TAINTED_BY = "tainted_by"
+COL_STEP_TAINTED_REASON = "tainted_reason"
 
 
 # Disposition values — contract with the UI's DLQ section and the hosted CP.
@@ -114,7 +119,7 @@ DLQ_ACKNOWLEDGED = "acknowledged"
 
 
 # Schema version bumps — update both sides when adding a migration
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 
 
 # Indexes (v12 names) — named explicitly so tests can check their presence.

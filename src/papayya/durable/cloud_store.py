@@ -184,6 +184,11 @@ class CloudStore:
                     # versions (pre-Plan-03) round-trip cleanly.
                     outcome_status=cp.get("outcome_status", "ok"),
                     outcome_reason=cp.get("outcome_reason"),
+                    # Plan 44 / D6. A control pane predating 091 sends
+                    # neither; None is "not tainted", which is the right
+                    # reading of a row written before the concept existed.
+                    tainted_by=cp.get("tainted_by"),
+                    tainted_reason=cp.get("tainted_reason"),
                     # Plan 41 R3. A control pane predating 072 sends
                     # neither, and the defaults are exactly right there:
                     # one execution per label, attempt 1. The server does
@@ -252,6 +257,8 @@ class CloudStore:
             "llm_provider_shape": entry.llm_provider_shape,
             "outcome_status": entry.outcome_status,
             "outcome_reason": entry.outcome_reason,
+            "tainted_by": entry.tainted_by,
+            "tainted_reason": entry.tainted_reason,
             # Plan 41 R3 — the execution identity. The server derives the
             # checkpoint row's primary key from (run_id, execution_token),
             # so this payload IS the idempotency of the write: a journal
