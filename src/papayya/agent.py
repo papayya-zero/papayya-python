@@ -135,6 +135,46 @@ def reset_bootstrap_run_id(token) -> None:
     _BOOTSTRAP_RUN_ID.reset(token)
 
 
+# The lease's DECLARED item_id, injected by the worker the same way the run id
+# above is (plan 43 B2b, C11).
+#
+# It exists because B2a moved the customer's input into the function's argument:
+# `fn(input)` replaced `fn(item_id)`, so `_extract_item_id(args)` — which is
+# literally `args[0]` — started returning the input OBJECT. That value reaches
+# `papayya().run(item_id=...)` and from there every checkpoint payload's
+# `item_id`, which the server types as a string. Measured on the real path: every
+# hosted `run.step()` answered `400 invalid request body`, the run was reported
+# failed, and NO hosted run could save a checkpoint at all.
+#
+# The lease has carried the declared id all along, so the fix is to hand it down
+# rather than to guess it from the arguments. NOT one-shot, unlike the run id:
+# every step in the body wants it, and the worker resets the token in a finally.
+#
+# THE DEFAULT IS A SENTINEL, NOT None, AND THAT DISTINCTION IS LOAD-BEARING.
+# `item_id` is optional since B2a — an undeclared submission stores NULL — so a
+# worker legitimately injects None, and None must mean "hosted, and this record
+# has no id". Only _UNSET means "no worker here", which is the local path that
+# keeps the legacy positional-arg convention. Measured with a plain None default:
+# the declared case was fixed and the UNDECLARED one still 400'd, because it fell
+# through to args[0] and handed the input object back to the wire.
+_UNSET_ITEM_ID = object()
+
+_BOOTSTRAP_ITEM_ID: ContextVar[Any] = ContextVar(
+    "papayya_bootstrap_item_id", default=_UNSET_ITEM_ID
+)
+
+
+def set_bootstrap_item_id(item_id: str | None):
+    """Set the lease's declared item_id for this invocation. Returns the
+    contextvar token; the worker resets it in a finally."""
+    return _BOOTSTRAP_ITEM_ID.set(item_id)
+
+
+def reset_bootstrap_item_id(token) -> None:
+    """Restore the bootstrap-item-id contextvar to its prior value."""
+    _BOOTSTRAP_ITEM_ID.reset(token)
+
+
 def consume_bootstrap_run_id() -> str | None:
     """One-shot read of the worker-injected run_id. Returns the lease's
     run_id when a worker set it for this invocation, None otherwise.
@@ -246,8 +286,35 @@ def _extract_item_id(args: tuple[Any, ...]) -> Any:
     path's existing ``item_id = args[0] if args else None`` convention.
     Both the inject_run and legacy paths use the same extraction here so
     baggage stays consistent across the two call shapes.
+
+    LOCAL-PATH ONLY since plan 43 B2a made the argument the customer's INPUT
+    rather than their id. On the hosted path the declared id comes off the
+    lease — see :func:`_resolve_item_id`.
     """
     return args[0] if args else None
+
+
+def _resolve_item_id(args: tuple[Any, ...]) -> Any:
+    """The record's id for this invocation: the lease's DECLARED id when a
+    worker injected one, else the legacy positional-arg convention.
+
+    The order is not a preference, it is a correctness rule (plan 43 B2b C11).
+    ``args[0]`` is the customer's input object on the hosted path, and an object
+    where the wire wants a string is what 400'd every hosted checkpoint write.
+    An undeclared id arrives as ``""`` from the dispatcher (``dispatch.go``
+    normalizes an omitted id to the empty string, not to NULL), so the worker
+    passes ``lease.item_id or None`` and this returns None rather than an
+    id-shaped blank.
+
+    A hosted invocation NEVER falls through to ``args[0]``, including when the
+    customer declared no id. Falling through would re-derive an id from the
+    input for exactly the customer who declined to name one — which is what
+    deleting ``dispatch.InputToItemID`` stopped doing one layer down.
+    """
+    declared = _BOOTSTRAP_ITEM_ID.get()
+    if declared is not _UNSET_ITEM_ID:
+        return declared
+    return _extract_item_id(args)
 
 
 def _extract_partition_key(kwargs: dict[str, Any]) -> Any:
@@ -533,7 +600,7 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
-                item_id_value = _extract_item_id(args)
+                item_id_value = _resolve_item_id(args)
                 partition_key_value = _extract_partition_key(kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,
@@ -615,7 +682,7 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
-                item_id_value = _extract_item_id(args)
+                item_id_value = _resolve_item_id(args)
                 partition_key_value = _extract_partition_key(kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,

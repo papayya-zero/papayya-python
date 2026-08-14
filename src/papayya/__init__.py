@@ -43,6 +43,13 @@ def __getattr__(name: str):
             "active_item": _active_item,
             "active_run_id": _active_run_id,
         }[name]
+    if name == "signal":
+        # Plan 43 B2b: backflow from the world. Deferred like everything else
+        # here, and for one extra reason — papayya.signals imports httpx, and a
+        # package-level import would put an HTTP client on the import path of
+        # every worker process that never signals anything.
+        from papayya.signals import signal as _signal
+        return _signal
     if name in ("schedule", "trigger"):
         # Plan 11 decorators. Deferred for the same reason as Plan 10's
         # iter/mark_* — pulling papayya.decorators (which transitively
@@ -62,6 +69,7 @@ __all__ = [
     "is_credit_exhaustion_error", "classify_provider_error",
     "CheckVerdict", "llm_judge",
     # iter/map deactivated (Plan 37) — see __getattr__.
+    "signal",
     "mark_degraded", "mark_outcome",
     "llm", "step", "active_item", "active_run_id",
 ]

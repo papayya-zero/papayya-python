@@ -1072,7 +1072,9 @@ class Worker:
         # would create a cycle / shadow.
         from papayya.agent import (
             get_agent,
+            reset_bootstrap_item_id,
             reset_bootstrap_run_id,
+            set_bootstrap_item_id,
             set_bootstrap_run_id,
         )
 
@@ -1094,6 +1096,17 @@ class Worker:
         if isinstance(lease.payload, dict):
             run_id = lease.payload.get("run_id")
         bootstrap_token = set_bootstrap_run_id(run_id)
+        # The DECLARED item_id, handed down rather than guessed from the
+        # function's arguments (plan 43 B2b C11). Since B2a the argument is the
+        # customer's INPUT, so `args[0]` is an object — and an object reached
+        # `papayya().run(item_id=...)` and then every checkpoint payload, where
+        # the wire wants a string: measured, every hosted run.step() 400'd and no
+        # hosted run could save a checkpoint at all.
+        #
+        # `or None` because the dispatcher normalizes an omitted id to "" rather
+        # than to NULL, and an empty string is not an id — it would blank the
+        # local fallback instead of deferring to it.
+        item_bootstrap_token = set_bootstrap_item_id(lease.item_id or None)
         if run_id:
             self._mark_run_running(run_id)
 
@@ -1207,6 +1220,7 @@ class Worker:
                 self._mark_run_terminal(run_id, run_status, output)
         finally:
             reset_bootstrap_run_id(bootstrap_token)
+            reset_bootstrap_item_id(item_bootstrap_token)
             with self._hb_lock:
                 self._in_flight_lease = None
             self._last_activity_at = time.monotonic()
