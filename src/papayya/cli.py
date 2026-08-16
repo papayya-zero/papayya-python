@@ -175,6 +175,34 @@ def _resolve_project_id(ctx_obj: dict) -> str | None:
     return _env_scope(ctx_obj).project_id
 
 
+_BUILD_POLL_SECONDS = 3
+_BUILD_TIMEOUT_SECONDS = 900
+
+
+def _await_build(api: APIClient, deployment_id: str) -> tuple[str, str]:
+    """Poll a deployment to a terminal state. Returns ``(state, detail)``.
+
+    ``state`` is "ready", "failed", or "timed out"; ``detail`` is the image ref
+    or the reason. BOUNDED — this was ``while True``, so a build wedged in
+    'building' hung the CLI with no exit but ^C.
+    """
+    deadline = time.monotonic() + _BUILD_TIMEOUT_SECONDS
+    while True:
+        time.sleep(_BUILD_POLL_SECONDS)
+        status = api.get_deployment(deployment_id)
+        state = status.get("status", "unknown")
+        if state == "ready":
+            return "ready", status.get("image_ref", "?")
+        if state == "failed":
+            return "failed", status.get("error_message", "unknown error")
+        if time.monotonic() >= deadline:
+            return "timed out", (
+                f"still {state!r} after {_BUILD_TIMEOUT_SECONDS}s — "
+                f"check the build logs for deployment {deployment_id}"
+            )
+        click.echo(f"  Status: {state}...")
+
+
 def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
     """Look up an agent by slug in the project, or create it. Returns agent ID."""
     slug = reg.name.lower().replace(" ", "-")
@@ -638,6 +666,7 @@ def deploy(
 
         # Deploy each agent; track slug -> agent_id for the reconciler.
         deployed: dict[str, str] = {}
+        failed_builds: list[tuple[str, str]] = []
         for reg in agents:
             click.echo(f"\nDeploying {reg.name}...")
 
@@ -664,23 +693,33 @@ def deploy(
 
             # Poll until build completes
             click.echo("  Building container image...")
-            while True:
-                time.sleep(3)
-                status = api.get_deployment(deployment_id)
-                state = status.get("status", "unknown")
-
-                if state == "ready":
-                    click.echo(f"  Build complete! Image: {status.get('image_ref', '?')}")
-                    break
-                elif state == "failed":
-                    click.echo(f"  Build failed: {status.get('error_message', 'unknown error')}", err=True)
-                    break
-                else:
-                    click.echo(f"  Status: {state}...")
+            state, detail = _await_build(api, deployment_id)
+            if state != "ready":
+                # NOT deployed: skip the success line and keep it out of
+                # `deployed`, so nothing downstream treats it as live.
+                click.echo(f"  Build {state}: {detail}", err=True)
+                failed_builds.append((reg.name, detail))
+                continue
+            click.echo(f"  Build complete! Image: {detail}")
 
             slug = reg.name.lower().replace(" ", "-")
             deployed[slug] = resolved_agent_id
             click.echo(f"  Deployed {slug} → {resolved_agent_id}")
+
+        # Stop here, BEFORE reconciling triggers. A failed build used to fall
+        # through to the success line, the "Next: papayya run ..." nudge and
+        # exit 0 — so the command told the user to invoke something that was
+        # never built, and the very next command contradicted it. Exiting
+        # before the reconcile also avoids compounding a failed deploy by
+        # mutating schedules and webhooks for a half-deployed bundle.
+        if failed_builds:
+            click.echo("", err=True)
+            for name, why in failed_builds:
+                # First line only. The full build log already went out above;
+                # repeating it whole buries the one sentence that matters.
+                headline = why.strip().splitlines()[0] if why.strip() else "unknown error"
+                click.echo(f"Error: {name} was NOT deployed — {headline}", err=True)
+            sys.exit(1)
 
         # Reconcile triggers. Source = @schedule / @trigger decorators
         # attached to @agent functions — populated in the module-level
