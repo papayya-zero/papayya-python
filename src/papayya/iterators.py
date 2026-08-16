@@ -310,7 +310,14 @@ class _LazyIsolate:
     bootstrap-id / replay-hydration adoption is untouched.
     """
 
-    __slots__ = ("agent", "item_id", "partition_key", "own_completion", "run")
+    __slots__ = (
+        "agent",
+        "item_id",
+        "partition_key",
+        "own_completion",
+        "run",
+        "manual_run",
+    )
 
     def __init__(
         self, agent: str, item_id: Any, partition_key: Any, own_completion: bool
@@ -320,6 +327,11 @@ class _LazyIsolate:
         self.partition_key = partition_key
         self.own_completion = own_completion
         self.run: "PapayyaRun | None" = None
+        # True once the body has opened a run by calling papayya().run()
+        # itself (the legacy pattern). Distinct from ``run`` above, which only
+        # holds the run *we* minted lazily — without this a legacy body looks
+        # identical to one that recorded nothing at all.
+        self.manual_run: bool = False
 
 
 # Set by the @agent/@papayya.durable clean-path wrapper. Read by _resolve_run
@@ -401,6 +413,10 @@ def _resolve_run() -> "PapayyaRun | None":
                 item_id=_coerce_item_id(iso.item_id),
                 partition_key=_coerce_partition_key(iso.partition_key),
             )
+            # That call routes through Papayya.run(), which flags the isolate
+            # as manually-run. We know better — WE minted it — and leaving the
+            # flag set would misreport this body as legacy.
+            iso.manual_run = False
         finally:
             _LEGACY_AGENT_PATH_ACTIVE.reset(tok)
         # Create the run row now (same as iter does before the body) so a verb
@@ -412,6 +428,71 @@ def _resolve_run() -> "PapayyaRun | None":
         # be reset from drive_ambient_*'s parent context. Later verbs resolve
         # through the isolate itself, which is shared across those contexts.
     return iso.run
+
+
+def note_manual_run() -> None:
+    """Record that the body opened its own run via ``papayya().run()``.
+
+    Called from :meth:`Papayya.run`. Without it the empty-agent warning below
+    cannot tell a legacy body (which did record a run, just not through the
+    isolate) from a body that recorded nothing.
+    """
+    iso = _AMBIENT_ISOLATE.get()
+    if iso is not None:
+        iso.manual_run = True
+
+
+def _sdk_is_configured() -> bool:
+    """True when credentials resolve — i.e. the caller has opted in.
+
+    Gates the empty-agent warning. Someone who has never set a key is calling
+    a decorated function as a plain function, which is supported and should
+    stay silent: adoption is rewarded, not required.
+    """
+    try:
+        from papayya.api import resolve_config
+
+        resolve_config()
+        return True
+    except Exception:
+        return False
+
+
+_EMPTY_AGENT_WARNED: set[str] = set()
+
+
+def _warn_wrote_nothing(agent: str) -> None:
+    """Warn that an agent body completed without recording anything.
+
+    The silent-no-op this catches: ``@agent`` injects a run only when the
+    function declares ``run`` as its first positional parameter. Drop that
+    parameter — the obvious edit, since the body often never touches it — and
+    the body still runs, still returns, and writes nothing to the dashboard.
+    A product whose whole claim is "it ran and it didn't work" should not ship
+    that failure mode in its own SDK.
+    """
+    if agent in _EMPTY_AGENT_WARNED:
+        return
+    _EMPTY_AGENT_WARNED.add(agent)
+    import warnings
+
+    warnings.warn(
+        f"papayya: agent {agent!r} finished without recording a run, so it "
+        f"will not appear in the dashboard. Add `run` as the first positional "
+        f"parameter (`def {agent}(run, ...)`) to have one injected, or call a "
+        f"papayya verb (run.step / @papayya.llm / mark_degraded) in the body. "
+        f"Silence with warnings.filterwarnings('ignore', message='papayya: agent').",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _maybe_warn_empty(iso: "_LazyIsolate") -> None:
+    """Fire the empty-agent warning when this body recorded nothing at all."""
+    if iso.run is not None or iso.manual_run or not iso.own_completion:
+        return
+    if _sdk_is_configured():
+        _warn_wrote_nothing(iso.agent)
 
 
 def drive_ambient_sync(
@@ -454,6 +535,8 @@ def drive_ambient_sync(
                     iso.run.complete()
                 except Exception:
                     log.exception("papayya: run.complete() raised at agent-body return")
+            else:
+                _maybe_warn_empty(iso)
             return result
     finally:
         _AMBIENT_ISOLATE.reset(iso_token)
@@ -491,6 +574,8 @@ async def drive_ambient_async(
                     iso.run.complete()
                 except Exception:
                     log.exception("papayya: run.complete() raised at agent-body return")
+            else:
+                _maybe_warn_empty(iso)
             return result
     finally:
         _AMBIENT_ISOLATE.reset(iso_token)

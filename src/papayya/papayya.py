@@ -216,6 +216,17 @@ class Papayya:
         # method themselves from inside the fn body — that's the line
         # they need to delete, so we warn at the call site (the wrapper
         # sets a contextvar before invoking the legacy fn).
+        # Tell the enclosing ambient isolate (if any) that this body opened a
+        # run for itself. Without this the empty-agent warning cannot tell a
+        # legacy body — which did record a run, just not via the isolate —
+        # from one that recorded nothing at all.
+        try:
+            from papayya.iterators import note_manual_run
+
+            note_manual_run()
+        except Exception:  # pragma: no cover - never block a real run
+            pass
+
         from papayya.agent import legacy_agent_path_active
         if legacy_agent_path_active():
             import warnings
