@@ -203,7 +203,12 @@ def test_run_slug_positional_triggers_in_env(
     assert trigger_inst.trigger_calls, "trigger_run was not called"
     call = trigger_inst.trigger_calls[0]
     assert call["agent_id"] == AGENT_STAGING_UUID
-    assert call["input_data"] == {"message": "hello"}
+    # The submitted input IS the agent's argument (Lease.agent_argument returns
+    # payload["input"] verbatim), so it goes on the wire unwrapped. This used to
+    # assert {"message": "hello"} — that envelope became the argument, and
+    # `papayya run hello "world"` returned "Hello, {'message': 'world'}!" where
+    # the same agent run locally returned "Hello, world!".
+    assert call["input_data"] == "hello"
 
 
 def test_run_agent_id_flag_still_works(

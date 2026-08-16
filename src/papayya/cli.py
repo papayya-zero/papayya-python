@@ -117,14 +117,62 @@ def _distinct_step_count(checkpoints: Any) -> int:
     return len({c.get("label") for c in (checkpoints or [])})
 
 
+# Memo for _project_id_from_api_key, keyed by (api_key, base_url). _env_scope
+# is called more than once per command by some code paths, and the lookup is a
+# network round trip.
+_PROJECT_ID_BY_KEY: dict[tuple[str, str], str | None] = {}
+
+
+def _project_id_from_api_key(api_key: str | None, base_url: str) -> str | None:
+    """Ask the control plane which project an API key should operate on.
+
+    Onboarding tells a new user to export PAPAYYA_API_KEY and nothing else, so
+    for their first `papayya deploy` the key is the ONLY thing they have. Every
+    other source of a project id — PAPAYYA_PROJECT_ID, the saved env config —
+    requires a step onboarding never mentions, so without this the documented
+    path dead-ends on itself.
+
+    Same rule `papayya login` already applies: exactly one reachable project
+    means there is nothing to choose. Note the listing is ACCOUNT-scoped, not
+    key-scoped — a project key still sees its siblings — so more than one
+    project is genuinely ambiguous here and has to be resolved by the user.
+
+    Best effort by construction: any unclear answer returns None so the
+    caller's existing "no project id" error is still what the user sees. It
+    never raises, because this runs on paths that would otherwise have failed
+    anyway and must not turn a clear error into a traceback.
+    """
+    if not api_key:
+        return None
+
+    memo_key = (api_key, base_url)
+    if memo_key in _PROJECT_ID_BY_KEY:
+        return _PROJECT_ID_BY_KEY[memo_key]
+
+    project_id: str | None = None
+    try:
+        api = APIClient(APIConfig(api_key=api_key, base_url=base_url))
+        try:
+            projects = api.list_projects()
+        finally:
+            api.close()
+        if len(projects) == 1:
+            project_id = projects[0].get("id")
+    except Exception:
+        project_id = None
+
+    _PROJECT_ID_BY_KEY[memo_key] = project_id
+    return project_id
+
+
 def _resolve_project_id(ctx_obj: dict) -> str | None:
-    """Resolve project ID from flag, env, or the current env's saved config."""
-    pid = os.environ.get("PAPAYYA_PROJECT_ID")
-    if pid:
-        return pid
-    cfg = _load_cli_config()
-    env_name = ctx_obj.get("env") or _current_env(cfg)
-    return _env_config(cfg, env_name).get("project_id")
+    """Resolve the project id the way every server-hitting command does.
+
+    Delegates rather than repeating the ladder: this used to carry its own
+    copy of the precedence rules, which is how it drifted from _env_scope and
+    let `deploy` and `run` disagree about which project they were addressing.
+    """
+    return _env_scope(ctx_obj).project_id
 
 
 def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
@@ -185,8 +233,14 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
 
     Precedence:
       - api_key: ctx flag / PAPAYYA_API_KEY env > envs[env].api_key
-      - project_id: PAPAYYA_PROJECT_ID env > envs[env].project_id
+      - project_id: PAPAYYA_PROJECT_ID env > envs[env].project_id > the key's
+        own project (see _project_id_from_api_key)
       - base_url: explicit --base-url / PAPAYYA_BASE_URL > envs[env].base_url > DEFAULT_BASE_URL
+
+    The key-derived project id is LAST, below the saved config, so a config
+    that names a project still wins — resolving from the key is the floor for
+    someone who has only ever done what onboarding told them to, not an
+    override of a choice the user made explicitly.
     """
     cfg = _load_cli_config()
     env_name = ctx_obj.get("env") or _current_env(cfg)
@@ -208,13 +262,19 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
     ctx_base = ctx_obj.get("base_url") or DEFAULT_BASE_URL
     base_url = ctx_base if explicit else (env_cfg.get("base_url") or ctx_base)
 
+    # Resolved last, and only when nothing else answered — it needs base_url,
+    # and it costs a round trip on a path that would otherwise hard-error.
+    if not project_id:
+        project_id = _project_id_from_api_key(api_key, base_url)
+
     return _EnvScope(env=env_name, api_key=api_key, project_id=project_id, base_url=base_url)
 
 
 def _require_api_key(scope: _EnvScope) -> str:
     if not scope.api_key:
         click.echo(
-            "Error: no API key. Run `papayya login` to paste one, or set "
+            # Capitalised to match its sibling ("Error: No project ID ...").
+            "Error: No API key. Run `papayya login` to paste one, or set "
             f"PAPAYYA_API_KEY (mint a key in the dashboard at {DEFAULT_DASHBOARD_URL}).",
             err=True,
         )
@@ -224,10 +284,17 @@ def _require_api_key(scope: _EnvScope) -> str:
 
 def _require_project_id(scope: _EnvScope) -> str:
     if not scope.project_id:
+        # Reaching here with a key in hand means resolving the project FROM the
+        # key did not produce a single answer — usually the key's account has
+        # several projects. Don't assert the cause (the lookup is best-effort
+        # and stays quiet when the control plane is unreachable); name the ways
+        # out, since the old message asked for a project id without saying
+        # where to get one.
         click.echo(
-            f"Error: No project ID for env '{scope.env}'. "
-            f"Run `papayya envs link {scope.env} --project-id ...` "
-            "or set PAPAYYA_PROJECT_ID.",
+            f"Error: No project ID for env '{scope.env}'. Pick one explicitly:\n"
+            "  papayya login --key <key> --project-id <id>\n"
+            f"  papayya envs link {scope.env} --project-id ...\n"
+            "  or set PAPAYYA_PROJECT_ID.",
             err=True,
         )
         sys.exit(1)
@@ -560,7 +627,13 @@ def deploy(
         if not project_id:
             project_id = _resolve_project_id({**ctx.obj, "env": env_name or ctx.obj.get("env")})
         if not project_id and not agent_id:
-            click.echo("Error: No project ID. Set PAPAYYA_PROJECT_ID or run `papayya signup`.", err=True)
+            # Not `papayya signup` — that only opens the dashboard, which is
+            # where the user just came from.
+            click.echo(
+                "Error: No project ID. Run `papayya login` to connect the CLI, "
+                "or set PAPAYYA_PROJECT_ID.",
+                err=True,
+            )
             sys.exit(1)
 
         # Deploy each agent; track slug -> agent_id for the reconciler.
@@ -2783,7 +2856,13 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
             agent_id=agent_id,
             model=reg.model,
             system_prompt=reg.instructions,
-            input_data={"message": input_text},
+            # The SUBMITTED INPUT is what the customer's function is called
+            # with — Lease.agent_argument returns payload["input"] verbatim.
+            # Wrapping it in {"message": ...} made that envelope the argument,
+            # so `papayya run hello "world"` returned
+            # "Hello, {'message': 'world'}!" where the same agent run locally
+            # returned "Hello, world!". The two execution paths have to agree.
+            input_data=input_text,
             max_steps=reg.max_steps,
             budget_cents=budget_cents,
         )
