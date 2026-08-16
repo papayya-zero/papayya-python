@@ -363,7 +363,8 @@ def test_cli_json_mode_puts_nothing_but_json_on_stdout(patched_api):
                          skipped_agent_missing=1),
         runs={"n1": _run(outcome="ok")},
     ))
-    result = CliRunner(mix_stderr=False).invoke(
+    # click>=8.2 separates stdout/stderr by default and removed mix_stderr=.
+    result = CliRunner().invoke(
         cli_module.main, ["release", "--agent", "enrich", "-y", "--json"])
     assert result.exit_code == 0, result.stderr
     payload = json.loads(result.stdout)

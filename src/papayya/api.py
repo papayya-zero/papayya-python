@@ -57,7 +57,7 @@ def resolve_config(
     """Resolve credentials for the hosted resource namespaces (.items/.runs).
 
     Resolution order matches the durable path
-    (``papayya._resolve_durable_api_key``): explicit arg → ``PAPAYYA_API_KEY``
+    (``papayya._resolve_durable_credentials``): explicit arg → ``PAPAYYA_API_KEY``
     → the CLI config file that ``papayya login`` writes
     (``~/.papayya/config.json``). Without the last step a developer who
     authed via the CLI would get a 401 the moment they touched ``.items``

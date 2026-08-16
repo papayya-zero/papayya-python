@@ -26,7 +26,11 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27,<1",
-    "click>=8,<9",
+    # >=8.2 specifically: 8.2 removed CliRunner(mix_stderr=...) and made stderr
+    # a separate stream. The CLI tests read result.stderr, which raises
+    # "stderr not separately captured" on 8.1.x — so 8.1 satisfied the old
+    # `click>=8` pin while silently failing 17 of them.
+    "click>=8.2,<9",
     "pydantic>=2,<3",
     "pyyaml>=6,<7",
     "psutil>=6,<8",

@@ -66,26 +66,35 @@ from papayya.resources.webhooks import Webhooks
 _PARTITION_KEY_UNSET = object()
 
 
-def _resolve_durable_api_key(explicit: str | None) -> str | None:
-    """Permissive API key resolution for the durable path.
+def _resolve_durable_credentials(
+    explicit_key: str | None, explicit_url: str | None
+) -> tuple[str | None, str]:
+    """Resolve the API key AND the control plane it is sent to, as a pair.
 
-    Unlike `resolve_config` (which raises when no key is found), this
-    returns None silently — local-only durable runs are valid and the
-    SDK falls back to SQLiteStore in that case.
+    They are only meaningful together: a key is minted by one control plane
+    and means nothing to another, and `papayya login` writes both into the
+    same env block for exactly that reason. Resolving them from independent
+    ladders is what pointed a docker-compose key at api.getpapayya.com — the
+    key was read out of the saved config while the URL fell through to the
+    production default.
+
+    So the SOURCE decides both. A key named explicitly or via
+    PAPAYYA_API_KEY takes the explicit/env URL (or the default) — never a
+    saved config's URL, which may describe a different control plane. Only
+    when the key itself comes from the config does the config's URL apply.
+
+    Permissive like the key resolution it replaces: returns ``(None, url)``
+    rather than raising when no key is found, because the caller falls back
+    to SQLiteStore in that case.
     """
-    if explicit:
-        return explicit
-    key = os.environ.get("PAPAYYA_API_KEY")
+    env_url = explicit_url or os.environ.get("PAPAYYA_BASE_URL")
+
+    key = explicit_key or os.environ.get("PAPAYYA_API_KEY")
     if key:
-        return key
-    cfg = load_cli_config()
-    return env_config(cfg).get("api_key")
+        return key, env_url or DEFAULT_BASE_URL
 
-
-def _resolve_durable_base_url(explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    return os.environ.get("PAPAYYA_BASE_URL") or DEFAULT_BASE_URL
+    cfg = env_config(load_cli_config())
+    return cfg.get("api_key"), env_url or cfg.get("base_url") or DEFAULT_BASE_URL
 
 
 class Papayya:
@@ -161,9 +170,10 @@ class Papayya:
 
             return make_runtime_store(runtime_base, runtime_key)
 
-        resolved_key = _resolve_durable_api_key(self._api_key)
+        resolved_key, resolved_url = _resolve_durable_credentials(
+            self._api_key, self._base_url
+        )
         if resolved_key:
-            resolved_url = _resolve_durable_base_url(self._base_url)
             return CloudStore(
                 CloudStoreConfig(api_key=resolved_key, base_url=resolved_url)
             )

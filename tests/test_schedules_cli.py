@@ -111,7 +111,10 @@ def test_max_steps_is_not_a_schedule_flag() -> None:
                 ["schedules", "update", "s1"]):
         result = _run([*cmd, "--max-steps", "20"])
         assert result.exit_code != 0
-        assert "No such option: --max-steps" in result.output
+        # Match on the parts, not the sentence: click 8.1 renders
+        # "No such option: --max-steps" and 8.2+ "No such option '--max-steps'."
+        assert "No such option" in result.output
+        assert "--max-steps" in result.output
 
 
 def test_list_forwards_agent_filter(fake_client: _FakeClient) -> None:
