@@ -62,6 +62,22 @@ _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 _DEFAULT_DRAIN_TIMEOUT_SECONDS = 30.0
 
 
+# Per-request budget for every dispatcher call (lease, complete, release,
+# heartbeat, run PATCH). Was a hardcoded 2.0 at each call site, which is
+# not a response budget a busy control plane can be held to — plan 48 W1
+# killed the pool by pausing the API for eight seconds, and a laptop
+# sleeping does the same thing. 10s is comfortably under the 30s lease TTL
+# so a single stalled call cannot outlive the lease it is about.
+_DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+
+
+# Bundle downloads get their own, longer budget: this one transfers a
+# tarball rather than a small JSON body, so it is sized for bytes on the
+# wire, not for control-plane latency. Floor, not override — raising
+# --http-timeout-seconds above it raises this too.
+_DEFAULT_BUNDLE_TIMEOUT_SECONDS = 30.0
+
+
 # ADR-0001 § 4 designed-but-unshipped recycling triggers. ADR-0002 #6
 # closes the loop. Defaults are guesses — Phase 1 prototype must surface
 # real memory growth and item-throughput numbers; Phase 2 tunes from
@@ -336,6 +352,7 @@ class Worker:
         poll_idle_seconds: float = 0.05,
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
+        http_timeout_seconds: float = _DEFAULT_HTTP_TIMEOUT_SECONDS,
         api_key: Optional[str] = None,
         bundle_url_base: Optional[str] = None,
         max_items_before_recycle: int = _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
@@ -348,6 +365,10 @@ class Worker:
         self.poll_idle_seconds = poll_idle_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.drain_timeout_seconds = drain_timeout_seconds
+        self.http_timeout_seconds = http_timeout_seconds
+        self._bundle_timeout_seconds = max(
+            _DEFAULT_BUNDLE_TIMEOUT_SECONDS, http_timeout_seconds
+        )
         # Bootstrap mode: hosted workers boot without --agent-module and
         # load every bundle on demand from lease.agent_version. A lease
         # with agent_version=None (LocalDispatcher) in this mode is a
@@ -557,8 +578,12 @@ class Worker:
         registration, so no layer can re-introduce it.
 
         Raises ``_VersionNotFound`` on 404 from the bundle endpoint;
-        ``_handle_lease`` maps that to a categorised failure. Network /
-        verification errors bubble — the lease TTL is the safety net.
+        ``_handle_lease`` maps that to a categorised failure. Network errors
+        bubble as ``OSError`` and everything else (a bad import in the
+        customer's entrypoint, a corrupt tarball) bubbles as ``Exception``:
+        ``_handle_lease`` catches both. The lease TTL is only a safety net if
+        the worker is alive to be caught by it, which is what plan 48 W1 was
+        about — before that these escaped ``run()`` and exited the process.
         """
         if lease.agent_version is None:
             return
@@ -733,7 +758,7 @@ class Worker:
             url += f"&project={project_id}"
         req = urllib_request.Request(url, headers=self._auth_headers())
         try:
-            resp = urllib_request.urlopen(req, timeout=30.0)
+            resp = urllib_request.urlopen(req, timeout=self._bundle_timeout_seconds)
         except urllib_error.HTTPError as exc:
             if exc.code == 404:
                 raise _VersionNotFound(
@@ -875,7 +900,23 @@ class Worker:
                         log.info("dispatcher reachable again; resuming normal poll cadence")
                     self._reconnect_backoff.on_success()
                     assert lease is not None
-                    self._handle_lease(lease)
+                    try:
+                        self._handle_lease(lease)
+                    except Exception:  # noqa: BLE001 — one item, not the pool
+                        # Backstop for plan 48 W1's shape rather than its
+                        # specific cause: every KNOWN failure is categorised
+                        # and reported inside _handle_lease, so reaching here
+                        # is a papayya bug. Log it whole (exc_info) and keep
+                        # polling — the lease TTL re-dispatches this item, and
+                        # one unanticipated exception taking down a pool that
+                        # serves every account is a strictly worse outcome
+                        # than one item going around again.
+                        log.error(
+                            "worker %s: unhandled error on lease %s item=%s; "
+                            "item returns to the queue at lease expiry",
+                            self.worker_id, lease.lease_id[:8], lease.item_id,
+                            exc_info=True,
+                        )
                     continue
                 if outcome == _PollOutcome.IDLE:
                     if self._reconnect_backoff.current > 0.0:
@@ -966,18 +1007,27 @@ class Worker:
         "no work right now" (IDLE) from "couldn't reach the dispatcher"
         (UNREACHABLE) so the caller can apply different sleep policies —
         the latter triggers exponential backoff.
+
+        Catches ``OSError``, not ``URLError``. urllib only converts to
+        ``URLError`` around the *request* phase; a timeout waiting for the
+        **response** comes out of ``h.getresponse()`` as a bare
+        ``TimeoutError``, which is outside that conversion. Under the old
+        handler it escaped here, escaped ``run()``, and exited the process —
+        plan 48 W1 killed the whole pool by pausing the API for eight
+        seconds. ``URLError`` and ``TimeoutError`` are both ``OSError``, so
+        one clause covers the request phase and the response phase alike.
         """
         url = f"{self.dispatcher_url}/lease?worker_id={self.worker_id}"
         req = urllib_request.Request(url, headers=self._auth_headers())
         try:
-            with urllib_request.urlopen(req, timeout=2.0) as resp:
+            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds) as resp:
                 if resp.status == 204:
                     return (_PollOutcome.IDLE, None)
                 if resp.status != 200:
                     log.warning("unexpected lease status: %s", resp.status)
                     return (_PollOutcome.IDLE, None)
                 body = json.loads(resp.read().decode("utf-8"))
-        except urllib_error.URLError as exc:
+        except OSError as exc:
             log.debug("lease poll failed: %s", exc)
             return (_PollOutcome.UNREACHABLE, None)
 
@@ -1021,13 +1071,18 @@ class Worker:
         # #4. On exhaustion the dispatcher's lease TTL is the safety net:
         # the lease eventually re-dispatches and at-least-once semantics
         # are preserved.
+        #
+        # ``OSError`` for the reason given on ``_poll_lease``. It matters more
+        # here: this call lands *after* the model call has been paid for, so
+        # the old ``URLError`` handler let a response-phase timeout kill the
+        # worker at the one moment the item's result was still unreported.
         attempts = 5
         wait = 0.1
         for attempt in range(1, attempts + 1):
             try:
-                with urllib_request.urlopen(req, timeout=2.0):
+                with urllib_request.urlopen(req, timeout=self.http_timeout_seconds):
                     return
-            except urllib_error.URLError as exc:
+            except OSError as exc:
                 if attempt == attempts:
                     log.error(
                         "failed to report completion for %s after %d attempts: %s",
@@ -1078,7 +1133,7 @@ class Worker:
         wait = 0.1
         for attempt in range(1, attempts + 1):
             try:
-                with urllib_request.urlopen(req, timeout=2.0):
+                with urllib_request.urlopen(req, timeout=self.http_timeout_seconds):
                     return
             except urllib_error.HTTPError as exc:
                 if exc.code in (404, 405):
@@ -1111,7 +1166,10 @@ class Worker:
                     return
                 time.sleep(wait)
                 wait = min(wait * 2.0, 2.0)
-            except urllib_error.URLError as exc:
+            # After the HTTPError clause, never before: HTTPError is itself an
+            # OSError, and the 404/405 branch above is what keeps a dispatcher
+            # with no /release from stranding the lease.
+            except OSError as exc:
                 if attempt == attempts:
                     log.error(
                         "failed to release lease %s after %d attempts: %s",
@@ -1146,9 +1204,12 @@ class Worker:
             method="PATCH",
         )
         try:
-            with urllib_request.urlopen(req, timeout=2.0):
+            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds):
                 return
-        except urllib_error.URLError as exc:
+        except OSError as exc:
+            # "Never raises" was the declared contract and OSError is what
+            # makes it true — a response-phase timeout here used to take the
+            # worker down between lease and execution (plan 48 W1).
             log.warning("failed to mark run %s running: %s", run_id, exc)
 
     def _mark_run_terminal(
@@ -1200,9 +1261,9 @@ class Worker:
             method="PATCH",
         )
         try:
-            with urllib_request.urlopen(req, timeout=2.0):
+            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds):
                 return
-        except urllib_error.URLError as exc:
+        except OSError as exc:
             log.warning("failed to mark run %s %s: %s", run_id, status, exc)
 
     # --- lease handling ------------------------------------------------ #
@@ -1291,6 +1352,54 @@ class Worker:
                     error=str(exc),
                     error_category="recycle_pending",
                 )
+                return
+            except OSError as exc:
+                # Couldn't reach the bundle endpoint. Transient by
+                # assumption, so this does NOT complete the lease: burning a
+                # customer's item because the control plane blinked is the
+                # wrong trade when the lease TTL will re-dispatch it in 30s.
+                # Deliberately no /complete — dropping the lease is the retry.
+                log.warning(
+                    "deferred %s item=%s bundle fetch unreachable (%s); "
+                    "dropping the lease for TTL re-dispatch",
+                    short, lease.item_id, exc,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — one lease, not the pool
+                # A bad import in the customer's entrypoint, a corrupt
+                # tarball, a verification failure. Deterministic: TTL
+                # re-dispatch would just fail the same way forever, so this
+                # one is reported. Before plan 48 W1 it exited the process
+                # instead — one customer's broken bundle stopped every other
+                # account's work.
+                from papayya.runtime.error_category import classify_exception
+
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                category = classify_exception(exc)
+                log.warning(
+                    "failed   %s item=%s duration=%dms category=%s "
+                    "bundle load: %s: %s",
+                    short, lease.item_id, duration_ms, category,
+                    type(exc).__name__, exc,
+                    exc_info=True,
+                )
+                self._report_complete(
+                    lease.lease_id,
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                    error_category=category,
+                )
+                # /complete records the LEASE. The run is a separate row and
+                # nothing else will move it, so without this the item reads
+                # "in progress" forever — plan 48 W3's exact shape, on a path
+                # that has already decided the work is over.
+                if run_id:
+                    self._mark_run_terminal(
+                        run_id,
+                        "failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                        error_category=category,
+                    )
                 return
 
             # ADR-0003 § Worker #4 — dispatch to the registration that
@@ -1754,8 +1863,15 @@ class Worker:
             headers={"Content-Type": "application/json", **self._auth_headers()},
             method="POST",
         )
+        # The SHORTER of one interval and the request budget. A heartbeat that
+        # hasn't landed by the time the next one is due has been superseded,
+        # and the loop is serial — a long budget here would stretch the cadence
+        # toward the lease TTL it exists to stay under. Timeouts surface as
+        # OSError and _heartbeat_loop's except Exception already absorbs them.
         try:
-            with urllib_request.urlopen(req, timeout=2.0):
+            with urllib_request.urlopen(
+                req, timeout=min(self.heartbeat_interval_seconds, self.http_timeout_seconds)
+            ):
                 pass
         except urllib_error.HTTPError as exc:
             # 410 Gone: dispatcher released this lease (TTL expired or

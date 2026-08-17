@@ -16,6 +16,7 @@ import sys
 from .worker import (
     _DEFAULT_DRAIN_TIMEOUT_SECONDS,
     _DEFAULT_HEARTBEAT_INTERVAL,
+    _DEFAULT_HTTP_TIMEOUT_SECONDS,
     _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
     _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE,
     Worker,
@@ -93,6 +94,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "before the worker force-exits (lease TTL recovers the "
             "orphaned item). 0 or negative disables the watchdog "
             f"(default: {_DEFAULT_DRAIN_TIMEOUT_SECONDS})."
+        ),
+    )
+    p.add_argument(
+        "--http-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get("PAPAYYA_HTTP_TIMEOUT_SECONDS")
+            or _DEFAULT_HTTP_TIMEOUT_SECONDS
+        ),
+        help=(
+            "Per-request budget for every dispatcher call (lease, complete, "
+            "release, run status). Raise it when the control plane is slow "
+            "under load; keep it below the 30s lease TTL. Falls back to "
+            "PAPAYYA_HTTP_TIMEOUT_SECONDS env var (default: "
+            f"{_DEFAULT_HTTP_TIMEOUT_SECONDS}). Plan 48 W1."
         ),
     )
     p.add_argument(
@@ -196,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         worker_id=args.worker_id,
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
+        http_timeout_seconds=args.http_timeout_seconds,
         api_key=api_key,
         bundle_url_base=args.bundle_url_base,
         max_items_before_recycle=args.max_items_before_recycle,
