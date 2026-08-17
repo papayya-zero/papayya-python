@@ -310,3 +310,38 @@ def test_secrets_missing_project_id_errors_with_env_hint(
     assert result.exit_code != 0
     # Error goes to stderr; click.testing merges by default
     assert "No project ID for env 'dev'" in result.output or "No project ID for env 'dev'" in (result.stderr or "")
+
+
+# ---------------------------------------------------------------------------
+# --env must name an env that exists (first-user walk, 2026-08-17)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_env_is_refused_and_lists_the_known_ones(
+    two_env_config: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`env_config` returns {} for a name that does not exist, so an explicit
+    --env fell through to the environment variables and RAN. A typo was
+    invisible, and `--env prod` on a box that has only dev aimed at prod and
+    hit dev."""
+    monkeypatch.setattr(cli_module, "APIClient", _FakeAPIClient)
+    result = CliRunner().invoke(cli_module.main, ["--env", "prod", "status", "r-1"])
+
+    assert result.exit_code != 0
+    assert "no env named 'prod'" in result.output
+    assert "dev" in result.output and "staging" in result.output
+
+
+def test_the_default_env_is_allowed_without_a_config(
+    tmp_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user who has never run `papayya login` has no envs at all — and
+    `papayya deploy` prints `papayya --env dev logs <run-id>` to exactly that
+    person. Refusing the default name would break the product's own
+    instruction for the user it is printed for."""
+    monkeypatch.setenv("PAPAYYA_API_KEY", "cpk_env")
+    monkeypatch.setattr(cli_module, "APIClient", _FakeAPIClient)
+    result = CliRunner().invoke(cli_module.main, ["--env", "dev", "status", "r-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "no env named" not in result.output

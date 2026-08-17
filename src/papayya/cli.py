@@ -17,6 +17,7 @@ import click
 from papayya._cli_errors import SafeGroup
 from papayya._config import (
     CONFIG_FILE as _CONFIG_FILE,
+    DEFAULT_ENV as _DEFAULT_ENV,
     current_env as _current_env,
     env_config as _env_config,
     list_envs as _list_envs,
@@ -318,6 +319,31 @@ class _EnvScope:
     base_url: str
 
 
+def _require_known_env(cfg: dict, requested: str | None) -> None:
+    """Fail when --env names an env that does not exist.
+
+    ``env_config`` returns ``{}`` for an unknown name, so an explicit
+    ``--env staging`` on a machine with no `staging` silently fell through to
+    the environment variables and ran — against whatever PAPAYYA_BASE_URL
+    happened to say. A typo was invisible, and `--env prod` on a box that has
+    only `dev` aimed at prod and hit dev.
+
+    Only an EXPLICIT name is checked, and DEFAULT_ENV is always allowed: a user
+    who has never run `papayya login` has no envs at all, and `papayya deploy`
+    prints `papayya --env dev logs <run-id>` to exactly that person.
+    """
+    if not requested or requested == _DEFAULT_ENV:
+        return
+    known = _list_envs(cfg)
+    if requested in known:
+        return
+    known_str = ", ".join(known) if known else "none configured"
+    raise click.ClickException(
+        f"no env named '{requested}' (known: {known_str}). "
+        "Add one with `papayya login --env " + requested + "`."
+    )
+
+
 def _env_scope(ctx_obj: dict) -> _EnvScope:
     """Resolve env + credentials + base_url from the current CLI context.
 
@@ -334,6 +360,7 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
     """
     cfg = _load_cli_config()
     env_name = ctx_obj.get("env") or _current_env(cfg)
+    _require_known_env(cfg, ctx_obj.get("env"))
     env_cfg = _env_config(cfg, env_name)
 
     api_key = (
@@ -1896,11 +1923,17 @@ def _echo_release_skips(diff: Any) -> None:
 
 @main.group()
 def runs() -> None:
-    """Runs — one invocation each (list local, submit hosted).
+    """Runs — one invocation each (submit hosted).
 
     A run is one invocation of an agent: one map() call, one cron fire,
-    one submitted batch of items. `list` reads the local ledger;
-    `submit` sends a JSONL file to the hosted control plane.
+    one submitted batch of items. `submit` sends a JSONL file to the
+    hosted control plane.
+
+    To see what has already run, use `papayya items list` (one record per
+    line) or the dashboard. This group's `list` read the local SQLite
+    ledger and was deactivated with it; the help kept advertising it, so
+    `papayya runs list` answered "No such command" to anyone who read the
+    line above it.
 
     BREAKING (0.3.0): this group used to operate on per-item records;
     per-item inspection moved to `papayya items`.
