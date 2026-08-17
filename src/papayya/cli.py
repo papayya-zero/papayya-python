@@ -1836,7 +1836,7 @@ def release_cmd(
             click.echo(
                 f"  {_MARK.get(rec.verdict, rec.verdict):<13} {label}  "
                 f"[{rec.before_status} -> {rec.after_status or '-'}]  "
-                f"${rec.before_cost_usd:.4f} -> ${rec.after_cost_usd:.4f}"
+                f"{_fmt_usd(rec.before_cost_usd)} -> {_fmt_usd(rec.after_cost_usd)}"
             )
 
         counts = diff.counts
@@ -1849,8 +1849,8 @@ def release_cmd(
             + (f", {counts[PENDING]} still running" if counts.get(PENDING) else "")
         )
         click.echo(
-            f"Cost of the re-drive: ${diff.after_cost_usd:.4f} "
-            f"(the originals cost ${diff.before_cost_usd:.4f})"
+            f"Cost of the re-drive: {_fmt_usd(diff.after_cost_usd)} "
+            f"(the originals cost {_fmt_usd(diff.before_cost_usd)})"
         )
         if diff.cost_note:
             click.echo(f"  {diff.cost_note}")
@@ -3020,6 +3020,60 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
         api.close()
 
 
+def _fmt_usd(amount: float) -> str:
+    """Render a dollar amount without rounding a real charge to zero.
+
+    ``${:.4f}`` is what the dashboard shipped until plan 51 had to remove it:
+    a real $0.000034 item rendered ``$0.0000``, which is this product's own
+    cost column telling a customer their run was free. Sub-cent amounts get
+    the precision they need; everything else stays readable.
+    """
+    if amount == 0:
+        return "$0.00"
+    if abs(amount) < 0.01:
+        return f"${amount:.6f}"
+    return f"${amount:,.2f}"
+
+
+def _fmt_cost(record: dict[str, Any], amount: float) -> str:
+    """Cost for one record, or the reason there isn't one.
+
+    ``cost_priced`` is false when the amount is 0 only because nothing could
+    price it — a project with an empty rate card prices every record at 0, and
+    printing ``$0.00`` for that is the silent-wrong-answer this product exists
+    to catch (plan 51 / ``model.PricingFor``). The server already ships the
+    verdict and a sentence to go with it; both are rendered rather than
+    re-derived, so the CLI cannot disagree with the dashboard.
+    """
+    if record.get("cost_priced") is False:
+        reason = record.get("cost_unpriced_reason") or "unpriced"
+        return f"—  ({reason})"
+    return _fmt_usd(amount)
+
+
+def _echo_run_verdict(run: dict[str, Any]) -> None:
+    """Say how the run ENDED, under a list of how its steps went.
+
+    A step list is not a verdict. The step that raised never checkpoints, so a
+    failed run's `papayya logs` is a clean list of the steps that worked and no
+    mention of the one that didn't — the command named "logs" being the one
+    place the failure is invisible. Silent on a healthy run: the list already
+    said it.
+    """
+    status = run.get("status")
+    if status in ("failed", "paused", "cancelled"):
+        line = f"Run {status}"
+        if run.get("error"):
+            line += f": {run['error']}"
+            if run.get("error_category"):
+                line += f"  [{run['error_category']}]"
+        click.echo(line)
+        return
+    worst = run.get("worst_outcome_status")
+    if worst and worst != "ok":
+        click.echo(f"Run {status}, but its worst step outcome was {worst}.")
+
+
 @main.command()
 @click.argument("run_id")
 @click.pass_context
@@ -3030,12 +3084,45 @@ def status(ctx: click.Context, run_id: str) -> None:
     config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
+    # Every field is read with .get() and a fallback. This command used to
+    # index `result['id']` and crashed with `KeyError: 'id'` on every hosted
+    # run there has ever been — the durable API returns `run_id` (plan 48 W6).
+    # Two of its other three lines read `current_step` and `total_cost_cents`,
+    # which no response has ever carried either, so they printed a confident
+    # `Step: 0` / `Cost: 0 cents` for four months.
     try:
         result = api.get_run(run_id)
-        click.echo(f"Run:    {result['id']}")
-        click.echo(f"Status: {result['status']}")
-        click.echo(f"Step:   {result.get('current_step', 0)}")
-        click.echo(f"Cost:   {result.get('total_cost_cents', 0)} cents")
+        agent = result.get("agent") or "?"
+        version = result.get("agent_version")
+        click.echo(f"Run:     {result.get('run_id') or run_id}")
+        click.echo(f"Agent:   {agent}" + (f" (v{version})" if version else ""))
+        click.echo(f"Status:  {result.get('status', 'unknown')}")
+
+        # Why it failed, on the command whose whole job is to say how the run
+        # is doing. The columns exist since plan 50; nothing was reading them.
+        if result.get("error"):
+            category = result.get("error_category")
+            click.echo(
+                f"Error:   {result['error']}"
+                + (f"  [{category}]" if category else "")
+            )
+
+        # The wedge: a run can be `completed` and still not have worked. Say so
+        # here rather than leaving the operator to notice it on the dashboard.
+        worst = result.get("worst_outcome_status")
+        degraded = result.get("degraded_count") or 0
+        if (worst and worst != "ok") or degraded:
+            click.echo(
+                f"Outcome: {worst or 'ok'}"
+                + (f" ({degraded} degraded step(s))" if degraded else "")
+            )
+
+        spent = result.get("budget_consumed_usd") or 0
+        limit = result.get("budget_limit_usd")
+        click.echo(
+            f"Cost:    {_fmt_cost(result, spent)}"
+            + (f" of {_fmt_usd(limit)} budget" if limit else "")
+        )
     finally:
         api.close()
 
@@ -3050,34 +3137,70 @@ def logs(ctx: click.Context, run_id: str) -> None:
     config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
+    # Durable checkpoints carry {label, result, outcome_status, attempt, seq,
+    # cost_usd, duration_ms, llm_*_tokens}. This command read step_number,
+    # step_type, status, input_tokens, output_tokens and output — six names,
+    # none of which the API has returned since the v1 cutover, so it raised
+    # `KeyError: 'step_number'` on every hosted run with a step (plan 48 W4).
+    # `run --wait` calls the same api.get_steps sixty lines above and WAS
+    # migrated; the comment there declaring the v1 shape gone sat in this file
+    # the whole time.
     try:
+        # The run first, then its steps. "No steps found." meant three
+        # different things and exited 0 for all of them: this run recorded no
+        # steps, this run does not exist (a typo'd id), or the command had just
+        # crashed. Fetching the run makes a bad id a 404 instead of a healthy
+        # empty result, and gives us the verdict for the trailer below.
+        run = api.get_run(run_id)
         steps = api.get_steps(run_id)
         if not steps:
-            click.echo("No steps found.")
+            click.echo(
+                f"Run {run.get('run_id') or run_id} is "
+                f"{run.get('status', 'unknown')} and recorded no steps."
+            )
+            click.echo(
+                "  Steps come from run.step(...) calls inside the agent; "
+                "an agent that never calls one has nothing to show here."
+            )
+            _echo_run_verdict(run)
             return
 
-        for s in steps:
-            step_num = s["step_number"]
-            step_type = s["step_type"]
-            status = s["status"]
-            tokens_in = s.get("input_tokens", 0)
-            tokens_out = s.get("output_tokens", 0)
-            duration = s.get("duration_ms", 0)
+        for i, s in enumerate(steps, 1):
+            label = s.get("label", "?")
+            # Mark re-executions, matching `run --wait`: two rows with the same
+            # label otherwise read as a duplicate rather than as attempt two.
+            attempt = s.get("attempt", 1)
+            if attempt > 1:
+                label = f"{label} (attempt {attempt})"
+            outcome = s.get("outcome_status") or "?"
+            duration = s.get("duration_ms") or 0
 
-            click.echo(f"Step {step_num} [{step_type}] — {status}")
-            click.echo(f"  Tokens: {tokens_in} in / {tokens_out} out | {duration}ms")
+            click.echo(f"{i}. {label} — {outcome}  ({duration}ms)")
 
-            output = s.get("output", {})
-            if isinstance(output, dict):
-                content = output.get("content", "")
-                if content:
-                    click.echo(f"  Output: {content[:300]}")
+            # Tokens and cost only when the step actually made a model call.
+            # llm_*_tokens are omitempty server-side, so defaulting them to 0
+            # would print "Tokens: 0 in / 0 out" for every non-LLM step — a
+            # measurement where there was no measurement.
+            tokens_in = s.get("llm_prompt_tokens")
+            tokens_out = s.get("llm_completion_tokens")
+            if tokens_in is not None or tokens_out is not None:
+                click.echo(
+                    f"   Tokens: {tokens_in or 0} in / {tokens_out or 0} out"
+                    f" | Cost: {_fmt_cost(s, s.get('cost_usd') or 0)}"
+                )
 
-                tool_calls = output.get("tool_calls", [])
-                for tc in tool_calls:
-                    click.echo(f"  Tool: {tc.get('name', '?')}({json.dumps(tc.get('input', {}))})")
+            reason = s.get("outcome_reason")
+            if reason:
+                click.echo(f"   Reason: {reason}")
+
+            result = s.get("result")
+            if result is not None:
+                rendered = result if isinstance(result, str) else json.dumps(result)
+                click.echo(f"   Result: {rendered[:300]}")
 
             click.echo()
+
+        _echo_run_verdict(run)
     finally:
         api.close()
 

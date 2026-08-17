@@ -75,7 +75,14 @@ class _FakeAgentsAPI:
         return {"id": "run-1", "status": "completed"}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        return {"id": run_id, "status": "completed", "current_step": 0, "total_cost_cents": 0}
+        # The shape the durable API actually returns: `run_id`, never `id`,
+        # and no `current_step` / `total_cost_cents` at all. A fake that
+        # answers with the fields the CLI *wanted* is what let
+        # `KeyError: 'id'` survive four months of green tests (plan 48 W6).
+        return {"run_id": run_id, "status": "completed", "agent": "ops-bot",
+                "agent_version": "1", "budget_consumed_usd": 0,
+                "budget_limit_usd": 5, "worst_outcome_status": "ok",
+                "llm_tokens_total": 0, "cost_priced": True}
 
     def get_steps(self, run_id: str) -> list[dict[str, Any]]:
         return []
