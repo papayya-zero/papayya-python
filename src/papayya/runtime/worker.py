@@ -42,7 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -139,6 +139,25 @@ class Lease:
         if self.payload is not None and "input" in self.payload:
             return self.payload["input"]
         return self.item_id
+
+
+class _InvocationOutcome(NamedTuple):
+    """What one invocation resolved to, for the caller's run-status flip.
+
+    Was a bare ``(run_status, output)`` tuple. The error and its category ride
+    here because plan 48 R3 found the worker already computing the exception
+    text — ``f"{type(exc).__name__}: {exc}"`` — reporting it to the LEASE table
+    and then throwing it away, so ``durable_runs`` had nothing and a crashed
+    record's entire diagnostic was the word "failed".
+
+    ``status`` is None for a pause/credit signal, whose run status is
+    authoritative server-side and must not be clobbered.
+    """
+
+    status: str | None
+    output: Any = None
+    error: str | None = None
+    error_category: str | None = None
 
 
 @dataclass
@@ -1133,12 +1152,19 @@ class Worker:
             log.warning("failed to mark run %s running: %s", run_id, exc)
 
     def _mark_run_terminal(
-        self, run_id: str, status: str, output: Any = None
+        self,
+        run_id: str,
+        status: str,
+        output: Any = None,
+        *,
+        error: str | None = None,
+        error_category: str | None = None,
     ) -> None:
         """Flip the durable run to its terminal state (running→completed/failed)
         on the platform-authed runtime lane (Plan 37 Unit 1). The sibling of
         :meth:`_mark_run_running`: PATCH /v1/runtime/runs/{run_id}
-        {status, output?}. The server guards the transition, resolves the
+        {status, output?, error?, error_category?}. The server guards the
+        transition, resolves the
         tenant off the run row, and runs the same terminal-status side effects
         (workload fence + run-failed notification) as the tenant path.
 
@@ -1151,6 +1177,15 @@ class Worker:
         if not self._durable_api_base:
             return
         body: dict[str, Any] = {"status": status}
+        # Why it failed, on the SAME request that records that it failed
+        # (plan 48 R3). Not a second call: a follow-up write could land on a
+        # row whose status the server's guard refused to move, putting one
+        # attempt's error on another attempt's record.
+        if status == "failed":
+            if error:
+                body["error"] = error
+            if error_category:
+                body["error_category"] = error_category
         if status == "completed" and output is not None:
             try:
                 json.dumps(output)  # probe serialisability
@@ -1323,7 +1358,7 @@ class Worker:
             if max_duration is None:
                 max_duration = registration.max_duration_seconds
 
-            run_status, output = self._invoke_with_timeout(
+            outcome = self._invoke_with_timeout(
                 fn=registration.fn,
                 lease=lease,
                 started_at=started_at,
@@ -1336,8 +1371,14 @@ class Worker:
             # invocation resolved. run_status is None for a pause/credit
             # signal — the run's status is authoritative server-side and must
             # not be clobbered. No-op on the local-dev path (no run_id).
-            if run_id and run_status is not None:
-                self._mark_run_terminal(run_id, run_status, output)
+            if run_id and outcome.status is not None:
+                self._mark_run_terminal(
+                    run_id,
+                    outcome.status,
+                    outcome.output,
+                    error=outcome.error,
+                    error_category=outcome.error_category,
+                )
         finally:
             reset_bootstrap_run_id(bootstrap_token)
             reset_bootstrap_item_id(item_bootstrap_token)
@@ -1438,6 +1479,7 @@ class Worker:
         # Late import: keep the worker boot path free of the bundle
         # loader's importlib pull-in cost when no bundles are involved.
         from papayya.runtime import _bundle_loader
+        from papayya.runtime.error_category import classify_exception
         from papayya.errors import CreditExhausted, WorkloadPaused
 
         prior_handler = None
@@ -1458,13 +1500,14 @@ class Worker:
                 "failed   %s item=%s duration=%dms category=timeout limit=%.2fs",
                 short, lease.item_id, duration_ms, max_duration,
             )
+            timeout_error = f"timeout: agent ran for >{max_duration}s"
             self._report_complete(
                 lease.lease_id,
                 status="failed",
-                error=f"timeout: agent ran for >{max_duration}s",
+                error=timeout_error,
                 error_category="timeout",
             )
-            return "failed", None
+            return _InvocationOutcome("failed", None, timeout_error, "timeout")
         except (WorkloadPaused, CreditExhausted) as exc:
             # Not a body failure: the run stopped, its checkpoints are all
             # saved, and it must be resumable. RELEASE the lease — do not
@@ -1481,19 +1524,25 @@ class Worker:
                 short, lease.item_id, duration_ms, reason, type(exc).__name__, exc,
             )
             self._report_release(lease.lease_id, reason=reason)
-            return None, None
+            return _InvocationOutcome(None)
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.exception(
                 "failed   %s item=%s duration=%dms",
                 short, lease.item_id, duration_ms,
             )
+            # The category the lease table never got: this branch is the
+            # common case (the customer's own function raised) and it was the
+            # one path that reported no category at all (plan 48 R3).
+            message = f"{type(exc).__name__}: {exc}"
+            category = classify_exception(exc)
             self._report_complete(
                 lease.lease_id,
                 status="failed",
-                error=f"{type(exc).__name__}: {exc}",
+                error=message,
+                error_category=category,
             )
-            return "failed", None
+            return _InvocationOutcome("failed", None, message, category)
         finally:
             if watchdog_armed:
                 signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1511,7 +1560,7 @@ class Worker:
             short, lease.item_id, duration_ms,
         )
         self._report_complete(lease.lease_id, status="completed")
-        return "completed", result
+        return _InvocationOutcome("completed", result)
 
     def _invoke_async(
         self,
@@ -1554,6 +1603,7 @@ class Worker:
           - Any other ``Exception``: existing stringified-error path.
         """
         from papayya.runtime import _bundle_loader
+        from papayya.runtime.error_category import classify_exception
         from papayya.errors import CreditExhausted, WorkloadPaused
 
         coro = fn(lease.agent_argument)
@@ -1573,26 +1623,28 @@ class Worker:
                 "failed   %s item=%s duration=%dms category=timeout limit=%.2fs",
                 short, lease.item_id, duration_ms, max_duration,
             )
+            timeout_error = f"timeout: agent ran for >{max_duration}s"
             self._report_complete(
                 lease.lease_id,
                 status="failed",
-                error=f"timeout: agent ran for >{max_duration}s",
+                error=timeout_error,
                 error_category="timeout",
             )
-            return "failed", None
+            return _InvocationOutcome("failed", None, timeout_error, "timeout")
         except asyncio.CancelledError:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.warning(
                 "failed   %s item=%s duration=%dms category=cancelled",
                 short, lease.item_id, duration_ms,
             )
+            cancel_error = "cancelled: asyncio.CancelledError"
             self._report_complete(
                 lease.lease_id,
                 status="failed",
-                error="cancelled: asyncio.CancelledError",
+                error=cancel_error,
                 error_category="cancelled",
             )
-            return "failed", None
+            return _InvocationOutcome("failed", None, cancel_error, "cancelled")
         except (WorkloadPaused, CreditExhausted) as exc:
             # Mirrors the sync path exactly: release the lease so the item
             # goes back to the queue parked, rather than completing it into
@@ -1604,19 +1656,22 @@ class Worker:
                 short, lease.item_id, duration_ms, reason, type(exc).__name__, exc,
             )
             self._report_release(lease.lease_id, reason=reason)
-            return None, None
+            return _InvocationOutcome(None)
         except Exception as exc:  # noqa: BLE001 — customer code; isolate
             duration_ms = int((time.monotonic() - started_at) * 1000)
             log.exception(
                 "failed   %s item=%s duration=%dms",
                 short, lease.item_id, duration_ms,
             )
+            message = f"{type(exc).__name__}: {exc}"
+            category = classify_exception(exc)
             self._report_complete(
                 lease.lease_id,
                 status="failed",
-                error=f"{type(exc).__name__}: {exc}",
+                error=message,
+                error_category=category,
             )
-            return "failed", None
+            return _InvocationOutcome("failed", None, message, category)
 
         duration_ms = int((time.monotonic() - started_at) * 1000)
         log.info(
@@ -1624,7 +1679,7 @@ class Worker:
             short, lease.item_id, duration_ms,
         )
         self._report_complete(lease.lease_id, status="completed")
-        return "completed", result
+        return _InvocationOutcome("completed", result)
 
     # --- drain watchdog ----------------------------------------------- #
 

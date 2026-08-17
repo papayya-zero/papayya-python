@@ -42,7 +42,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -51,7 +51,7 @@ from typing import Any, Iterable
 # Bumped only on a breaking change to the on-disk shape. Fixtures are meant to
 # live in a customer's repo for years — a reader must be able to say "I don't
 # understand this file" rather than silently mis-read a newer one.
-FIXTURE_VERSION = 1
+FIXTURE_VERSION = 2
 
 # Where the input came from. Named on every fixture rather than inferred.
 INPUT_FROM_ITEM = "item_snapshot"
@@ -100,6 +100,17 @@ class Fixture:
     input_source: str
     recorded_output: Any
     worst_outcome_status: str = "ok"
+    # The RUN's status — 'failed' / 'completed' — as distinct from the step
+    # verdict above. A record that raised before its first checkpoint keeps
+    # worst_outcome_status='ok' forever, so a fixture carrying only that
+    # column described three crashes as healthy and `verify` duly reported
+    # `[ok -> ok] · 0 fixed` on the fix that repaired them (plan 48 R2/R4).
+    status: str = "completed"
+    # Why it failed, one line: "KeyError: 'body'". None on anything that did
+    # not fail. This is what makes a pulled fixture answer "what am I fixing?"
+    # offline, which is the entire point of pulling one.
+    error: str | None = None
+    error_category: str | None = None
     agent_version: str | None = None
     partition_key: str | None = None
     created_at: str | None = None
@@ -119,14 +130,30 @@ class Fixture:
     def from_json(cls, raw: str) -> "Fixture":
         data = json.loads(raw)
         version = data.get("papayya_fixture_version")
-        if version != FIXTURE_VERSION:
+        # OLDER fixtures load; NEWER ones do not.
+        #
+        # This was a strict `!=`, which is right for a removal and wrong for
+        # an addition — and plan 50 is an addition. Under the strict gate,
+        # adding `status` and `error` would have invalidated every fixture
+        # already on disk with "Re-pull the cohort", i.e. broken exactly the
+        # use case fixtures exist for: a permanent, committed CI case (ADR
+        # 0009 D7b). A field this SDK has a default for is a field it can
+        # read without one.
+        #
+        # The forward direction stays hard, because there the missing fields
+        # are genuinely unknown — a newer SDK's file may encode meaning this
+        # one has no way to honour, and guessing would be the silent-wrong
+        # answer this product exists to catch.
+        if not isinstance(version, int) or version > FIXTURE_VERSION:
             raise FixtureError(
-                f"fixture is version {version!r}, this SDK reads version "
-                f"{FIXTURE_VERSION}. Re-pull the cohort, or upgrade/downgrade "
-                f"the SDK to match."
+                f"fixture is version {version!r}, this SDK reads up to version "
+                f"{FIXTURE_VERSION}. Upgrade the SDK to read it."
             )
         steps = [FixtureStep(**s) for s in data.pop("steps", [])]
-        return cls(steps=steps, **data)
+        # Drop keys this SDK does not know rather than TypeError on them: a
+        # forward-compatible read is only useful if it actually reads.
+        known = {f.name for f in fields(cls)}
+        return cls(steps=steps, **{k: v for k, v in data.items() if k in known})
 
     def filename(self) -> str:
         """Stable, filesystem-safe name for this fixture.
@@ -240,6 +267,9 @@ def fixture_from_record(
         input_source=source,
         recorded_output=recorded,
         worst_outcome_status=record.get("worst_outcome_status") or "ok",
+        status=record.get("status") or "completed",
+        error=record.get("error"),
+        error_category=record.get("error_category"),
         agent_version=record.get("agent_version"),
         partition_key=record.get("partition_key"),
         created_at=str(record.get("created_at")) if record.get("created_at") else None,

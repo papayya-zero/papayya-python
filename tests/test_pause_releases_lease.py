@@ -88,7 +88,7 @@ def _async_raiser(exc):
 def test_pause_releases_the_lease(worker, exc, want_reason, path):
     fn = _raiser(exc) if path == "sync" else _async_raiser(exc)
 
-    run_status, output = worker._invoke_with_timeout(
+    outcome = worker._invoke_with_timeout(
         fn=fn, lease=_lease(), started_at=0.0, max_duration=None, short="enrich",
     )
 
@@ -102,8 +102,12 @@ def test_pause_releases_the_lease(worker, exc, want_reason, path):
     )
     # The run's status is authoritative server-side; the worker must not
     # clobber it with a terminal value on the way out.
-    assert run_status is None
-    assert output is None
+    assert outcome.status is None
+    assert outcome.output is None
+    # A pause is not a failure. Recording an error here would put a message on
+    # a record that is going to be resumed and succeed (plan 50).
+    assert outcome.error is None
+    assert outcome.error_category is None
 
 
 @pytest.mark.parametrize("path", ["sync", "async"])
@@ -114,11 +118,19 @@ def test_ordinary_failures_still_complete(worker, path):
     exc = ValueError("boom")
     fn = _raiser(exc) if path == "sync" else _async_raiser(exc)
 
-    run_status, _ = worker._invoke_with_timeout(
+    outcome = worker._invoke_with_timeout(
         fn=fn, lease=_lease(), started_at=0.0, max_duration=None, short="enrich",
     )
 
     assert worker.releases == []
     assert len(worker.completions) == 1
     assert worker.completions[0]["status"] == "failed"
-    assert run_status == "failed"
+    assert outcome.status == "failed"
+    # Plan 50: the message the worker computes is now CARRIED OUT, not just
+    # reported to the lease table and dropped. This is what durable_runs.error
+    # is written from, and it is the whole of R3.
+    assert outcome.error == "ValueError: boom"
+    assert outcome.error_category == "customer_code"
+    # The generic exception path used to report NO category at all, which is
+    # why every crashed record in the walk had error_category empty.
+    assert worker.completions[0]["error_category"] == "customer_code"
