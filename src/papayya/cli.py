@@ -1259,6 +1259,7 @@ def pull_cmd(
       papayya pull --agent enrich --flagged
       papayya pull --probe bf88-... --flagged   # like this one AND flagged
     """
+    from papayya.cohort_diff import record_verdict
     from papayya.fixtures import fixture_from_record, write_fixtures
 
     scope = _env_scope(ctx.obj)
@@ -1351,7 +1352,15 @@ def pull_cmd(
         if dry_run:
             click.echo(f"Would pull {len(members)} of {total} record(s) into {out_dir}:")
             for m in members[:20]:
-                click.echo(f"  {m.get('item_id') or m.get('id')}  {m.get('worst_outcome_status')}")
+                # Both columns, same collapse as `release` prints — the
+                # selection response carries `status` beside
+                # `worst_outcome_status`. Printing the step verdict alone
+                # labelled every crashed record `ok` in the listing of a
+                # cohort selected as "everything that didn't work".
+                verdict = record_verdict(
+                    m.get("status"), m.get("worst_outcome_status")
+                )
+                click.echo(f"  {m.get('item_id') or m.get('id')}  {verdict}")
             if len(members) > 20:
                 click.echo(f"  … and {len(members) - 20} more")
             return
