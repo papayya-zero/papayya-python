@@ -23,6 +23,7 @@ from papayya.cohort_diff import (
     diff_from_release,
     merge_runs,
     pending_run_ids,
+    record_verdict,
 )
 
 COST_NOTE = "cost_usd is estimated from token counts x your project rate card"
@@ -113,6 +114,77 @@ def test_newly_broken_is_the_column_that_earns_the_diff():
     )
     assert diff.records[0].verdict == RECOVERED
     assert diff.records[1].verdict == NEWLY_BROKEN
+
+
+# --- the record that crashed (plan 48 R5) ------------------------------- #
+#
+# Every case above uses a source whose verdict is 'degraded' — a record that
+# COMPLETED and was graded by an inspector. A record that raises before its
+# first checkpoint has no step to grade, so it carries status='failed' with the
+# 'ok' it was born with. That is the commonest way a first batch fails, and
+# neither this suite nor its Go twin had a single case of it.
+
+
+def test_record_verdict_collapses_both_columns():
+    assert record_verdict("completed", "ok") == "ok"
+    assert record_verdict("completed", "degraded") == "degraded"
+    # The crash: nothing ever wrote the step column.
+    assert record_verdict("failed", "ok") == "failed"
+    # Both, and the run status is the louder fact.
+    assert record_verdict("failed", "degraded") == "failed"
+    # An unset column is not a verdict.
+    assert record_verdict("completed", None) == "ok"
+
+
+def test_repairing_a_crash_is_a_recovery_not_a_no_op():
+    """THE R5 test.
+
+    Two crashed records re-driven onto a fixed version printed
+    "0 recovered, 2 still ok" — the repair reported as nothing having changed,
+    because the before side read the step column and the after side read both.
+    """
+    diff = diff_from_release(
+        _release(_member("s1", "n1", "tkt-0007", outcome="failed")),
+        {"n1": _run(status="completed", outcome="ok")},
+    )
+    assert diff.records[0].verdict == RECOVERED
+    assert diff.counts == {RECOVERED: 1}
+
+
+def test_a_crash_the_fix_did_not_repair_is_still_not_ok():
+    diff = diff_from_release(
+        _release(_member("s1", "n1", "tkt-0007", outcome="failed")),
+        {"n1": _run(status="failed", outcome="ok")},
+    )
+    assert diff.records[0].verdict == STILL_NOT_OK
+
+
+def test_the_printed_transition_agrees_with_the_verdict():
+    """A verdict from one column beside a transition from another contradicts
+    itself on the line the operator reads: `NEWLY BROKEN … [ok -> ok]`."""
+    diff = diff_from_release(
+        _release(
+            _member("s1", "n1", "tkt-0007", outcome="failed"),
+            _member("s2", "n2", "tkt-0008", outcome="ok"),
+        ),
+        {"n1": _run(status="completed", outcome="ok"),
+         "n2": _run(status="failed", outcome="ok")},
+    )
+    recovered, broken = diff.records
+    assert (recovered.verdict, recovered.before_status, recovered.after_status) == (
+        RECOVERED, "failed", "ok",
+    )
+    assert (broken.verdict, broken.before_status, broken.after_status) == (
+        NEWLY_BROKEN, "ok", "failed",
+    )
+
+
+def test_merging_a_polled_crash_repair_updates_to_recovered():
+    diff = diff_from_release(_release(_member("s1", "n1", "tkt-0007", outcome="failed")))
+    assert diff.records[0].verdict == PENDING
+    merge_runs(diff, [("n1", _run(status="completed", outcome="ok"))])
+    assert diff.records[0].verdict == RECOVERED
+    assert diff.records[0].after_status == "ok"
 
 
 def test_a_clean_record_that_stays_clean_is_still_ok():

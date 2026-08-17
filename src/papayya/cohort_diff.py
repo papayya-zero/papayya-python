@@ -104,17 +104,48 @@ class CohortDiff:
         }
 
 
+def record_verdict(status: str | None, worst_outcome: str | None) -> str:
+    """Collapse a record's TWO verdict columns into the one an operator reads.
+
+    ``status`` is the run's; ``worst_outcome_status`` is the roll-up of its
+    steps. A record that raises before its first checkpoint has no step to
+    inspect, so it keeps the ``ok`` it was born with while ``status`` says
+    ``failed`` — the commonest way a first batch fails, and invisible to the
+    step column alone. That was plan 48 R5.
+
+    The Go twin is ``handler.recordVerdict`` and the SQL twin is
+    ``store.cohortWhere``'s outcome switch. Three expressions of one
+    definition, because one has to run in the database and one has to run
+    against runs this SDK polls for itself.
+    """
+    if status == "failed":
+        return "failed"
+    if worst_outcome and worst_outcome != "ok":
+        return worst_outcome
+    return "ok"
+
+
 def _verdict(before: str, after: str | None, run_status: str | None) -> str:
     """Classify one record.
 
     A re-drive that has not reached a terminal run status has NO verdict yet
     — `worst_outcome_status` on a queued run is its initial 'ok', and reading
     that as "recovered" would report a fix that has not run.
+
+    ``before`` arrives ALREADY COLLAPSED: it is the server's ``source_outcome``,
+    which the release handler puts through its own ``recordVerdict``. The after
+    side collapses here, because these runs are polled directly from
+    ``GET /v1/durable/runs/{id}`` and arrive as the two raw columns.
+
+    Both sides have to ask the same question. They did not, and the asymmetry
+    made ``recovered`` unreachable for a record that crashed: a real release of
+    two crashed records onto a fixed version printed "0 recovered, 2 still ok"
+    while both went from KeyError to a classification.
     """
     if run_status not in _TERMINAL or after is None:
         return PENDING
     was_ok = before == "ok"
-    now_ok = after == "ok" and run_status != "failed"
+    now_ok = record_verdict(run_status, after) == "ok"
     if was_ok:
         return STILL_OK if now_ok else NEWLY_BROKEN
     return RECOVERED if now_ok else STILL_NOT_OK
@@ -149,7 +180,16 @@ def diff_from_release(
         # A pending record has NO after-verdict. `worst_outcome_status` on a
         # queued run is its initial 'ok', and rendering "degraded -> ok" next
         # to "still running" reads as a recovery that has not happened.
-        after = None if verdict == PENDING else fresh.get("worst_outcome_status")
+        #
+        # Collapsed, so the transition the CLI prints agrees with the verdict
+        # printed beside it. The released cohort that exposed R5 printed
+        # `NEWLY BROKEN … [ok -> ok]`: a verdict from one column, a transition
+        # from another, contradicting each other on the same line.
+        after = (
+            None
+            if verdict == PENDING
+            else record_verdict(run_status, fresh.get("worst_outcome_status"))
+        )
         out.records.append(
             RecordDiff(
                 source_id=member.get("source_id", ""),
@@ -189,12 +229,15 @@ def merge_runs(
         )
         # See diff_from_release: a still-queued run's outcome is not a verdict.
         rec.after_status = (
-            None if rec.verdict == PENDING else fresh.get("worst_outcome_status")
+            None
+            if rec.verdict == PENDING
+            else record_verdict(rec.after_run_status, fresh.get("worst_outcome_status"))
         )
     return diff
 
 
 __all__ = [
+    "record_verdict",
     "RECOVERED",
     "STILL_NOT_OK",
     "NEWLY_BROKEN",
