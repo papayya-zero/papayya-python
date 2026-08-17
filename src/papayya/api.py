@@ -488,6 +488,17 @@ class APIClient:
         # the durable run instead. Response carries status + checkpoints.
         return self._request("GET", f"/v1/durable/runs/{run_id}")
 
+    def get_run_v2(self, run_id: str) -> dict[str, Any] | None:
+        """The SUBMISSION rollup for a group id, or None when there is no such
+        run. Distinct from get_run, which reads the per-ITEM surface — the two
+        nouns live at different paths and a customer holds one id."""
+        try:
+            return self._request("GET", f"/v2/runs/{run_id}")
+        except PapayyaAPIError as e:
+            if getattr(e, "status", None) == 404:
+                return None
+            raise
+
     def get_steps(self, run_id: str) -> list[dict[str, Any]]:
         # Steps are durable checkpoints after the cutover. Each item is
         # {label, result, cost_usd, duration_ms, ...} — not the v1

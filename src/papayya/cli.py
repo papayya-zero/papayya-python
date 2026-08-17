@@ -1940,67 +1940,13 @@ def runs() -> None:
     """
 
 
-# Plan 37: `papayya runs list` reads the local SQLite ledger — DEACTIVATED
-# (standalone, not registered on the `runs` group). The cloud equivalent
-# (SDK Runs.list over GET /v1/durable/runs) is the follow-up wiring; body
-# retained.
-@click.command("list")
-@click.option("--db", default=".papayya/local.db", envvar="PAPAYYA_LOCAL_DB_PATH",
-              help="Path to SQLite database (also honors PAPAYYA_LOCAL_DB_PATH)")
-@click.option("--limit", type=int, default=50, show_default=True,
-              help="Newest-first row cap")
-def runs_list(db: str, limit: int) -> None:
-    """List local runs, newest first (NDJSON, one run per line).
-
-    Each line carries the outcome rollup — item counts, degraded/failed
-    items, worst_outcome_status — so a degradation incident is visible
-    from the terminal. Reads the local SQLite ledger directly.
-    """
-    import sqlite3 as _sqlite
-    from pathlib import Path as _Path
-
-    db_file = _Path(db)
-    if not db_file.exists():
-        click.echo(f"Error: No local database at {db_file.resolve()}", err=True)
-        sys.exit(1)
-
-    from papayya.durable import _schema as _s
-    from papayya.durable.sqlite_store import ensure_migrated as _ensure_migrated
-    _ensure_migrated(db_file.resolve())
-
-    conn = _sqlite.connect(str(db_file))
-    conn.row_factory = _sqlite.Row
-    try:
-        rows = conn.execute(
-            f"""SELECT r.*, COALESCE(a.item_count, 0) AS item_count,
-                       COALESCE(a.degraded_items, 0) AS degraded_items,
-                       COALESCE(a.failed_items, 0) AS failed_items
-                FROM {_s.TBL_RUNS} r
-                LEFT JOIN (
-                    SELECT {_s.COL_ITEM_RUN_ID} AS rid, COUNT(*) AS item_count,
-                           SUM(CASE WHEN {_s.COL_ITEM_WORST_OUTCOME_STATUS} = 'degraded'
-                                    THEN 1 ELSE 0 END) AS degraded_items,
-                           SUM(CASE WHEN status = 'failed'
-                                     OR {_s.COL_ITEM_WORST_OUTCOME_STATUS} = 'failed'
-                                    THEN 1 ELSE 0 END) AS failed_items
-                    FROM {_s.TBL_ITEMS} GROUP BY {_s.COL_ITEM_RUN_ID}
-                ) a ON a.rid = r.{_s.COL_RUN_ID}
-                ORDER BY r.{_s.COL_RUN_CREATED_AT} DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    for row in rows:
-        d = dict(row)
-        if d["failed_items"] > 0:
-            d["worst_outcome_status"] = "failed"
-        elif d["degraded_items"] > 0:
-            d["worst_outcome_status"] = "degraded"
-        else:
-            d["worst_outcome_status"] = "ok"
-        click.echo(json.dumps(d))
-
+# The local-ledger `papayya runs list` that used to sit here is GONE, not
+# deactivated. It read `.papayya/local.db`, which `papayya dev` stopped
+# creating; it was never registered on the `runs` group, so no user could reach
+# it; and its own comment called the cloud equivalent "the follow-up wiring".
+# That wiring is now `runs list` below, over GET /v2/runs. Keeping a retained
+# body for a discontinued surface meant two functions named runs_list, one
+# shadowing the other, and two tests exercising the unreachable one.
 
 # ---------------------------------------------------------------------------
 # items — hosted per-item inspection (the pre-0.3.0 `runs` verbs, renamed)
@@ -3107,6 +3053,59 @@ def _echo_run_verdict(run: dict[str, Any]) -> None:
         click.echo(f"Run {status}, but its worst step outcome was {worst}.")
 
 
+def _echo_submission_status(api: "APIClient", run_id: str,
+                            *, original: Exception) -> None:
+    """Render a SUBMISSION's rollup for an id the item surface did not know.
+
+    Re-raises the original 404 when this surface does not know it either: an id
+    that is neither an item nor a submission is a typo, and inventing a second
+    error for it would bury the first.
+    """
+    run = api.get_run_v2(run_id)
+    if run is None:
+        raise original
+
+    items = f"{run.get('item_count', 0)}"
+    failed = run.get("failed_count") or 0
+    click.echo(f"Run:     {run.get('id') or run_id}")
+    click.echo(f"Agent:   {run.get('agent') or '?'}")
+    click.echo(f"Status:  {run.get('status', 'unknown')}"
+               + (f"  ({failed} of {items} item(s) failed)" if failed else ""))
+
+    worst = run.get("worst_outcome_status")
+    degraded = run.get("degraded_count") or 0
+    if (worst and worst != "ok") or degraded:
+        click.echo(f"Outcome: {worst or 'ok'}"
+                   + (f" ({degraded} degraded step(s))" if degraded else ""))
+
+    click.echo(f"Items:   {items}"
+               + (f" — {run.get('queued_count', 0)} queued, "
+                  f"{run.get('running_count', 0)} running, "
+                  f"{run.get('completed_count', 0)} completed"
+                  if run.get("status") not in ("completed",) else ""))
+    click.echo(f"Cost:    {_fmt_run_cost(run)}")
+    click.echo(f"\nItems in this run:  papayya items list")
+
+
+def _fmt_run_cost(run: dict[str, Any]) -> str:
+    """A RUN's cost, which is a SUM and so has its own unpriced rule.
+
+    ``cost_priced`` is a property of ONE record; a run is many, and its
+    run-grain equivalent is ``unpriced_item_count``. The reading is asymmetric,
+    and matches ``formatRunCost`` in the dashboard so the two surfaces cannot
+    disagree about the same run: with SOME items unpriced the sum is a real
+    lower bound worth showing beside what it is missing, and with EVERY item
+    unpriced it bounds nothing, so leading with a number would be the
+    free-vs-unpriced confusion one level up (plan 51).
+    """
+    unpriced = run.get("unpriced_item_count") or 0
+    total = run.get("item_count") or 0
+    if unpriced and unpriced >= total:
+        return "—"
+    rendered = _fmt_usd(run.get("cost_usd") or 0)
+    return f"{rendered}*" if unpriced else rendered
+
+
 @main.command()
 @click.argument("run_id")
 @click.pass_context
@@ -3124,7 +3123,19 @@ def status(ctx: click.Context, run_id: str) -> None:
     # which no response has ever carried either, so they printed a confident
     # `Step: 0` / `Cost: 0 cents` for four months.
     try:
-        result = api.get_run(run_id)
+        try:
+            result = api.get_run(run_id)
+        except PapayyaAPIError as e:
+            # An id the customer holds is just an id. `runs submit` returns a
+            # GROUP id and `run` returns an ITEM id, and they live on different
+            # surfaces — /v2/runs/{id} and /v1/durable/runs/{id} — so this
+            # command used to 404 on half the ids the product had handed out
+            # (plan 48 W6's second half). Nobody should have to know which noun
+            # they were given to ask how it went.
+            if getattr(e, "status", None) != 404:
+                raise
+            _echo_submission_status(api, run_id, original=e)
+            return
         agent = result.get("agent") or "?"
         version = result.get("agent_version")
         click.echo(f"Run:     {result.get('run_id') or run_id}")
@@ -3513,6 +3524,92 @@ def _iter_jsonl_items(path: str) -> Iterator[dict[str, Any]]:
                 sys.exit(1)
 
 
+def _ago(iso: str | None) -> str:
+    """A timestamp as "3m ago", the way a person reads a list.
+
+    Absolute times are the right thing on ONE record's page, where the question
+    is "when exactly"; in a list the question is "which of these is recent",
+    and 14 identical date prefixes answer it worse than a relative offset does.
+    """
+    if not iso:
+        return "—"
+    from datetime import datetime, timezone
+
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    seconds = (datetime.now(timezone.utc) - when).total_seconds()
+    if seconds < 0:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return f"{int(seconds)}s ago"
+
+
+@runs.command("list")
+@click.option("--agent", "agent_slug", default=None,
+              help="Only this agent's runs (slug, e.g. `triage`).")
+@click.option("--limit", type=int, default=20, show_default=True,
+              help="How many runs to show, newest first.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="NDJSON instead of a table — one run per line, for jq.")
+@click.pass_context
+def runs_list(ctx: click.Context, agent_slug: str | None, limit: int,
+              as_json: bool) -> None:
+    """List your runs, newest first.
+
+    The answer to "what have I run?". Until now the CLI had none: `items list`
+    prints per-record NDJSON, and `status` / `logs` both need a run id you had
+    to keep — so losing the id `papayya run` printed left no way back to your
+    own work (plan 52 G1).
+    """
+    client = _make_papayya_client(ctx)
+    try:
+        runs_ = client.runs.list(agent=agent_slug, limit=limit)
+    except PapayyaAPIError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    finally:
+        client.close()
+
+    if as_json:
+        for r in runs_:
+            click.echo(json.dumps(r))
+        return
+
+    if not runs_:
+        click.echo(
+            f"No runs yet{f' for agent {agent_slug}' if agent_slug else ''}."
+        )
+        click.echo("  Submit one with `papayya run <agent> \"<input>\"` or "
+                   "`papayya runs submit --agent <id> --file items.jsonl`.")
+        return
+
+    click.echo(f"{'RUN':<38} {'AGENT':<16} {'STATUS':<10} "
+               f"{'ITEMS':>12} {'COST':>12}  STARTED")
+    for r in runs_:
+        items = f"{r.get('item_count', 0)}"
+        failed = r.get("failed_count") or 0
+        if failed:
+            items += f" ({failed} failed)"
+        click.echo(
+            f"{r.get('id', '?'):<38} {(r.get('agent') or '?'):<16} "
+            f"{(r.get('status') or '?'):<10} {items:>12} "
+            f"{_fmt_run_cost(r):>12}  {_ago(r.get('created_at'))}"
+        )
+
+    # A list that silently stops at its cap answers "what have I run" with a
+    # subset and looks like the whole. Say so, and say what to type.
+    if len(runs_) >= limit:
+        click.echo(
+            f"\n(showing the newest {limit} — there may be more; "
+            f"pass --limit)",
+            err=True,
+        )
+
+
 @runs.command("submit")
 @click.option("--agent", "agent_id", required=True, help="Agent ID to run each item against")
 @click.option("--file", "file_path", required=True, type=click.Path(exists=False), help="JSONL file — one item per line, e.g. {\"input\": ..., \"metadata\"?: ...}")
@@ -3557,13 +3654,23 @@ def runs_submit(
     finally:
         client.close()
 
-    click.echo(f"Run submitted: {result.get('id', '?')}")
+    # `group_id`, which is what POST /v1/batches returns and what every read
+    # surface addresses this submission by — GET /v2/runs/{id}, `papayya
+    # status`, `papayya logs`. Reading `id` with a '?' default printed
+    # "Run submitted: ?" on every successful submission there has ever been,
+    # destroying the only handle to the work at the moment it was created
+    # (plan 47 S6). The fallbacks are ordered oldest-wire-last, and there is no
+    # '?': a submission with no id is a bug worth seeing, not a shrug.
+    run_id = result.get("group_id") or result.get("run_id") or result.get("id")
+    click.echo(f"Run submitted: {run_id}")
     status_val = result.get("status")
     if status_val:
         click.echo(f"  Status: {status_val}")
     total = result.get("total_items")
     if total is not None:
         click.echo(f"  Items:  {total}")
+    if run_id:
+        click.echo(f"\nNext:\n  papayya status {run_id}\n  papayya runs list")
 
 
 # Deprecated alias (Plan 34: batch → run): `papayya batch submit` keeps

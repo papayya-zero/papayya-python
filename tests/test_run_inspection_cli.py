@@ -60,11 +60,32 @@ STEP_OK = {
 }
 
 
+RUN_V2 = {
+    "id": "ff32b881-a40c-42ba-8c2a-a93f4ecd7ab1",
+    "agent": "hello",
+    "status": "completed",
+    "item_count": 5,
+    "failed_count": 0,
+    "queued_count": 0,
+    "running_count": 0,
+    "completed_count": 5,
+    "worst_outcome_status": "ok",
+    "degraded_count": 0,
+    "cost_usd": 1.995,
+    "unpriced_item_count": 0,
+}
+
+
 class _FakeAPI:
-    def __init__(self, run: dict[str, Any] | Exception, steps: list[dict[str, Any]]):
+    def __init__(self, run: dict[str, Any] | Exception, steps: list[dict[str, Any]],
+                 run_v2: dict[str, Any] | None = None):
         self._run = run
         self._steps = steps
+        self._run_v2 = run_v2
         self.closed = False
+
+    def get_run_v2(self, run_id: str) -> dict[str, Any] | None:
+        return self._run_v2
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         if isinstance(self._run, Exception):
@@ -84,8 +105,8 @@ def _key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PAPAYYA_ENV", raising=False)
 
 
-def _run_cli(monkeypatch, argv, *, run=RUN_OK, steps=()):
-    fake = _FakeAPI(run, list(steps))
+def _run_cli(monkeypatch, argv, *, run=RUN_OK, steps=(), run_v2=None):
+    fake = _FakeAPI(run, list(steps), run_v2)
     monkeypatch.setattr(cli_module, "APIClient", lambda _config: fake)
     return CliRunner().invoke(main, argv), fake
 
@@ -229,3 +250,58 @@ def test_sub_cent_costs_are_not_rounded_to_zero():
     assert _fmt_usd(0.000034) == "$0.000034"
     assert _fmt_usd(0) == "$0.00"
     assert _fmt_usd(12.5) == "$12.50"
+
+
+# --- one id, two nouns ------------------------------------------------- #
+#
+# `runs submit` returns a GROUP id and `run` returns an ITEM id. They live on
+# different surfaces (/v2/runs/{id} vs /v1/durable/runs/{id}), so `status`
+# 404'd on half the ids the product itself had handed out — including the one
+# printed directly above the line telling the user what to run next (plan 48
+# W6's second half).
+
+
+def test_status_falls_back_to_the_submission_for_a_group_id(monkeypatch):
+    from papayya.api import PapayyaAPIError
+
+    result, _ = _run_cli(monkeypatch, ["status", RUN_V2["id"]],
+                         run=PapayyaAPIError(404, "durable run not found"),
+                         run_v2=RUN_V2)
+
+    assert result.exit_code == 0, result.output
+    assert RUN_V2["id"] in result.output
+    assert "hello" in result.output
+    assert "5" in result.output
+
+
+def test_status_reports_a_submissions_failures(monkeypatch):
+    from papayya.api import PapayyaAPIError
+
+    result, _ = _run_cli(monkeypatch, ["status", RUN_V2["id"]],
+                         run=PapayyaAPIError(404, "not found"),
+                         run_v2={**RUN_V2, "status": "failed", "failed_count": 2})
+
+    assert "2 of 5 item(s) failed" in result.output
+
+
+def test_status_on_an_id_that_is_neither_keeps_the_original_404(monkeypatch):
+    """A typo is a typo. Inventing a second error for it would bury the first."""
+    from papayya.api import PapayyaAPIError
+
+    result, _ = _run_cli(monkeypatch, ["status", "00000000-0000-0000-0000-000000000000"],
+                         run=PapayyaAPIError(404, "durable run not found"),
+                         run_v2=None)
+
+    assert result.exit_code != 0
+    assert "404" in str(result.output) + str(result.exception)
+
+
+def test_status_does_not_swallow_a_non_404_from_the_item_surface(monkeypatch):
+    """Only a 404 means "wrong noun". A 500 is a 500."""
+    from papayya.api import PapayyaAPIError
+
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]],
+                         run=PapayyaAPIError(500, "boom"), run_v2=RUN_V2)
+
+    assert result.exit_code != 0
+    assert "500" in str(result.output) + str(result.exception)

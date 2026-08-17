@@ -35,6 +35,30 @@ class Runs:
     def __init__(self, api: APIClient) -> None:
         self._api = api
 
+    def list(
+        self,
+        *,
+        agent: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List this project's runs (invocations), newest first.
+
+        The answer to "what have I run?", which had no client until plan 52 G1:
+        ``items.list`` returns per-ITEM records as NDJSON and both ``status``
+        and ``logs`` need a run id the caller had to keep, so a user who lost
+        the id ``papayya run`` printed had no way back to their own work.
+
+        ``agent`` narrows to one slug; omitted means every agent, which is the
+        question as usually asked.
+        """
+        query = []
+        if agent:
+            query.append(f"agent={agent}")
+        if limit is not None:
+            query.append(f"limit={limit}")
+        suffix = ("?" + "&".join(query)) if query else ""
+        return self._api._request("GET", f"/v2/runs{suffix}")
+
     def create(
         self,
         agent_id: str,
