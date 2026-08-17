@@ -212,6 +212,59 @@ def _await_ready(api: APIClient, deployment_id: str) -> tuple[str, str]:
         time.sleep(_DEPLOY_POLL_SECONDS)
 
 
+def _preflight_dependencies(project_dir: str) -> None:
+    """Fail the deploy if the bundle needs something the pool cannot import.
+
+    ADR 0010. The managed worker pool carries a fixed dependency set and never
+    pip-installs a bundle, so a `requirements.txt` naming anything outside that
+    set is a run that will die on `import` — which is what plan 47 S2 recorded:
+    ModuleNotFoundError on item 1 of 200, after deploy had said success.
+
+    Deploy-time and named beats runtime and mysterious. Escape hatch for an
+    import that is genuinely conditional (`try: import pandas except: ...`),
+    because we are reading a manifest, not the code.
+    """
+    import os
+
+    from papayya.runtime.baked_deps import baked_distributions, unsupported_requirements
+
+    manifest = Path(project_dir) / "requirements.txt"
+    if not manifest.is_file():
+        return
+    try:
+        unsupported = unsupported_requirements(manifest.read_text(encoding="utf-8"))
+    except OSError:
+        return  # unreadable manifest is the bundler's problem, not the gate's
+    if not unsupported:
+        return
+
+    if os.getenv("PAPAYYA_SKIP_DEP_PREFLIGHT") == "1":
+        click.echo(
+            "  Warning: requirements the hosted runtime does not carry "
+            f"({', '.join(unsupported)}) — preflight skipped, imports may fail at run time.",
+            err=True,
+        )
+        return
+
+    available = baked_distributions() or set()
+    click.echo("", err=True)
+    click.echo(
+        "Error: this bundle declares dependencies the hosted runtime does not carry:",
+        err=True,
+    )
+    for line in unsupported:
+        click.echo(f"  {line}", err=True)
+    click.echo(
+        "\nThe managed worker pool ships: "
+        + ", ".join(sorted(available))
+        + "\n(plus the Python standard library). Per-bundle dependency"
+        "\ninstallation is not available yet — see ADR 0010."
+        "\n\nIf the import is conditional, re-run with PAPAYYA_SKIP_DEP_PREFLIGHT=1.",
+        err=True,
+    )
+    sys.exit(1)
+
+
 def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
     """Look up an agent by slug in the project, or create it. Returns agent ID."""
     slug = reg.name.lower().replace(" ", "-")
@@ -659,6 +712,8 @@ def deploy(
         click.echo(f"Bundling project from {project_dir}...")
         tarball, sha256 = bundle_project(project_dir, entrypoint=entrypoint)
         click.echo(f"  Archive: {len(tarball)} bytes (SHA256: {sha256[:16]}...)")
+
+        _preflight_dependencies(project_dir)
 
         # Resolve project ID for agent lookup/create
         if not project_id:

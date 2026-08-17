@@ -59,6 +59,25 @@ otel = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
 ]
+# The dependency set the HOSTED WORKER POOL carries (ADR 0010). This extra is
+# the single source of truth for two things that must not drift:
+#
+#   1. runtime-images/python-bootstrap/Dockerfile installs it, so the worker
+#      can import these without a per-bundle pip step.
+#   2. `papayya deploy` reads it back out of installed package metadata to
+#      preflight a bundle's requirements.txt, so a dependency the pool does
+#      not carry fails the DEPLOY with a named list rather than item 1 of 200
+#      with ModuleNotFoundError.
+#
+# Not installed by `pip install papayya` — a customer's own machine already has
+# whatever their agent imports. Adding a name here means rebuilding the worker
+# image and rolling the pool; that friction is the point, and it is why
+# per-bundle installation is the eventual answer (ADR 0010 § 4, § 7).
+runtime = [
+    "openai>=1.0",
+    "anthropic>=0.40",
+    "tiktoken>=0.7",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
