@@ -494,3 +494,70 @@ def test_help_states_the_api_spend_caveat():
     result = CliRunner().invoke(cli_module.main, ["verify", "--help"])
     assert result.exit_code == 0
     assert "does NOT stop YOUR function" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Plan 48 R4: the CI gate could not fail on the commonest class of failure
+# ---------------------------------------------------------------------------
+#
+# A record that RAISED before its first checkpoint keeps the
+# worst_outcome_status='ok' it was born with while `status` says 'failed' — the
+# commonest way a first batch fails, and the exact shape plan 48 walked into.
+# `verify` read worst_outcome_status alone, so it called three crashed fixtures
+# healthy, printed `[ok -> ok] · 0 fixed` on the fix that repaired them, and
+# exited 0 under --strict, "the CI setting".
+#
+# The `status` these assert on was added to the fixture by plan 50 for this
+# call site, and nothing consumed it until now.
+
+
+def _crashed(**over):
+    """The fixture shape a pre-first-checkpoint crash produces."""
+    base = dict(status="failed", worst_outcome_status="ok",
+                error="KeyError: 'body'", error_category="customer_code")
+    base.update(over)
+    return _fx(**base)
+
+
+def test_a_repaired_crash_is_fixed_not_still_ok():
+    summary = verify_fixtures([_crashed()], handler=_handler([{"a": 1}]),
+                              strict=True)
+
+    verdicts = [r.verdict for r in summary.results]
+    assert verdicts == [FIXED], (
+        f"a crashed fixture that now succeeds is FIXED; got {verdicts}. "
+        "Reading worst_outcome_status alone reports STILL_OK — the fix that "
+        "repaired it credited with fixing nothing."
+    )
+
+
+def test_a_crash_that_still_crashes_fails_the_gate():
+    """The half that matters for CI: exit non-zero on a fix that didn't."""
+    summary = verify_fixtures([_crashed()], handler=_handler(KeyError("body")),
+                              strict=True)
+
+    assert [r.verdict for r in summary.results] == [STILL_NOT_OK]
+    assert not summary.ok, (
+        "verify --strict must fail on a fix that did not repair the crash; "
+        "it exited 0 on this for as long as the verdict came from the wrong "
+        "column"
+    )
+
+
+def test_the_recorded_side_of_the_transition_says_failed():
+    """`[ok -> ok]` on a crashed record was the printed form of the defect."""
+    summary = verify_fixtures([_crashed()], handler=_handler([{"a": 1}]),
+                              strict=True)
+
+    assert summary.results[0].recorded_status == "failed"
+
+
+def test_a_genuinely_healthy_record_is_still_ok():
+    """The guard on the fix: a record that really was ok must not read as a
+    crash just because both columns are now consulted."""
+    summary = verify_fixtures(
+        [_fx(status="completed", worst_outcome_status="ok")],
+        handler=_handler([{"a": 1}]), strict=True)
+
+    assert [r.verdict for r in summary.results] == [STILL_OK]
+    assert summary.ok

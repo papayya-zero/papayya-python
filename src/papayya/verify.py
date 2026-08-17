@@ -57,6 +57,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from papayya.cohort_diff import record_verdict
 from papayya.fixtures import (
     INPUT_FROM_FIRST_CHECKPOINT,
     INPUT_MISSING,
@@ -340,7 +341,7 @@ def _run_one(
         item_id=fx.item_id,
         agent=fx.agent,
         verdict=STILL_NOT_OK,
-        recorded_status=fx.worst_outcome_status,
+        recorded_status=record_verdict(fx.status, fx.worst_outcome_status),
         input_source=fx.input_source,
         recorded_agent_version=fx.agent_version,
     )
@@ -444,7 +445,18 @@ def _run_one(
         )
         return result
 
-    was_ok = fx.worst_outcome_status == "ok"
+    # The recorded verdict comes from BOTH columns, through the one definition
+    # that collapses them (plan 48 R5). Reading worst_outcome_status alone was
+    # plan 48 R4: a record that raised before its first checkpoint keeps the
+    # 'ok' it was born with, so `verify` called three crashed fixtures healthy,
+    # reported `[ok -> ok] · 0 fixed` on the fix that repaired them, and exited
+    # 0 — under --strict, "the CI setting". A gate that cannot fail on the
+    # commonest class of failure is worse than no gate, because it is quoted as
+    # evidence.
+    #
+    # The `status` this reads was added to the fixture by plan 50 for exactly
+    # this call site, and until now nothing consumed it.
+    was_ok = record_verdict(fx.status, fx.worst_outcome_status) == "ok"
     now_ok = new_status == "ok" and result.raised is None
     if was_ok:
         result.verdict = STILL_OK if now_ok else NEWLY_BROKEN
@@ -533,7 +545,7 @@ def verify_fixtures(
                     item_id=fx.item_id,
                     agent=fx.agent,
                     verdict=SKIPPED_NO_INPUT,
-                    recorded_status=fx.worst_outcome_status,
+                    recorded_status=record_verdict(fx.status, fx.worst_outcome_status),
                     input_source=fx.input_source,
                     recorded_agent_version=fx.agent_version,
                     note="no input was recorded for this record; it is kept "
@@ -559,7 +571,7 @@ def verify_fixtures(
                     item_id=fx.item_id,
                     agent=fx.agent,
                     verdict=UNRESOLVED_AGENT,
-                    recorded_status=fx.worst_outcome_status,
+                    recorded_status=record_verdict(fx.status, fx.worst_outcome_status),
                     input_source=fx.input_source,
                     recorded_agent_version=fx.agent_version,
                     note=f"no @agent named {fx.agent!r} in the module. "
