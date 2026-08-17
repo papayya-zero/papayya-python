@@ -19,6 +19,7 @@ from __future__ import annotations
 import time as _t
 
 from papayya.bundler import bundle_project
+from papayya.runtime._bundle_cache import LOCAL_SCOPE
 
 from ._bundle_server import FakeBundleServer
 from ._dispatcher import FakeDispatcher
@@ -152,13 +153,15 @@ def test_worker_holds_two_versions_resident(
             assert ("enrich", 1) in bundle_server.calls
             assert ("enrich", 2) in bundle_server.calls
 
-            # Both extracted on disk under the slug-keyed cache layout.
-            assert (cache_root / "enrich" / "v1" / "agent.py").exists()
-            assert (cache_root / "enrich" / "v2" / "agent.py").exists()
+            # Both extracted on disk under the account-partitioned
+                # layout (plan 47 S1). These leases carry no account_id,
+                # so they land under LOCAL_SCOPE.
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v1" / "agent.py").exists()
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v2" / "agent.py").exists()
             # And both expose the helpers sibling that the entrypoint
             # imported — proves the MetaPathFinder did not collapse them.
-            assert (cache_root / "enrich" / "v1" / "helpers.py").exists()
-            assert (cache_root / "enrich" / "v2" / "helpers.py").exists()
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v1" / "helpers.py").exists()
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v2" / "helpers.py").exists()
         finally:
             dispatcher.shutdown()
     finally:

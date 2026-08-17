@@ -9,10 +9,19 @@ whichever was imported first wins forever.
 
 This module fixes that by routing top-level imports made *during* a
 bundle's execution through a custom ``MetaPathFinder``. The finder is
-keyed by version; activation is scoped via a ContextVar so the worker
-controls when a particular bundle's imports take effect (during
-``exec_module`` of the entrypoint, and during ``_handle_lease`` calls
-on the registered fn).
+keyed by an opaque **residency token**; activation is scoped via a
+ContextVar so the worker controls when a particular bundle's imports
+take effect (during ``exec_module`` of the entrypoint, and during
+``_handle_lease`` calls on the registered fn).
+
+The token is opaque here on purpose — this module only needs it to be
+distinct per resident bundle root. The worker builds it from
+``(account_scope, agent_version)`` (``worker._residency_token``), because
+a bare version collides across accounts on a shared worker: two
+customers deploying v1 would share one registered root and one
+customer's ``from helpers import x`` would resolve into the other's
+bundle (plan 47 S1). Parameters are still named ``version`` for
+backward compatibility with existing callers and tests.
 
 Concurrency contract:
     The worker is single-threaded for lease execution. The heartbeat

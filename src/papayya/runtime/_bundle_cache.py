@@ -18,18 +18,34 @@ Concurrency contract:
 
 Cache layout:
     <root>/
-      <agent_slug>/
-        v<N>/                             ← stable, returned to caller
-        v<N>.partial-<uuid>/              ← in-flight extraction
-        v<N>.lock                         ← flock target
+      <account_id>/                       ← tenancy boundary (plan 47 S1)
+        <agent_slug>/
+          v<N>/                           ← stable, returned to caller
+          v<N>.partial-<uuid>/            ← in-flight extraction
+          v<N>.lock                       ← flock target
 
-ADR-0003 § 2 specifies ``<root>/<account_id>/<agent_id>/v<N>/`` —
-slice 2 deviates and uses the agent slug as the middle key because
-the worker is project-scoped (one API key, one project) and only
-learns ``account_id`` / ``agent_id`` after fetching from the bundle
-endpoint. Re-keying the cache after the network round-trip would
-mean every cache hit pays an HTTP HEAD to discover the path. Slice
-D (multi-tenant ECS workers) will revisit when shared workers land.
+**Why the account is the leading component.** Slice 2 shipped
+``<root>/<agent_slug>/v<N>/`` as a documented deviation from ADR-0003
+§ 2, justified by "the worker is project-scoped and only learns
+``account_id`` after fetching", with the re-key deferred to slice D
+"when shared multi-tenant workers land". Plan 47 S1 found both halves
+had since expired:
+
+  - Shared workers landed. A platform worker authenticated with
+    ``PAPAYYA_PLATFORM_WORKER_KEY`` leases across accounts, so two
+    accounts deploying the same slug at the same version collided on
+    one cache entry — and one account's code executed against the
+    other's items. The cache-hit path returns *before* ``fetch()``, so
+    it also bypasses the bundle endpoint's cross-account check.
+  - The worker now knows the account before the fetch.
+    ``Lease.account_id`` rides the lease wire, and platform-principal
+    bundle fetches already *require* ``?account=``. The re-key no
+    longer costs the HTTP HEAD that justified deferring it.
+
+``account_id`` is therefore required. Callers without one (local dev,
+``LocalDispatcher``, which never sets it) pass ``LOCAL_SCOPE``, keeping
+single-tenant behaviour on a partition that can never alias a real
+account id.
 
 The default ``root`` is ``~/.papayya/bundles/``. ECS sets
 ``PAPAYYA_BUNDLE_CACHE_ROOT`` to ``/var/cache/papayya/bundles/`` (Slice
@@ -58,6 +74,12 @@ log = logging.getLogger("papayya.runtime.bundle_cache")
 # filesystem of the developer running the suite.
 _DEFAULT_ROOT = Path.home() / ".papayya" / "bundles"
 
+# Partition used when no account id is available — local dev and
+# ``LocalDispatcher``, which never populate ``Lease.account_id``. The
+# leading underscore cannot collide with a real account id (UUIDs), so a
+# local bundle can never be served to a hosted lease or vice versa.
+LOCAL_SCOPE = "_local"
+
 
 def _resolve_root() -> Path:
     """Return the cache root, honouring ``PAPAYYA_BUNDLE_CACHE_ROOT``."""
@@ -65,6 +87,25 @@ def _resolve_root() -> Path:
     if raw:
         return Path(raw).expanduser()
     return _DEFAULT_ROOT
+
+
+def _safe_key_component(value: str, *, field: str) -> str:
+    """Reject cache-key components that could escape their partition.
+
+    ``account_id`` and ``agent_slug`` are both interpolated into a
+    filesystem path. Neither is attacker-controlled today (the account
+    id is a server-issued UUID, the slug is server-generated), but a
+    slug containing ``..`` or a separator would let one account's bundle
+    land inside another's subtree — defeating the very partition this
+    module exists to enforce. The guard is one comparison on a path
+    already being built; the failure it prevents is silent cross-tenant
+    execution.
+    """
+    if not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    if value in (".", "..") or "/" in value or "\\" in value or "\0" in value:
+        raise ValueError(f"{field} must not contain path separators: {value!r}")
+    return value
 
 
 @dataclass
@@ -136,6 +177,7 @@ class FetchedBundle:
 
 def ensure_bundle(
     *,
+    account_id: str,
     agent_slug: str,
     version: int,
     fetch: Callable[[], FetchedBundle],
@@ -145,8 +187,8 @@ def ensure_bundle(
 
     On hit: short-circuit. On miss: call ``fetch()`` to obtain bytes,
     verify SHA256 against the server-supplied ETag (if any), extract
-    under ``<root>/<agent_slug>/v<N>.partial-<uuid>/``, then atomically
-    rename to ``v<N>/``.
+    under ``<root>/<account_id>/<agent_slug>/v<N>.partial-<uuid>/``, then
+    atomically rename to ``v<N>/``.
 
     Concurrency: a per-tuple file lock (``v<N>.lock``) serializes the
     extract+rename so two workers on the same host don't both produce
@@ -155,9 +197,13 @@ def ensure_bundle(
     is atomic on POSIX, so seeing the directory is sufficient).
 
     Args:
-        agent_slug: Agent slug from the lease (``Lease.agent``). One
-            slug → one cache subtree per worker; the worker is
-            project-scoped so slug uniqueness holds.
+        account_id: Owning account (``Lease.account_id``). The leading
+            key component, so two accounts deploying the same slug at
+            the same version get distinct entries — see the module
+            docstring and plan 47 S1. Pass :data:`LOCAL_SCOPE` when
+            there is no account (local dev / ``LocalDispatcher``).
+        agent_slug: Agent slug from the lease (``Lease.agent``). Unique
+            *within* an account, which is all the cache now assumes.
         version: Integer deployment version.
         fetch: Zero-arg callable returning the freshly-fetched
             ``FetchedBundle``. Only invoked on cache miss; receiver
@@ -168,6 +214,8 @@ def ensure_bundle(
         Resolved ``BundleEntry`` pointing at the on-disk extraction.
 
     Raises:
+        ValueError: version below 1, or an account/slug containing path
+            separators (which would escape the account partition).
         BundleVerificationError: SHA256 mismatch.
         OSError: filesystem permission / disk-full failures bubble up.
         Anything ``fetch()`` raises bubbles unchanged.
@@ -175,7 +223,10 @@ def ensure_bundle(
     if version < 1:
         raise ValueError(f"version must be a positive integer, got {version}")
 
-    base = (root or _resolve_root()) / agent_slug
+    _safe_key_component(account_id, field="account_id")
+    _safe_key_component(agent_slug, field="agent_slug")
+
+    base = (root or _resolve_root()) / account_id / agent_slug
     final_path = base / f"v{version}"
     lock_path = base / f"v{version}.lock"
 
@@ -201,7 +252,7 @@ def ensure_bundle(
             actual = hashlib.sha256(fetched.tarball_bytes).hexdigest()
             if actual != fetched.artifact_hash:
                 raise BundleVerificationError(
-                    f"sha256 mismatch for {agent_slug}/v{version}: "
+                    f"sha256 mismatch for {account_id}/{agent_slug}/v{version}: "
                     f"expected {fetched.artifact_hash}, got {actual}"
                 )
 

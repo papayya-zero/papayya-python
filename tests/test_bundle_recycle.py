@@ -38,6 +38,12 @@ from papayya.runtime._bundle_cache import (
     FetchedBundle,
     _compute_dep_hash,
 )
+
+# Two distinct accounts. Every residency key leads with the account
+# (plan 47 S1), so these are what keep one customer's bundle out of
+# another's cache entry, sys.modules name and loader root.
+ACCT_A = "11111111-1111-4111-8111-111111111111"
+ACCT_B = "22222222-2222-4222-8222-222222222222"
 from papayya.runtime.worker import (
     Lease,
     Worker,
@@ -110,6 +116,7 @@ def test_ensure_bundle_writes_dep_hash_sidecar(tmp_path: Path) -> None:
     })
 
     entry = _bundle_cache.ensure_bundle(
+        account_id=ACCT_A,
         agent_slug="enrich",
         version=1,
         fetch=lambda: _fetched(tarball),
@@ -117,7 +124,7 @@ def test_ensure_bundle_writes_dep_hash_sidecar(tmp_path: Path) -> None:
     )
 
     assert entry.dep_hash == hashlib.sha256(b"openai==1.0\n").hexdigest()
-    sidecar = tmp_path / "enrich" / "v1" / ".papayya_dep_hash"
+    sidecar = tmp_path / ACCT_A / "enrich" / "v1" / ".papayya_dep_hash"
     assert sidecar.exists()
     assert sidecar.read_text(encoding="utf-8") == entry.dep_hash
 
@@ -128,6 +135,7 @@ def test_ensure_bundle_no_manifest_no_sidecar(tmp_path: Path) -> None:
     tarball = _make_tarball({"agent.py": b"# agent\n"})
 
     entry = _bundle_cache.ensure_bundle(
+        account_id=ACCT_A,
         agent_slug="enrich",
         version=1,
         fetch=lambda: _fetched(tarball),
@@ -135,7 +143,7 @@ def test_ensure_bundle_no_manifest_no_sidecar(tmp_path: Path) -> None:
     )
 
     assert entry.dep_hash is None
-    assert not (tmp_path / "enrich" / "v1" / ".papayya_dep_hash").exists()
+    assert not (tmp_path / ACCT_A / "enrich" / "v1" / ".papayya_dep_hash").exists()
 
 
 def test_entry_from_disk_reads_dep_hash_sidecar(tmp_path: Path) -> None:
@@ -149,6 +157,7 @@ def test_entry_from_disk_reads_dep_hash_sidecar(tmp_path: Path) -> None:
 
     # First call extracts + writes the sidecar.
     _bundle_cache.ensure_bundle(
+        account_id=ACCT_A,
         agent_slug="enrich",
         version=1,
         fetch=lambda: _fetched(tarball),
@@ -161,6 +170,7 @@ def test_entry_from_disk_reads_dep_hash_sidecar(tmp_path: Path) -> None:
         raise AssertionError("fetch should not run on cache hit")
 
     entry = _bundle_cache.ensure_bundle(
+        account_id=ACCT_A,
         agent_slug="enrich",
         version=1,
         fetch=_no_fetch,
@@ -198,7 +208,7 @@ def test_recycle_triggers_on_dep_hash_mismatch(
     """v1 resident with hash A; v2 fetch with hash B → ``_RecyclePending``
     raised, ``_recycle_pending`` set, ``_running`` cleared."""
     worker = _make_worker_for_recycle_test(monkeypatch)
-    worker._loaded_versions[("enrich", "1")] = _LoadedBundle(
+    worker._loaded_versions[(ACCT_A, "enrich", "1")] = _LoadedBundle(
         agent_name="enrich",
         agent_version="1",
         bundle_path=str(tmp_path / "v1"),
@@ -207,7 +217,7 @@ def test_recycle_triggers_on_dep_hash_mismatch(
     )
 
     # Stub ensure_bundle to return a v2 entry with a different dep_hash.
-    def _stub_ensure_bundle(*, agent_slug: str, version: int, fetch):
+    def _stub_ensure_bundle(*, account_id: str, agent_slug: str, version: int, fetch):
         return BundleEntry(
             path=tmp_path / "v2",
             agent_slug=agent_slug,
@@ -223,6 +233,7 @@ def test_recycle_triggers_on_dep_hash_mismatch(
         agent="enrich",
         item_id="co_42",
         agent_version="2",
+        account_id=ACCT_A,
     )
 
     with pytest.raises(_RecyclePending) as excinfo:
@@ -232,7 +243,7 @@ def test_recycle_triggers_on_dep_hash_mismatch(
     assert worker._recycle_pending is True
     assert worker._running is False
     # v2 must NOT have been added to the registry — load was aborted.
-    assert ("enrich", "2") not in worker._loaded_versions
+    assert (ACCT_A, "enrich", "2") not in worker._loaded_versions
 
 
 def test_recycle_skipped_when_dep_hash_matches(
@@ -243,7 +254,7 @@ def test_recycle_skipped_when_dep_hash_matches(
     recycle. The two versions co-resident, both in the registry."""
     worker = _make_worker_for_recycle_test(monkeypatch)
     same_hash = "cccc" * 16
-    worker._loaded_versions[("enrich", "1")] = _LoadedBundle(
+    worker._loaded_versions[(ACCT_A, "enrich", "1")] = _LoadedBundle(
         agent_name="enrich",
         agent_version="1",
         bundle_path=str(tmp_path / "v1"),
@@ -251,7 +262,7 @@ def test_recycle_skipped_when_dep_hash_matches(
         dep_hash=same_hash,
     )
 
-    def _stub_ensure_bundle(*, agent_slug: str, version: int, fetch):
+    def _stub_ensure_bundle(*, account_id: str, agent_slug: str, version: int, fetch):
         return BundleEntry(
             path=tmp_path / "v2",
             agent_slug=agent_slug,
@@ -274,6 +285,7 @@ def test_recycle_skipped_when_dep_hash_matches(
         agent="enrich",
         item_id="co_42",
         agent_version="2",
+        account_id=ACCT_A,
     )
 
     worker._ensure_loaded(lease)
@@ -281,8 +293,8 @@ def test_recycle_skipped_when_dep_hash_matches(
     assert worker._recycle_pending is False
     assert worker._running is True
     # v1 still resident, v2 added.
-    assert ("enrich", "1") in worker._loaded_versions
-    assert ("enrich", "2") in worker._loaded_versions
+    assert (ACCT_A, "enrich", "1") in worker._loaded_versions
+    assert (ACCT_A, "enrich", "2") in worker._loaded_versions
 
 
 def test_recycle_skipped_when_no_manifest_in_either_bundle(
@@ -292,7 +304,7 @@ def test_recycle_skipped_when_no_manifest_in_either_bundle(
     """No manifest = unknown deps; conservative behaviour is to NOT
     recycle. Single-file bundles (just ``agent.py``) hit this branch."""
     worker = _make_worker_for_recycle_test(monkeypatch)
-    worker._loaded_versions[("enrich", "1")] = _LoadedBundle(
+    worker._loaded_versions[(ACCT_A, "enrich", "1")] = _LoadedBundle(
         agent_name="enrich",
         agent_version="1",
         bundle_path=str(tmp_path / "v1"),
@@ -300,7 +312,7 @@ def test_recycle_skipped_when_no_manifest_in_either_bundle(
         dep_hash=None,
     )
 
-    def _stub_ensure_bundle(*, agent_slug: str, version: int, fetch):
+    def _stub_ensure_bundle(*, account_id: str, agent_slug: str, version: int, fetch):
         return BundleEntry(
             path=tmp_path / "v2",
             agent_slug=agent_slug,
@@ -321,6 +333,7 @@ def test_recycle_skipped_when_no_manifest_in_either_bundle(
         agent="enrich",
         item_id="co_42",
         agent_version="2",
+        account_id=ACCT_A,
     )
     worker._ensure_loaded(lease)
 

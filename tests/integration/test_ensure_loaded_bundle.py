@@ -24,6 +24,7 @@ from __future__ import annotations
 import time as _t
 
 from papayya.bundler import bundle_project
+from papayya.runtime._bundle_cache import LOCAL_SCOPE
 
 from ._bundle_server import FakeBundleServer
 from ._dispatcher import FakeDispatcher
@@ -132,8 +133,8 @@ def test_worker_fetches_bundle_and_completes(
             assert ("enrich", 1) in bundle_server.calls
 
             # Cache layout: <root>/<agent_slug>/v<N>/agent.py present.
-            assert (cache_root / "enrich" / "v1" / "agent.py").exists()
-            assert (cache_root / "enrich" / "v1" / ".papayya_entrypoint").read_text() == "agent.py"
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v1" / "agent.py").exists()
+            assert (cache_root / LOCAL_SCOPE / "enrich" / "v1" / ".papayya_entrypoint").read_text() == "agent.py"
 
             worker.stop(timeout=5.0)
             assert worker.exit_code == 0
@@ -194,7 +195,7 @@ def test_worker_reports_version_not_found_on_404(
 
             # Cache directory was never finalised — only the lock file
             # exists (or nothing at all). v9/ must not be present.
-            v9 = cache_root / "enrich" / "v9"
+            v9 = cache_root / LOCAL_SCOPE / "enrich" / "v9"
             assert not v9.is_dir(), f"v9 should not have been finalised, but {v9} exists"
 
             worker.stop(timeout=5.0)

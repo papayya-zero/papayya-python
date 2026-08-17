@@ -153,12 +153,51 @@ class _LoadedBundle:
     ``dep_hash`` carries forward from the bundle cache so
     ``_ensure_loaded`` can detect dep-graph changes without re-reading
     the on-disk sidecar on every miss (ADR-0003 § Worker #6).
+
+    ``registration`` is the ``@agent`` registration this bundle produced
+    at import time, snapshotted here rather than looked up at dispatch.
+    The module-level ``papayya.agent._registry`` is keyed
+    ``(name, version)`` with no account component — customer code cannot
+    know its account — so on a shared worker two accounts deploying the
+    same slug at the same version overwrite each other there. Holding
+    the registration per residency makes that collision unreachable for
+    hosted dispatch (plan 47 S1). ``None`` for the local /
+    ``LocalDispatcher`` path, which falls back to ``get_agent``.
     """
     agent_name: str
     agent_version: str
     bundle_path: str
     module_name: str
     dep_hash: str | None = None
+    registration: object | None = None
+
+
+def _lookup_registration(agent: str, version: str | None):
+    """``papayya.agent.get_agent`` behind a late import.
+
+    ``papayya.agent`` is imported lazily throughout this module to keep
+    worker boot free of the decorator machinery; this wrapper keeps that
+    property while letting ``_ensure_loaded`` snapshot a registration.
+    """
+    from papayya.agent import get_agent
+
+    return get_agent(agent, version)
+
+
+def _residency_token(account_scope: str, agent_version: str) -> str:
+    """Identifier-safe token naming one (account, version) residency.
+
+    Used as the ``sys.modules`` name suffix and as the bundle loader's
+    registration key, so both are partitioned per account rather than
+    per version alone (plan 47 S1).
+
+    Non-alphanumerics collapse to ``_`` because the token lands in a
+    module name. Account ids are UUIDs, which differ in their hex digits
+    and not only in punctuation, so the collapse cannot alias two
+    accounts onto one token.
+    """
+    safe = "".join(c if c.isalnum() else "_" for c in account_scope)
+    return f"{safe}__v{agent_version}"
 
 
 class _VersionNotFound(Exception):
@@ -330,7 +369,10 @@ class Worker:
         # at most one resident entry per (name, version) tuple — multi-
         # version dispatch is slice 3. Hot-path lookup avoids re-reading
         # the on-disk cache and re-importing the module on every lease.
-        self._loaded_versions: dict[tuple[str, str], "_LoadedBundle"] = {}
+        # Keyed (account_scope, agent_slug, agent_version) — the account
+        # leads because a shared platform worker serves many accounts and
+        # slug+version alone collides across them (plan 47 S1).
+        self._loaded_versions: dict[tuple[str, str, str], "_LoadedBundle"] = {}
         self._running = True
         now = time.monotonic()
         self._last_activity_at = now
@@ -478,14 +520,22 @@ class Worker:
         1. ``lease.agent_version is None`` — local-dev / legacy. The
            file-loaded module from ``--agent-module`` already populated
            the registry; no-op.
-        2. ``(agent, agent_version)`` already in ``self._loaded_versions``
-           — hot path. The earlier import already registered the
-           ``@agent``; no-op.
+        2. ``(account, agent, agent_version)`` already in
+           ``self._loaded_versions`` — hot path. The earlier import
+           already registered the ``@agent``; no-op.
         3. Cache miss. Fetch the tarball from the bundle endpoint,
            extract under the on-disk cache, build a ``ModuleSpec`` from
            the entrypoint, ``exec_module`` it (the ``@agent`` decorator
            re-registers under the agent's slug), record the bundle in
            ``self._loaded_versions``.
+
+        Every residency key leads with the account. A shared platform
+        worker leases across accounts, so ``(slug, version)`` alone
+        aliases two customers' bundles onto one entry — the collision
+        plan 47 S1 demonstrated, where one account's code ran against
+        another's items. The same scope flows into the on-disk cache
+        path, the ``sys.modules`` name, and the bundle loader's root
+        registration, so no layer can re-introduce it.
 
         Raises ``_VersionNotFound`` on 404 from the bundle endpoint;
         ``_handle_lease`` maps that to a categorised failure. Network /
@@ -494,7 +544,7 @@ class Worker:
         if lease.agent_version is None:
             return
 
-        key = (lease.agent, lease.agent_version)
+        key = self._residency_key(lease)
         if key in self._loaded_versions:
             return
 
@@ -505,6 +555,7 @@ class Worker:
 
         version_int = self._parse_version(lease.agent_version)
         bundle = _bundle_cache.ensure_bundle(
+            account_id=self._account_scope(lease),
             agent_slug=lease.agent,
             version=version_int,
             fetch=lambda: self._fetch_bundle(
@@ -524,11 +575,17 @@ class Worker:
         # a fresh worker. ``None`` on either side (no manifest in the
         # bundle) means we can't tell deps apart, so we proceed —
         # explicit absence is treated as "no dep change."
+        # Same account, same slug, different version. Scoping the search
+        # to the account matters in both directions: another account's
+        # resident v1 is not a *version* conflict with this one, so an
+        # unscoped search would fire a spurious recycle every time two
+        # customers happened to share a slug.
+        scope = self._account_scope(lease)
         prior = next(
             (
                 lb
-                for (slug, _v), lb in self._loaded_versions.items()
-                if slug == lease.agent and _v != lease.agent_version
+                for (acct, slug, _v), lb in self._loaded_versions.items()
+                if acct == scope and slug == lease.agent and _v != lease.agent_version
             ),
             None,
         )
@@ -558,14 +615,52 @@ class Worker:
             entrypoint=bundle.entrypoint or "agent.py",
             agent_name=lease.agent,
             agent_version=lease.agent_version,
+            account_scope=scope,
         )
+        # Snapshot the registration this import just produced. The global
+        # registry is keyed (name, version) with no account, so a later
+        # import by another account would overwrite it — dispatching from
+        # the snapshot keeps each residency pointed at its own code.
         self._loaded_versions[key] = _LoadedBundle(
             agent_name=lease.agent,
             agent_version=lease.agent_version,
             bundle_path=str(bundle.path),
             module_name=module_name,
             dep_hash=bundle.dep_hash,
+            registration=_lookup_registration(lease.agent, lease.agent_version),
         )
+
+    @staticmethod
+    def _account_scope(lease: "Lease") -> str:
+        """Account partition for every residency key derived from ``lease``.
+
+        ``Lease.account_id`` is populated on the hosted wire and absent
+        for ``LocalDispatcher``. Falling back to the reserved
+        ``LOCAL_SCOPE`` keeps single-tenant local dev on its own
+        partition, which cannot alias a real (UUID) account id.
+        """
+        from papayya.runtime._bundle_cache import LOCAL_SCOPE
+
+        return lease.account_id or LOCAL_SCOPE
+
+    def _residency_key(self, lease: "Lease") -> tuple[str, str, str]:
+        """``(account_scope, agent_slug, agent_version)`` for ``_loaded_versions``."""
+        return (
+            self._account_scope(lease),
+            lease.agent,
+            lease.agent_version or "",
+        )
+
+    def _activation_token(self, lease: "Lease") -> str | None:
+        """Bundle-loader key for this lease, or ``None`` for local dev.
+
+        Mirrors the token ``_import_bundle_module`` registered under, so
+        function-body imports during dispatch resolve against the bundle
+        root that was actually imported for this account and version.
+        """
+        if lease.agent_version is None:
+            return None
+        return _residency_token(self._account_scope(lease), lease.agent_version)
 
     @staticmethod
     def _parse_version(version: str) -> int:
@@ -652,6 +747,7 @@ class Worker:
         entrypoint: str,
         agent_name: str,
         agent_version: str,
+        account_scope: str,
     ) -> str:
         """exec_module the bundle's entrypoint; return the sys.modules key.
 
@@ -666,6 +762,16 @@ class Worker:
         identical ``_papayya_user_<stem>`` keys without the version
         suffix. Slice 2 namespaces the suffix so the warning fires only
         when an actual collision happens.
+
+        ``account_scope`` extends that namespace across tenants. The
+        version suffix alone is not enough on a shared worker: two
+        accounts deploying ``agent.py`` at v1 both produce
+        ``_papayya_user_agent__v1`` and the second silently overwrites
+        the first in ``sys.modules`` — the "already in sys.modules —
+        overwriting" warning observed in plan 47 S1. The same scope keys
+        the bundle loader's root registration, so a sibling
+        ``from helpers import x`` resolves within the right account's
+        bundle rather than whichever landed first.
         """
         entry_path = (bundle_path / entrypoint).resolve()
         if not entry_path.exists():
@@ -681,9 +787,10 @@ class Worker:
         # ``sys.modules``.
         from papayya.runtime import _bundle_loader
 
-        _bundle_loader.register_bundle(agent_version, bundle_path)
+        residency = _residency_token(account_scope, agent_version)
+        _bundle_loader.register_bundle(residency, bundle_path)
 
-        module_name = f"_papayya_user_{entry_path.stem}__v{agent_version}"
+        module_name = f"_papayya_user_{entry_path.stem}__{residency}"
         if module_name in sys.modules:
             log.warning(
                 "module name %s already in sys.modules — overwriting",
@@ -713,7 +820,7 @@ class Worker:
             # exec_module (e.g., the entrypoint's ``from helpers
             # import ...``) to this version's bundle root, so two
             # bundles' sibling files don't collide in sys.modules.
-            with _bundle_loader.activate(agent_version):
+            with _bundle_loader.activate(residency):
                 spec.loader.exec_module(module)
         finally:
             if prior_env is None:
@@ -1156,7 +1263,20 @@ class Worker:
             # None`` (LocalDispatcher) preserves single-resident
             # behaviour: ``get_agent`` returns the latest-registered
             # entry for the slug.
-            registration = get_agent(lease.agent, lease.agent_version)
+            #
+            # Hosted leases dispatch from the residency's own snapshot
+            # rather than the global registry. The registry is keyed
+            # (name, version) with no account — customer code cannot
+            # know its account — so on a shared worker the second
+            # account to import a shared slug overwrites the first's
+            # entry, and every later lease for *either* account would
+            # get the survivor's function (plan 47 S1).
+            resident = self._loaded_versions.get(self._residency_key(lease))
+            registration = (
+                resident.registration
+                if resident is not None and resident.registration is not None
+                else get_agent(lease.agent, lease.agent_version)
+            )
             if registration is None:
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 # ADR-0003 § Worker #5 — bootstrap workers have no
@@ -1326,11 +1446,11 @@ class Worker:
             prior_handler = signal.signal(signal.SIGALRM, _on_agent_alarm)
             signal.setitimer(signal.ITIMER_REAL, max_duration)
         try:
-            # Activate the version's bundle finder so function-body
+            # Activate this residency's bundle finder so function-body
             # imports (``def fn(): from helpers import x``) resolve
-            # against the right version's siblings. ``None`` is a
-            # no-op so local-dev / LocalDispatcher leases pay nothing.
-            with _bundle_loader.activate(lease.agent_version):
+            # against the right account+version's siblings. ``None`` is
+            # a no-op so local-dev / LocalDispatcher leases pay nothing.
+            with _bundle_loader.activate(self._activation_token(lease)):
                 result = fn(lease.agent_argument)
         except _AgentTimeout:
             duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -1441,8 +1561,8 @@ class Worker:
             # Same activate-scope rationale as the sync path; mirrored
             # here because ``asyncio.run`` runs the coroutine on a new
             # loop and we want imports inside it to see the right
-            # version's siblings.
-            with _bundle_loader.activate(lease.agent_version):
+            # account+version's siblings.
+            with _bundle_loader.activate(self._activation_token(lease)):
                 if max_duration is not None and max_duration > 0:
                     result = asyncio.run(asyncio.wait_for(coro, timeout=max_duration))
                 else:
