@@ -175,32 +175,41 @@ def _resolve_project_id(ctx_obj: dict) -> str | None:
     return _env_scope(ctx_obj).project_id
 
 
-_BUILD_POLL_SECONDS = 3
-_BUILD_TIMEOUT_SECONDS = 900
+_DEPLOY_POLL_SECONDS = 1
+_DEPLOY_TIMEOUT_SECONDS = 60
 
 
-def _await_build(api: APIClient, deployment_id: str) -> tuple[str, str]:
-    """Poll a deployment to a terminal state. Returns ``(state, detail)``.
+def _await_ready(api: APIClient, deployment_id: str) -> tuple[str, str]:
+    """Read a deployment's terminal state. Returns ``(state, detail)``.
 
-    ``state`` is "ready", "failed", or "timed out"; ``detail`` is the image ref
-    or the reason. BOUNDED — this was ``while True``, so a build wedged in
-    'building' hung the CLI with no exit but ^C.
+    A deployment is terminal the moment the row exists: the server writes
+    ``ready`` at creation, after the artifact upload has already returned, and
+    ``ready`` now means "the bundle endpoint can serve this version" — which is
+    the only property the worker actually tests at lease time.
+
+    This was ``_await_build``, polling every 3s for up to 15 minutes while an
+    async ``docker build`` ran server-side. That build's base image had been
+    deleted on purpose, so it always failed, every row said ``failed``, and
+    deploy exited 1 saying "was NOT deployed" about a bundle that was live
+    (plan 48 W2). Plan 49 deleted the build.
+
+    The loop is kept, short, because ``failed`` is still a legal value on rows
+    written before that change, and a first read can still race a slow write.
     """
-    deadline = time.monotonic() + _BUILD_TIMEOUT_SECONDS
+    deadline = time.monotonic() + _DEPLOY_TIMEOUT_SECONDS
     while True:
-        time.sleep(_BUILD_POLL_SECONDS)
         status = api.get_deployment(deployment_id)
         state = status.get("status", "unknown")
         if state == "ready":
-            return "ready", status.get("image_ref", "?")
+            return "ready", f"v{status.get('version', '?')}"
         if state == "failed":
             return "failed", status.get("error_message", "unknown error")
         if time.monotonic() >= deadline:
             return "timed out", (
-                f"still {state!r} after {_BUILD_TIMEOUT_SECONDS}s — "
-                f"check the build logs for deployment {deployment_id}"
+                f"still {state!r} after {_DEPLOY_TIMEOUT_SECONDS}s — "
+                f"deployment {deployment_id}"
             )
-        click.echo(f"  Status: {state}...")
+        time.sleep(_DEPLOY_POLL_SECONDS)
 
 
 def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
@@ -666,7 +675,7 @@ def deploy(
 
         # Deploy each agent; track slug -> agent_id for the reconciler.
         deployed: dict[str, str] = {}
-        failed_builds: list[tuple[str, str]] = []
+        failed_deploys: list[tuple[str, str]] = []
         for reg in agents:
             click.echo(f"\nDeploying {reg.name}...")
 
@@ -691,16 +700,13 @@ def deploy(
             click.echo(f"  Deployment ID: {deployment_id}")
             click.echo(f"  Version: {result.get('version', '?')}")
 
-            # Poll until build completes
-            click.echo("  Building container image...")
-            state, detail = _await_build(api, deployment_id)
+            state, detail = _await_ready(api, deployment_id)
             if state != "ready":
                 # NOT deployed: skip the success line and keep it out of
                 # `deployed`, so nothing downstream treats it as live.
-                click.echo(f"  Build {state}: {detail}", err=True)
-                failed_builds.append((reg.name, detail))
+                click.echo(f"  Deployment {state}: {detail}", err=True)
+                failed_deploys.append((reg.name, detail))
                 continue
-            click.echo(f"  Build complete! Image: {detail}")
 
             slug = reg.name.lower().replace(" ", "-")
             deployed[slug] = resolved_agent_id
@@ -712,10 +718,10 @@ def deploy(
         # never built, and the very next command contradicted it. Exiting
         # before the reconcile also avoids compounding a failed deploy by
         # mutating schedules and webhooks for a half-deployed bundle.
-        if failed_builds:
+        if failed_deploys:
             click.echo("", err=True)
-            for name, why in failed_builds:
-                # First line only. The full build log already went out above;
+            for name, why in failed_deploys:
+                # First line only. The full detail already went out above;
                 # repeating it whole buries the one sentence that matters.
                 headline = why.strip().splitlines()[0] if why.strip() else "unknown error"
                 click.echo(f"Error: {name} was NOT deployed — {headline}", err=True)
