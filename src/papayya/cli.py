@@ -1540,9 +1540,11 @@ def _echo_probe_proposals(
         # no word for what is wrong with this output — which is worth saying
         # plainly rather than dressing up as a failure to try.
         click.echo("No predicate fits this record.")
-        click.echo("  Nothing about its recorded output is expressible in the "
-                   "vocabulary this platform will commit to (missing, empty, "
-                   "short, truncated, or a verdict something already made).")
+        click.echo("  Nothing about it is expressible in the vocabulary this "
+                   "platform will commit to — how it broke (its error, or the "
+                   "category of it), or what one of its steps did (missing, "
+                   "empty, short, truncated, or a verdict something already "
+                   "made).")
     for p in proposals:
         click.echo(f"  {p.get('count'):>7,}  {p.get('why')}")
         click.echo(f"           papayya pull --probe {p.get('probe')}")
