@@ -165,10 +165,18 @@ class TestNonJsonNativePayloads:
         assert body["output"]["answer"] == "42"
         assert body["output"]["confidence"] == 0.9
 
-    def test_save_task_rejects_non_json_snapshot(self) -> None:
-        """Snapshots use strict=True to match SQLite's _encode_snapshot
-        contract — silent degradation to repr would poison the /item/:id
-        diff view."""
+    def test_save_task_rejects_a_snapshot_it_could_only_repr(self) -> None:
+        """Snapshots use strict=True because silent degradation to repr would
+        poison the /item/:id diff view.
+
+        Plan 53 S5: this used to hand it a SimpleNamespace and assert a raise —
+        but a SimpleNamespace has a __dict__ and stores as {"not_json": true},
+        which is not a degradation. The test was pinning the defect that made
+        `@papayya.llm`'s documented return shape crash after paying for the
+        model call. Only a genuinely unreadable object can degrade."""
+
+        class Opaque:
+            __slots__ = ()
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(201, json={})
@@ -179,10 +187,34 @@ class TestNonJsonNativePayloads:
             result={"ok": True},
             duration_ms=50,
             completed_at="2026-04-21T00:00:00+00:00",
-            input_snapshot=SimpleNamespace(not_json=True),
+            input_snapshot=Opaque(),
         )
         with pytest.raises(ValueError):
             store.save_task("r1", entry)
+
+    def test_save_task_stores_a_provider_response_snapshot(self) -> None:
+        """The shape `@papayya.llm` publishes, end to end through the wire."""
+        captured: dict = {}
+
+        class ChatCompletion:
+            def model_dump(self):
+                return {"id": "chatcmpl-x", "usage": {"prompt_tokens": 10}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(201, json={})
+
+        store = _make_store(handler)
+        entry = TaskEntry(
+            label="call_model",
+            result={"ok": True},
+            duration_ms=50,
+            completed_at="2026-04-21T00:00:00+00:00",
+            output_snapshot=ChatCompletion(),
+        )
+        store.save_task("r1", entry)
+
+        assert captured["body"]["output_snapshot"]["usage"]["prompt_tokens"] == 10
 
 
 class TestCreateSendsMetadataAndPartitionKey:

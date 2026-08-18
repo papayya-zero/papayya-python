@@ -124,9 +124,45 @@ def test_raising_model_dump_does_not_break_encoding():
     assert decoded == "Flaky()"
 
 
-def test_strict_mode_raises_on_non_serializable():
-    with pytest.raises(ValueError, match="JSON-encodable"):
-        encode_user_value(SimpleNamespace(x=1), strict=True)
+def test_strict_mode_raises_only_when_it_would_have_to_repr():
+    """Plan 53 S5. This asserted that `SimpleNamespace(x=1)` was REJECTED —
+    pinning the defect, because a SimpleNamespace has a __dict__ and stores as
+    {"x": 1}, which is not a degradation at all.
+
+    Strict's guarantee is that lineage never silently becomes
+    "<Thing object at 0x...>". Only an object the whole ladder cannot read a
+    shape from can do that."""
+
+    class Opaque:
+        __slots__ = ()  # no model_dump, no dict(), not a dataclass, no __dict__
+
+    with pytest.raises(ValueError, match="faithfully"):
+        encode_user_value(Opaque(), strict=True)
+
+
+def test_strict_mode_stores_a_structured_object_rather_than_refusing_it():
+    assert encode_user_value(SimpleNamespace(x=1), strict=True) == '{"x": 1}'
+
+
+def test_strict_mode_stores_a_provider_response_as_its_model_dump():
+    """THE CASE THIS COST. `@papayya.llm`'s own docstring publishes
+    `return client.messages.create(...)`, and strict raised on it from
+    save_task's output_snapshot — AFTER the model call had been paid for, on
+    the decorator whose job is capturing that spend."""
+
+    class ChatCompletion:
+        def model_dump(self):
+            return {"id": "chatcmpl-x", "choices": [{"message": {"content": "hi"}}]}
+
+    encoded = encode_user_value(ChatCompletion(), strict=True)
+    assert json.loads(encoded)["choices"][0]["message"]["content"] == "hi"
+
+
+def test_strict_mode_still_refuses_a_circular_reference():
+    circular: dict = {}
+    circular["self"] = circular
+    with pytest.raises(ValueError):
+        encode_user_value(circular, strict=True)
 
 
 def test_strict_mode_passes_through_serializable():
