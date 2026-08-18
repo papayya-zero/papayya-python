@@ -3140,7 +3140,24 @@ def status(ctx: click.Context, run_id: str) -> None:
         version = result.get("agent_version")
         click.echo(f"Run:     {result.get('run_id') or run_id}")
         click.echo(f"Agent:   {agent}" + (f" (v{version})" if version else ""))
-        click.echo(f"Status:  {result.get('status', 'unknown')}")
+        run_status = result.get("status", "unknown")
+        click.echo(f"Status:  {run_status}")
+
+        # HOW LONG it has been non-terminal, which is the whole of the question
+        # on a run that is not finished (plan 53 W3). `queued` on its own is a
+        # true statement that answers nothing: queued for four seconds is a
+        # healthy submission and queued for three days is a dead worker pool,
+        # and the word is identical in both. The server now keeps the status
+        # honest — a run whose item is waiting in the queue says `queued`
+        # rather than `running` — so this line is what turns that honesty into
+        # something a customer can act on.
+        #
+        # Terminal runs are excluded deliberately: "failed 3d ago" is a fact
+        # about the past that `runs list` already carries, and putting an age
+        # under every status would bury the one case where it is the signal.
+        if run_status in ("queued", "running", "paused"):
+            waited = _ago(result.get("created_at"))
+            click.echo(f"Waiting: {waited.removesuffix(' ago')} in {run_status}")
 
         # Why it failed, on the command whose whole job is to say how the run
         # is doing. The columns exist since plan 50; nothing was reading them.

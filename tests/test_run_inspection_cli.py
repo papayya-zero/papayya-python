@@ -160,6 +160,55 @@ def test_status_surfaces_a_completed_run_that_did_not_work(monkeypatch):
     assert "degraded" in result.output
 
 
+# Plan 53 W3. `queued` is a true statement that answers nothing on its own:
+# queued for four seconds is a healthy submission, queued for three days is a
+# dead worker pool, and the word is identical in both. These fixtures carry
+# `created_at` verbatim off the server body — the field the server has always
+# sent and this command never read.
+
+
+def test_status_says_how_long_a_queued_run_has_been_waiting(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    run = {**RUN_OK, "status": "queued", "created_at": long_ago}
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=run)
+
+    assert result.exit_code == 0, result.output
+    assert "Waiting:" in result.output
+    assert "3d" in result.output
+
+
+def test_status_does_not_age_a_terminal_run(monkeypatch):
+    """"failed 3d ago" is a fact about the past that `runs list` already
+    carries. An age under every status buries the one case where it is the
+    signal."""
+    from datetime import datetime, timedelta, timezone
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    run = {**RUN_OK, "status": "completed", "created_at": long_ago}
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=run)
+
+    assert "Waiting:" not in result.output
+
+
+def test_status_renders_an_abandoned_run_with_its_cause(monkeypatch):
+    """The sweeper's verdict has to reach the customer through the command
+    they already run. This body is what the store writes."""
+    run = {**RUN_OK, "status": "failed",
+           "error": "abandoned: no worker holds this run and it is in no queue, "
+                    "so nothing will move it — the worker pool most likely died "
+                    "mid-item. Re-drive it.",
+           "error_category": "abandoned_by_worker"}
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=run)
+
+    assert result.exit_code == 0, result.output
+    assert "abandoned_by_worker" in result.output
+    assert "Re-drive it." in result.output
+    # And it is NOT still claiming to be in progress.
+    assert "Waiting:" not in result.output
+
+
 # --- logs -------------------------------------------------------------- #
 
 
