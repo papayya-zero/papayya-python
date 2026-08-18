@@ -10,6 +10,8 @@ verdict. These tests pin that the front door now records and inspects.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import papayya
@@ -253,3 +255,42 @@ def test_nested_durable_reuses_minted_run(db):
     runs = _runs(db)
     assert len(runs) == 1
     assert runs[0]["worst_outcome_status"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# Plan 53 — the outcome verbs with NO active item.
+#
+# These two lived in test_papayya_iter.py, under a file-level
+# `pytestmark = skip(reason="Plan 37: local surface deactivated")`. That skip
+# is correct about the file's SUBJECT — papayya.iter — and wrong about these,
+# because mark_degraded / mark_outcome are AMBIENT verbs that ship: they run
+# inside worker-executed @agent bodies and papayya/__init__.py exports them
+# for exactly that. So the one thing a customer meets when their verdict goes
+# nowhere was disabled by a skip about something else.
+#
+# The same shape as plan 52's find in test_runs_cli.py: a file-level skip
+# written for a dead surface that grew to cover a live one.
+# ---------------------------------------------------------------------------
+
+
+def test_mark_degraded_with_no_active_item_warns_and_does_not_raise(caplog):
+    """A verdict recorded nowhere must say so. Not raising is the contract —
+    a wrapper that kills the caller's work because IT could not record
+    something is the opposite of rewarded-and-optional adoption."""
+    with caplog.at_level(logging.WARNING, logger="papayya.iter"):
+        result = papayya.mark_degraded("nothing-to-mark")
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "recorded a verdict against nothing and said nothing about it"
+    message = " ".join(r.getMessage() for r in warnings)
+    # And it names a surface the caller actually has. This message used to say
+    # "outside an active papayya.iter run" — an API plan 37 deactivated, so the
+    # advice pointed at something the SDK no longer exports.
+    assert "papayya.iter" not in message
+    assert "@agent" in message
+
+
+def test_mark_outcome_rejects_a_status_outside_the_closed_set():
+    with pytest.raises(ValueError, match="must be"):
+        papayya.mark_outcome("weird")

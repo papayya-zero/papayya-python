@@ -20,6 +20,17 @@ from papayya.durable.sqlite_store import SQLiteStore
 # Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
 # CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
 # file is skipped rather than deleted — unskip when the local surface is revived.
+#
+# PLAN 53: A FILE-LEVEL SKIP ONLY COVERS WHAT THE FILE IS ABOUT, AND FILES GROW.
+# Four assertions under this marker were about LIVE surfaces — papayya.mark_degraded
+# / mark_outcome with no active item (ambient verbs that ship, exported for use
+# inside @agent bodies) and the Item/PapayyaRun + .id/.run_id alias contract from
+# plan 34. They have moved to tests/test_ambient_wedge.py and
+# tests/test_item_handle_nouns.py, where nothing disables them.
+#
+# Before adding a test here, ask whether its subject is papayya.iter/map and the
+# local SQLite ledger. If it is not, it does not belong under this marker — that
+# is how plan 52 lost four tests of live hosted `items` verbs to the same shape.
 import pytest as _pytest
 pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
 
@@ -149,37 +160,6 @@ def test_failing_item_rolls_run_to_partial(db) -> None:
     assert run["completed"] == 1
     assert run["failed"] == 1
     assert run["status"] == "partial"
-
-
-def test_direct_call_is_implicit_run_of_one(db) -> None:
-    store, path = db
-    client = papayya.Papayya(store=store)
-    item = client.item(agent="solo", partition_key=None)
-    item.step("s", lambda: 1)()
-    item.complete()
-
-    runs = _rows(path, "runs")
-    items = _rows(path, "items")
-    assert len(runs) == 1
-    assert runs[0]["run_id"] == f"single-{item.id}"
-    assert runs[0]["total_items"] == 1
-    assert runs[0]["status"] == "completed"
-    assert items[0]["run_id"] == runs[0]["run_id"]
-
-
-def test_item_handle_surface(db) -> None:
-    """papayya().item() returns an Item; .id is the surrogate; the old
-    names (.run(), PapayyaRun, .run_id, active_run_id) stay as aliases."""
-    store, _ = db
-    from papayya import Item, PapayyaRun
-
-    assert PapayyaRun is Item
-    client = papayya.Papayya(store=store)
-    via_new = client.item(agent="x", partition_key=None)
-    via_old = client.run(agent="x", partition_key=None)
-    assert isinstance(via_new, Item)
-    assert isinstance(via_old, Item)
-    assert via_new.id == via_new.run_id
 
 
 def test_active_item_returns_handle(db) -> None:

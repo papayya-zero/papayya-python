@@ -20,6 +20,17 @@ from papayya.durable._replay import ReplayError, replay
 # Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
 # CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
 # file is skipped rather than deleted — unskip when the local surface is revived.
+#
+# PLAN 53: A FILE-LEVEL SKIP ONLY COVERS WHAT THE FILE IS ABOUT, AND FILES GROW.
+# Four assertions under this marker were about LIVE surfaces — papayya.mark_degraded
+# / mark_outcome with no active item (ambient verbs that ship, exported for use
+# inside @agent bodies) and the Item/PapayyaRun + .id/.run_id alias contract from
+# plan 34. They have moved to tests/test_ambient_wedge.py and
+# tests/test_item_handle_nouns.py, where nothing disables them.
+#
+# Before adding a test here, ask whether its subject is papayya.iter/map and the
+# local SQLite ledger. If it is not, it does not belong under this marker — that
+# is how plan 52 lost four tests of live hosted `items` verbs to the same shape.
 import pytest as _pytest
 pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
 

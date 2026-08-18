@@ -27,6 +27,17 @@ from papayya import iterators
 # Plan 37: this file's SUBJECT is a DEACTIVATED local surface (iter/map / local SQLite
 # CLI / keyless demo). The code is retained in-repo for self-host / revival, so the
 # file is skipped rather than deleted — unskip when the local surface is revived.
+#
+# PLAN 53: A FILE-LEVEL SKIP ONLY COVERS WHAT THE FILE IS ABOUT, AND FILES GROW.
+# Four assertions under this marker were about LIVE surfaces — papayya.mark_degraded
+# / mark_outcome with no active item (ambient verbs that ship, exported for use
+# inside @agent bodies) and the Item/PapayyaRun + .id/.run_id alias contract from
+# plan 34. They have moved to tests/test_ambient_wedge.py and
+# tests/test_item_handle_nouns.py, where nothing disables them.
+#
+# Before adding a test here, ask whether its subject is papayya.iter/map and the
+# local SQLite ledger. If it is not, it does not belong under this marker — that
+# is how plan 52 lost four tests of live hosted `items` verbs to the same shape.
 import pytest as _pytest
 pytestmark = _pytest.mark.skip(reason="Plan 37: local surface deactivated")
 
@@ -358,14 +369,6 @@ def test_mark_degraded_inside_iter_writes_degraded_entry(tmp_path):
 
 # ── 10. mark_degraded outside iter logs warning, no raise ─────────────────
 
-def test_mark_degraded_outside_iter_logs_warning(caplog):
-    with caplog.at_level(logging.WARNING, logger="papayya.iter"):
-        result = papayya.mark_degraded("nothing-to-mark")
-    assert result is None
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("outside an active papayya.iter" in r.message for r in warnings)
-
-
 # ── 11. mark_outcome('failed') writes a failed entry ──────────────────────
 
 def test_mark_outcome_failed_writes_failed_entry(tmp_path):
@@ -416,11 +419,6 @@ def test_mark_outcome_ok_writes_audit_row(tmp_path):
 
 
 # ── 13. mark_outcome rejects unknown status ───────────────────────────────
-
-def test_mark_outcome_rejects_unknown_status():
-    with pytest.raises(ValueError, match="must be"):
-        papayya.mark_outcome("weird")
-
 
 # ── 14. Aggregation: mark_degraded escalates worst_outcome_status ─────────
 

@@ -589,7 +589,9 @@ def mark_degraded(reason: str) -> None:
     ``degraded_count`` aggregates update via Plan 01's ``save_task``
     aggregation logic on stores that support it (SQLiteStore, CloudStore).
 
-    No-op (with a warning) if called outside an active ``papayya.iter`` run.
+    No-op (with a warning) if called with no active item — i.e. outside an
+    ``@agent`` / ``@papayya.durable`` body. ``papayya.iter`` used to be the
+    other way in and was deactivated in plan 37.
     """
     _mark(OutcomeVerdict("degraded", reason))
 
@@ -725,8 +727,19 @@ def active_run_id() -> str | None:
 def _mark(verdict: OutcomeVerdict) -> None:
     run = _resolve_run()
     if run is None:
+        # Names the surfaces the caller actually has (plan 53). This warning
+        # said "outside an active papayya.iter run" — and papayya.iter was
+        # deactivated in plan 37, so the one message a customer sees when the
+        # verdict they recorded went nowhere pointed them at an API the SDK
+        # no longer exports. The verbs themselves are live: they run inside
+        # worker-executed @agent bodies, which is where a reader of this line
+        # will be standing.
         log.warning(
-            "papayya.mark_%s(%r) called outside an active papayya.iter run; ignored",
+            "papayya.mark_%s(%r) called with no active item; ignored. "
+            "The outcome verbs record against the item your @agent function "
+            "is currently handling — call this from inside an @agent body "
+            "(or a @papayya.durable one), not at import time or in a "
+            "background thread.",
             verdict.status,
             verdict.reason,
         )
