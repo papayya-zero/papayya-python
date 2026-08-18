@@ -268,26 +268,28 @@ def test_apply_two_agents_isolated_failures() -> None:
     assert put_calls == ["agt-a"]
 
 
-def test_apply_sends_managed_by_marker_via_api_client_path() -> None:
-    """Verifies the contract that the wire-format carries managed_by='code'
-    in every item. Exercised at the APIClient layer, which is where the
-    marker is attached (the reconciler hands desired specs without the
-    field; api.put_*() adds it). This test pins that integration."""
+def test_apply_sends_the_reconcilers_items_verbatim() -> None:
+    """Plan 53. This asserted that the wire carries managed_by='code' in every
+    item, and called that "the contract" — a contract the server has never had.
+    Its request structs have no such field and it decodes with
+    DisallowUnknownFields, so every `papayya deploy` of an agent carrying a
+    @schedule or @trigger answered 400 "invalid request body" and exited 1.
+
+    The scope is the SERVER's to decide, and it reports which one it applied in
+    the response envelope. The transport's job is to send what the reconciler
+    decided, unedited."""
     from unittest.mock import MagicMock
     from papayya.api import APIClient, APIConfig
 
     client = APIClient(APIConfig(api_key="cpk_test"))
     client._request = MagicMock(return_value={"items": [], "summary": {}})  # type: ignore[method-assign]
+
     client.put_schedules("agt1", [{"cron_expression": "0 9 * * *"}])
-    _method, _path, kwargs = client._request.call_args[0][0], client._request.call_args[0][1], client._request.call_args[1]
-    body = kwargs["json"]
-    assert body["items"][0]["managed_by"] == "code"
-    assert body["items"][0]["cron_expression"] == "0 9 * * *"
+    body = client._request.call_args[1]["json"]
+    assert body == {"items": [{"cron_expression": "0 9 * * *"}]}
 
     client._request.reset_mock()
     client.put_webhooks("agt1", [{"name": "trigger"}])
-    kwargs = client._request.call_args[1]
-    body = kwargs["json"]
-    assert body["items"][0]["managed_by"] == "code"
-    assert body["items"][0]["name"] == "trigger"
+    body = client._request.call_args[1]["json"]
+    assert body == {"items": [{"name": "trigger"}]}
     client.close()

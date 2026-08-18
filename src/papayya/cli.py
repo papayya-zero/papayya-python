@@ -959,10 +959,18 @@ def _collect_managed_diff(
             {"cron_expression": s.cron, "timezone": getattr(s, "timezone", "UTC")}
             for s in agent_spec.schedules
         ]
-        wh_payload = [
-            {"name": w.name, "secret_env": w.secret_env}
-            for w in agent_spec.webhooks
-        ]
+        # `secret_env` is NOT sent (plan 53). It is a LOCAL declaration —
+        # which env var the customer reads the signing secret from — and the
+        # control plane has no such concept anywhere: zero occurrences outside
+        # tests. The server's item struct rejects it, so this probe 400'd on
+        # every deploy carrying a @trigger.
+        #
+        # The apply path (_reconcile.apply_plan) has always sent `{"name": ...}`
+        # alone. That divergence is the whole defect: this probe's own
+        # docstring promises it is "byte-faithful to what the next deploy would
+        # do", and it was sending a body the deploy never sends and the server
+        # never accepted.
+        wh_payload = [{"name": w.name} for w in agent_spec.webhooks]
         sched_diff = api.put_schedules(agent_id, sched_payload, dry_run=True)
         wh_diff = api.put_webhooks(agent_id, wh_payload, dry_run=True)
         out.append((slug, "schedule", sched_diff))

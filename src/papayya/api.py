@@ -601,10 +601,10 @@ class APIClient:
 
         ``schedules`` is a list of dicts each shaped like the POST body
         (``cron_expression`` + optional ``timezone`` / ``input`` /
-        ``max_steps`` / ``budget_cents``). Each item carries
-        ``managed_by='code'`` on the wire so the server scopes its
-        full-replace to code-managed rows only — ``managed_by='api'``
-        rows (dashboard / direct-POST) are invisible to this call.
+        ``budget_cents``), sent verbatim. The server scopes its full-replace
+        to ``managed_by='code'`` rows on its own — ``managed_by='api'`` rows
+        (dashboard / direct-POST) are invisible to this call — and reports
+        which scope it applied in the response.
 
         ``dry_run=True`` flips the server into preview mode: the same
         diff is computed against current ``managed_by='code'`` rows but
@@ -615,9 +615,16 @@ class APIClient:
         Returns the server's apply-mode ``{items, summary}`` envelope by
         default, or the dry-run diff envelope when ``dry_run=True``.
         """
-        body = {
-            "items": [{**item, "managed_by": "code"} for item in schedules],
-        }
+        # NOT `{**item, "managed_by": "code"}` (plan 53). The server decides
+        # the scope and SAYS SO in its response envelope's `managed_by` field;
+        # sending it was redundant, and its request struct has no such field,
+        # so DisallowUnknownFields rejected the whole body:
+        #
+        #     PUT /v1/agents/{id}/schedules?dry_run=true
+        #     400 {"error":{"message":"invalid request body"}}
+        #
+        # which is every `papayya deploy` of an agent carrying a @schedule.
+        body = {"items": list(schedules)}
         path = f"/v1/agents/{agent_id}/schedules"
         if dry_run:
             path = f"{path}?dry_run=true"
@@ -665,9 +672,10 @@ class APIClient:
         exactly once), or the dry-run diff envelope when
         ``dry_run=True`` (no secret in the response).
         """
-        body = {
-            "items": [{**item, "managed_by": "code"} for item in webhooks],
-        }
+        # Same as put_schedules: the server owns the scope and rejects an
+        # unknown `managed_by` (plan 53). Every `papayya deploy` of an agent
+        # carrying a @trigger 400'd on it.
+        body = {"items": list(webhooks)}
         path = f"/v1/agents/{agent_id}/webhooks"
         if dry_run:
             path = f"{path}?dry_run=true"

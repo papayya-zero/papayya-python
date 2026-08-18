@@ -202,7 +202,12 @@ def test_deploy_dry_run_prints_plan_without_mutation(
     )
     api.put_webhooks.assert_called_once_with(
         "agt1",
-        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        # `secret_env` is NOT on the wire (plan 53). It is a LOCAL declaration
+        # — which env var holds the signing secret — and the control plane has
+        # no concept of it, so sending it 400'd every deploy of a @trigger.
+        # The apply path below has always sent {"name": ...} alone; this probe
+        # promises to be byte-faithful to it.
+        [{"name": "trigger"}],
         dry_run=True,
     )
     api.create_schedule.assert_not_called()
@@ -234,7 +239,12 @@ def test_deploy_create_schedule_and_webhook_happy_path(
     assert api.put_webhooks.call_count == 2
     api.put_webhooks.assert_any_call(
         "agt1",
-        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        # `secret_env` is NOT on the wire (plan 53). It is a LOCAL declaration
+        # — which env var holds the signing secret — and the control plane has
+        # no concept of it, so sending it 400'd every deploy of a @trigger.
+        # The apply path below has always sent {"name": ...} alone; this probe
+        # promises to be byte-faithful to it.
+        [{"name": "trigger"}],
         dry_run=True,
     )
     api.put_webhooks.assert_any_call("agt1", [{"name": "trigger"}])
@@ -288,7 +298,7 @@ def test_deploy_webhook_rename_prints_rotation_warning(
     assert api.put_webhooks.call_count == 2
     api.put_webhooks.assert_any_call(
         "agt1",
-        [{"name": "new-name", "secret_env": "MY_SECRET"}],
+        [{"name": "new-name"}],
         dry_run=True,
     )
     api.put_webhooks.assert_any_call("agt1", [{"name": "new-name"}])
@@ -454,7 +464,12 @@ def test_deploy_decorator_only_no_yaml_succeeds(
     assert api.put_webhooks.call_count == 2
     api.put_webhooks.assert_any_call(
         "agt1",
-        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        # `secret_env` is NOT on the wire (plan 53). It is a LOCAL declaration
+        # — which env var holds the signing secret — and the control plane has
+        # no concept of it, so sending it 400'd every deploy of a @trigger.
+        # The apply path below has always sent {"name": ...} alone; this probe
+        # promises to be byte-faithful to it.
+        [{"name": "trigger"}],
         dry_run=True,
     )
     api.put_webhooks.assert_any_call("agt1", [{"name": "trigger"}])

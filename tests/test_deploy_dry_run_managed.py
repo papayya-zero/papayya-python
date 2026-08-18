@@ -60,7 +60,12 @@ def test_dry_run_calls_put_endpoints_with_dry_run_flag(
     )
     api.put_webhooks.assert_called_once_with(
         "agt1",
-        [{"name": "trigger", "secret_env": "MY_SECRET"}],
+        # `secret_env` is NOT on the wire (plan 53). It is a LOCAL declaration
+        # — which env var holds the signing secret — and the control plane has
+        # no concept of it, so sending it 400'd every deploy of a @trigger.
+        # The apply path below has always sent {"name": ...} alone; this probe
+        # promises to be byte-faithful to it.
+        [{"name": "trigger"}],
         dry_run=True,
     )
     # Legacy per-call mutators stay idle.
