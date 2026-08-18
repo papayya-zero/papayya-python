@@ -200,6 +200,24 @@ class APIClient:
             "budget_cents": budget_cents,
         })
 
+    def resume_run(self, run_id: str) -> dict[str, Any]:
+        """Resume a paused run — clear the fence and re-drive what it stopped.
+
+        The verb for a run something DECIDED to stop, as distinct from
+        ``replay_run``, which is the verb for a run that ENDED badly. The
+        server refuses each on the other's states (409), and until plan 53
+        the CLI exposed only replay — so a fenced run had no way out of the
+        terminal at all.
+
+        The response carries two numbers worth reading together:
+        ``redriven`` (was a parked item actually re-queued) and
+        ``reexecuting`` (how many steps the fence objected to will run
+        again). ``redriven=false`` means the pause was cleared but the lease
+        had already been completed, so there is nothing to re-queue — replay
+        it instead.
+        """
+        return self._request("POST", f"/v1/durable/runs/{run_id}/resume")
+
     def replay_run(
         self,
         run_id: str,

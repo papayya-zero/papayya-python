@@ -354,3 +354,73 @@ def test_status_does_not_swallow_a_non_404_from_the_item_surface(monkeypatch):
 
     assert result.exit_code != 0
     assert "500" in str(result.output) + str(result.exception)
+
+
+# ---------------------------------------------------------------------------
+# Plan 53 — a fence objected and the run finished anyway.
+#
+# A fence raises WorkloadPaused at the START OF THE NEXT STEP, so one that trips
+# on a run's LAST step never raises: the body returns, the worker completes, and
+# the run reaches terminal carrying paused_at + pause_reason from a pause nobody
+# acted on. Driven on the compose stack:
+#
+#     status=completed | paused_at set | pause_reason='3 consecutive degraded steps: hollow'
+#
+# The row is not lying — the work finished AND a fence objected — but no surface
+# read the second column, so a customer holding an "auto-paused" alert opened the
+# run and read `completed`.
+#
+# These bodies are the server's, field for field.
+# ---------------------------------------------------------------------------
+
+RUN_FENCED = {
+    **RUN_OK,
+    "status": "completed",
+    "worst_outcome_status": "degraded",
+    "degraded_count": 3,
+    "paused_at": "2026-08-18T05:12:04.881Z",
+    "pause_reason": "3 consecutive degraded steps: hollow",
+}
+
+
+def test_status_says_a_fence_objected_to_a_completed_run(monkeypatch):
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=RUN_FENCED)
+
+    assert result.exit_code == 0, result.output
+    assert "Fenced:" in result.output
+    assert "3 consecutive degraded steps" in result.output
+
+
+def test_status_does_not_repeat_the_fence_on_a_live_pause(monkeypatch):
+    """A paused run's status word already says it. Saying it twice makes the
+    terminal case — the one nothing was reporting — indistinguishable."""
+    run = {**RUN_FENCED, "status": "paused"}
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=run)
+
+    assert "Fenced:" not in result.output
+    assert "paused" in result.output
+
+
+def test_status_drops_the_fence_line_once_an_operator_resolved_it(monkeypatch):
+    run = {**RUN_FENCED, "pause_resolved_at": "2026-08-18T05:20:00Z"}
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=run)
+
+    assert "Fenced:" not in result.output
+
+
+def test_status_points_at_replay_not_resume_for_a_fenced_terminal_run(monkeypatch):
+    """The verbs are not interchangeable and the server refuses each on the
+    other's states. This run is terminal, so replay is the one that works —
+    established by typing the message's own instruction and getting a 409."""
+    result, _ = _run_cli(monkeypatch, ["status", RUN_OK["run_id"]], run=RUN_FENCED)
+
+    assert "replay" in result.output
+    assert "papayya resume" not in result.output
+
+
+def test_logs_reports_the_fence_under_the_step_list(monkeypatch):
+    result, _ = _run_cli(
+        monkeypatch, ["logs", RUN_OK["run_id"]], run=RUN_FENCED, steps=[STEP_OK])
+
+    assert result.exit_code == 0, result.output
+    assert "A fence objected" in result.output

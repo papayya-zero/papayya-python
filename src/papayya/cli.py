@@ -1295,6 +1295,72 @@ def replay_cmd(
         api.close()
 
 
+@main.command("resume")
+@click.argument("run_id")
+@click.pass_context
+def resume_cmd(ctx: click.Context, run_id: str) -> None:
+    """Resume a run a fence stopped.
+
+    \b
+      papayya resume <run_id>
+
+    The verb for a run something DECIDED to stop, as distinct from `replay`,
+    which is the verb for a run that ENDED badly. The server refuses each on
+    the other's states, and until this command existed a fenced run had no way
+    out through the CLI at all: `replay` answers 409 "run is paused; only a
+    terminal run can be replayed", and there was nothing else to type.
+
+    Resuming clears the pause and re-queues the run's parked item. Two numbers
+    come back and they are worth reading together — see the output.
+    """
+    scope = _env_scope(ctx.obj)
+    config = APIConfig(api_key=_require_api_key(scope), base_url=scope.base_url)
+    api = APIClient(config)
+    try:
+        try:
+            result = api.resume_run(run_id)
+        except PapayyaAPIError as exc:
+            # The 409 names the other verb, because being told "this is not
+            # resumable" without being told what IS is how a dead end at 2am
+            # gets built.
+            if getattr(exc, "status", None) == 409:
+                click.echo(
+                    f"Error: {exc}\n"
+                    f"  A run that ENDED badly is replayed, not resumed:\n"
+                    f"    papayya replay {run_id}",
+                    err=True,
+                )
+                sys.exit(1)
+            click.echo(f"Error: resume failed ({exc.status}): {exc}", err=True)
+            sys.exit(1)
+
+        click.echo(f"Resumed: {result.get('run_id', run_id)}")
+        click.echo(f"  Status: {result.get('status', 'unknown')}")
+
+        # THE TWO NUMBERS, and why both are printed rather than a cheerful
+        # "resumed". `reexecuting=0` means this will produce exactly what it
+        # produced before, which is almost never what the person resuming
+        # wants; `redriven=false` means the pause is cleared but nothing was
+        # re-queued, so the run will not move at all.
+        reexecuting = result.get("reexecuting", 0)
+        if result.get("redriven"):
+            click.echo(f"  Re-executing: {reexecuting} step(s) the fence objected to")
+            if not reexecuting:
+                click.echo(
+                    "  Nothing will be re-executed, so this will produce what it "
+                    "produced before.\n"
+                    f"  If you changed the code, replay it instead: papayya replay {run_id}"
+                )
+        else:
+            click.echo(
+                "  Nothing was re-queued: this run's lease was already completed, "
+                "so there is no parked item to hand back to a worker.\n"
+                f"  Re-drive it instead: papayya replay {run_id}"
+            )
+    finally:
+        api.close()
+
+
 # ---------------------------------------------------------------------------
 # pull — materialize a production incident as local fixtures
 #
@@ -2998,7 +3064,7 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
             done = _distinct_step_count(status_resp.get("checkpoints"))
             click.echo(f"  {done} step(s) — {state}")
 
-            if state in ("completed", "failed", "cancelled", "budget_exceeded"):
+            if state in _RUN_WAIT_STOP_STATES:
                 break
 
         # Show final result. Durable checkpoints carry {label, result};
@@ -3020,11 +3086,47 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
             )
             click.echo(f"  {label}: {str(content)[:200]}")
 
+        # AFTER the steps, not before them. `paused` and `quarantine` are
+        # terminal FOR THIS COMMAND without being terminal for the run, and the
+        # word alone strands the user — something stopped this and nothing will
+        # move it until a human acts. Printed last because it is the thing to do
+        # next, and a next-step buried above the output is one nobody reads.
+        #
+        # The loop above used to spin on both forever. It never came up because,
+        # until the fence guard landed, a fenced run reported `completed`.
+        if state in _RUN_WAIT_OPERATOR_STATES:
+            reason = status_resp.get("pause_reason") or status_resp.get("quarantine_reason")
+            click.echo("")
+            click.echo(f"Stopped by: {reason}" if reason
+                       else f"Stopped, and {state} is not a state that clears itself.")
+            click.echo("Nothing will move this run until you act on it:")
+            # `resume`, NOT `replay`. Typing the string this command had first
+            # printed answered 409 — "run is paused; only a terminal run can be
+            # replayed" — which is plan 52's shape reproduced by the fix for it,
+            # in the same session. A paused run is resumed; a terminal one is
+            # replayed; the two verbs are not interchangeable and the message
+            # has to know which state it is looking at.
+            click.echo(f"  papayya resume {run_id}   # clear the fence and re-drive")
+
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     finally:
         api.close()
+
+
+# States `papayya run --wait` stops polling on. NOT the same as "terminal".
+#
+# `paused` and `quarantine` are non-terminal on the run row — an operator can
+# resume or release them — but nothing in the system will move them without one,
+# so a client waiting for them waits forever. That is not hypothetical: a fence
+# raises WorkloadPaused at the start of the NEXT step, so a fence that trips on
+# a run's last step leaves the run paused with the body already returned, and
+# this command printed "4 step(s) — paused" every two seconds until killed.
+_RUN_WAIT_OPERATOR_STATES = ("paused", "quarantine")
+_RUN_WAIT_STOP_STATES = (
+    "completed", "failed", "cancelled", "budget_exceeded",
+) + _RUN_WAIT_OPERATOR_STATES
 
 
 def _fmt_usd(amount: float) -> str:
@@ -3058,6 +3160,27 @@ def _fmt_cost(record: dict[str, Any], amount: float) -> str:
     return _fmt_usd(amount)
 
 
+def _fence_objection(run: dict[str, Any]) -> str | None:
+    """The fence's objection, when the run finished anyway (plan 53).
+
+    A fence raises WorkloadPaused at the START OF THE NEXT STEP, so one that
+    trips on a run's LAST step never raises: the body returns, the worker
+    completes, and the run reaches terminal carrying `paused_at` and
+    `pause_reason` from a pause nothing acted on. The row is not lying — the
+    work did finish AND a fence objected, and those are two facts on two
+    columns — but until now no surface read the second one, so a customer who
+    had just been alerted "auto-paused" opened the run and saw `completed`.
+
+    Returns None while the pause is LIVE (a non-terminal run) — there the
+    status word already says it — and None once an operator has resolved it.
+    """
+    if run.get("status") not in ("completed", "failed"):
+        return None
+    if not run.get("paused_at") or run.get("pause_resolved_at"):
+        return None
+    return run.get("pause_reason") or "a fence objected to this run"
+
+
 def _echo_run_verdict(run: dict[str, Any]) -> None:
     """Say how the run ENDED, under a list of how its steps went.
 
@@ -3079,6 +3202,8 @@ def _echo_run_verdict(run: dict[str, Any]) -> None:
     worst = run.get("worst_outcome_status")
     if worst and worst != "ok":
         click.echo(f"Run {status}, but its worst step outcome was {worst}.")
+    if objection := _fence_objection(run):
+        click.echo(f"A fence objected while it ran: {objection}")
 
 
 def _echo_submission_status(api: "APIClient", run_id: str,
@@ -3195,6 +3320,17 @@ def status(ctx: click.Context, run_id: str) -> None:
                 f"Error:   {result['error']}"
                 + (f"  [{category}]" if category else "")
             )
+
+        # A fence objected and the run finished anyway. Two facts, two columns,
+        # and until plan 53 the second one reached nobody — so a customer with
+        # an "auto-paused" alert in their inbox opened the run and read
+        # `completed`. Printed above the outcome line because it is the stronger
+        # statement: the platform did not merely observe a bad outcome, it
+        # decided this should stop.
+        if objection := _fence_objection(result):
+            click.echo(f"Fenced:  {objection}")
+            click.echo("         (it finished before the fence could stop it; "
+                       "replay it if you want the objected steps re-run)")
 
         # The wedge: a run can be `completed` and still not have worked. Say so
         # here rather than leaving the operator to notice it on the dashboard.
@@ -3745,9 +3881,14 @@ main.sections = [
     # are the recovery loop's verbs (Plan 41 R4 / ADR 0009 D7b), and an
     # operator looking for "what do I do about these failures" should meet
     # them in the same section they found the failures in.
+    # `resume` sits beside `replay` for the same reason `pull` sits beside
+    # `triage`: they are the two halves of one question. A run that ENDED badly
+    # is replayed; a run something DECIDED to stop is resumed; the server
+    # refuses each on the other's states, and finding only one of them in the
+    # help is how an operator meets a 409 instead of a verb.
     ("Run agents & inspect results",
      ["run", "runs", "items", "status", "logs", "agents", "schedules",
-      "triggers", "triage", "pull", "verify", "release"]),
+      "triggers", "triage", "pull", "verify", "release", "resume"]),
     ("Account & platform ops",
      ["signup", "logout", "envs", "secrets", "projects",
       "deployments", "api-keys", "usage", "rate-card"]),
