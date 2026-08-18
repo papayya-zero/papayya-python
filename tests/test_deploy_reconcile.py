@@ -461,3 +461,121 @@ def test_deploy_decorator_only_no_yaml_succeeds(
 
     # Clean up the global registry so this test doesn't leak.
     _registry.clear()
+
+
+# ---------------------------------------------------------------------------
+# Plan 53 S8 — deploy resolves its endpoint like every other command
+#
+# `deploy` was the last server-hitting command not routed through
+# `_env_scope`. It read base_url straight off `ctx.obj["base_url"]`, which is
+# the FLAG, whose default is DEFAULT_BASE_URL — so it dialled
+# api.getpapayya.com on a machine whose env said localhost and died on DNS.
+# Every deploy in plans 47 and 48 needed PAPAYYA_BASE_URL= in front of it.
+#
+# The `deploy_env` fixture's config gives dev and prod DIFFERENT stored
+# base_urls below, because a fixture where both envs agree with the default
+# cannot fail on this defect — which is why the existing deploy suite passed
+# through it.
+# ---------------------------------------------------------------------------
+
+
+def _client_base_url(deploy_env: dict[str, Any]) -> str:
+    """The base_url the CLI actually handed APIClient."""
+    config = deploy_env["MockClass"].call_args.args[0]
+    return config.base_url
+
+
+def test_deploy_uses_the_envs_stored_base_url_not_the_flag_default(
+    deploy_env: dict[str, Any], tmp_config: Path
+) -> None:
+    """The S8 defect: a configured env, and deploy dials the public default."""
+    tmp_config.write_text(
+        '{"version": 2, "current_env": "dev", '
+        '"envs": {"dev": {"api_key": "cpk_test", '
+        '"base_url": "http://localhost:8090", "project_id": "proj"}}}'
+    )
+    exit_code, stdout, _ = _invoke("deploy")
+    assert exit_code == 0, stdout
+    assert _client_base_url(deploy_env) == "http://localhost:8090"
+
+
+def test_deploy_honours_env_flag_over_current_env(
+    deploy_env: dict[str, Any], tmp_config: Path
+) -> None:
+    """--env picks the endpoint too, not only the credentials. The dangerous
+    spelling is `--env prod` resolving to dev's server."""
+    tmp_config.write_text(
+        '{"version": 2, "current_env": "dev", '
+        '"envs": {"dev": {"api_key": "cpk_dev", '
+        '"base_url": "http://localhost:8090", "project_id": "p-dev"}, '
+        '"prod": {"api_key": "cpk_prod", '
+        '"base_url": "https://api.example.test", "project_id": "p-prod"}}}'
+    )
+    exit_code, stdout, _ = _invoke("--env", "prod", "deploy")
+    assert exit_code == 0, stdout
+    assert _client_base_url(deploy_env) == "https://api.example.test"
+    config = deploy_env["MockClass"].call_args.args[0]
+    assert config.api_key == "cpk_prod"
+
+
+def test_deploy_still_lets_an_explicit_base_url_win(
+    deploy_env: dict[str, Any], tmp_config: Path
+) -> None:
+    """The env's stored value beats the DEFAULT, not an explicit override —
+    otherwise routing deploy through _env_scope would break the escape hatch
+    every walk has been using."""
+    tmp_config.write_text(
+        '{"version": 2, "current_env": "dev", '
+        '"envs": {"dev": {"api_key": "cpk_test", '
+        '"base_url": "http://localhost:8090", "project_id": "proj"}}}'
+    )
+    exit_code, stdout, _ = _invoke("--base-url", "https://override.test", "deploy")
+    assert exit_code == 0, stdout
+    assert _client_base_url(deploy_env) == "https://override.test"
+
+
+def test_deploy_refuses_an_env_that_does_not_exist(
+    deploy_env: dict[str, Any]
+) -> None:
+    """Plan 52 E1's check lives in _env_scope, so deploy skipped it. Without a
+    project id it reported "No API key found. Run `papayya signup`" — a wrong
+    diagnosis pointing at a wrong remedy."""
+    exit_code, _stdout, stderr = _invoke("--env", "nope-not-real", "deploy")
+    assert exit_code != 0
+    assert "no env named 'nope-not-real'" in stderr
+    assert "signup" not in stderr
+
+
+def test_deploy_refuses_an_unknown_env_even_with_an_explicit_project_id(
+    deploy_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE ONE THAT MATTERED. With --project-id nothing needed resolving, so
+    nothing validated: deploy uploaded a bundle, printed `Env: nope-not-real`,
+    and signed off telling the user to run `papayya --env nope-not-real logs
+    <run-id>` — which the same binary refuses. The product printed an
+    instruction it had already decided was invalid."""
+    monkeypatch.setenv("PAPAYYA_API_KEY", "cpk_ambient")
+    exit_code, stdout, stderr = _invoke(
+        "--env", "nope-not-real", "deploy", "--project-id", "proj"
+    )
+    assert exit_code != 0
+    assert "no env named 'nope-not-real'" in stderr
+    assert deploy_env["api"].upload_deployment.call_count == 0, (
+        "a bundle was uploaded under an env that does not exist"
+    )
+    assert "Next:" not in stdout
+
+
+def test_deploy_validates_the_env_before_bundling(
+    deploy_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check that fires after the work is done is a check that wasted the
+    work. The scope is resolved at the top of the command now."""
+    bundled: list[int] = []
+    monkeypatch.setattr(
+        "papayya.bundler.bundle_project",
+        lambda *_a, **_k: (bundled.append(1), (b"tar", "sha"))[1],
+    )
+    exit_code, _stdout, _stderr = _invoke("--env", "nope-not-real", "deploy")
+    assert exit_code != 0
+    assert bundled == [], "bundled the project before checking the env exists"

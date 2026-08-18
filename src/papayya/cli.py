@@ -166,14 +166,13 @@ def _project_id_from_api_key(api_key: str | None, base_url: str) -> str | None:
     return project_id
 
 
-def _resolve_project_id(ctx_obj: dict) -> str | None:
-    """Resolve the project id the way every server-hitting command does.
-
-    Delegates rather than repeating the ladder: this used to carry its own
-    copy of the precedence rules, which is how it drifted from _env_scope and
-    let `deploy` and `run` disagree about which project they were addressing.
-    """
-    return _env_scope(ctx_obj).project_id
+# _resolve_project_id IS GONE, and so is _resolve_api_key below it (plan 53
+# S8). Both were one-line delegates kept for `deploy`, the last command that
+# had not been routed through _env_scope — and having them made deploy LOOK
+# like it resolved things the same way as everything else while it read
+# base_url straight off the flag. A wrapper that hides which of three values
+# a command actually agrees with the rest of the CLI about is worse than no
+# wrapper. `_env_scope` is the one door.
 
 
 _DEPLOY_POLL_SECONDS = 1
@@ -298,15 +297,6 @@ def _find_or_create_agent(api: APIClient, project_id: str, reg) -> str:
     )
     click.echo(f"  Created agent: {result['id']} ({slug})")
     return result["id"]
-
-
-def _resolve_api_key(ctx_key: str | None, env: str | None = None) -> str | None:
-    """Resolve API key from CLI flag, env var, or the current env's saved config."""
-    key = ctx_key or os.environ.get("PAPAYYA_API_KEY")
-    if key:
-        return key
-    cfg = _load_cli_config()
-    return _env_config(cfg, env or _current_env(cfg)).get("api_key")
 
 
 @dataclass(frozen=True)
@@ -478,7 +468,21 @@ def login(ctx: click.Context, key: str | None, project_id_opt: str | None) -> No
     not the CLI. Setting PAPAYYA_API_KEY works too and skips this entirely.
     Pass `--env <name>` (global flag) to connect a specific env.
     """
+    # NOT _env_scope: login is the command that WRITES an env, so it cannot
+    # read its credentials from the env it is about to create. It reads the
+    # flag — but re-logging in to an env that already exists must not silently
+    # repoint it. `papayya --env dev login` on a dev configured for localhost
+    # would otherwise move it to the public default just because a key was
+    # re-pasted, which is S8's defect wearing a different hat: the flag's
+    # DEFAULT is not a user's choice, only its explicit value is.
+    cfg_now = _load_cli_config()
+    target_env_guess = ctx.obj.get("env") or (
+        _current_env(cfg_now) if cfg_now.get("envs") else "dev"
+    )
+    explicit_base = ctx.obj.get("base_url_source") in {"COMMANDLINE", "ENVIRONMENT"}
     base_url = ctx.obj["base_url"]
+    if not explicit_base:
+        base_url = _env_config(cfg_now, target_env_guess).get("base_url") or base_url
 
     api_key = (key or click.prompt("Paste your Papayya API key", hide_input=True) or "").strip()
     if not api_key:
@@ -711,10 +715,29 @@ def deploy(
     # Env selection is code-first: --env / PAPAYYA_ENV / current_env in
     # ~/.papayya/config.json (all folded into ctx.obj["env"] by the main
     # callback). There is no papayya.yaml env block.
+    #
+    # THROUGH _env_scope, like every other server-hitting command (plan 47 S8).
+    # This command used to resolve the same three things by hand — key via
+    # _resolve_api_key, project via _resolve_project_id, and base_url straight
+    # off ctx.obj["base_url"] — and the third one is what broke it: ctx.obj
+    # holds the FLAG, whose default is DEFAULT_BASE_URL, so deploy dialled
+    # api.getpapayya.com on a machine whose env said localhost and died on
+    # DNS. Every deploy in plans 47 and 48 needed PAPAYYA_BASE_URL= in front
+    # of it, on the third command of the quickstart.
+    #
+    # Driving it turned up worse than the walk recorded. _env_scope is also
+    # where plan 52 E1 put the unknown-env check, so `papayya --env <typo>
+    # deploy` skipped it: without a project id it reported "No API key found.
+    # Run `papayya signup`" — a wrong diagnosis pointing at a wrong remedy —
+    # and WITH --project-id it validated nothing at all. It uploaded a bundle,
+    # printed `Env: nope-not-real`, and signed off telling the user to run
+    # `papayya --env nope-not-real logs <run-id>`, which the same binary
+    # refuses. The product printed an instruction it had already decided was
+    # invalid. That is plan 52's whole shape, on the command plan 52 quoted.
+    scope = _env_scope(ctx.obj)
     env_name: str | None = ctx.obj.get("env")
 
-    # Resolve auth
-    resolved_key = _resolve_api_key(ctx.obj["api_key"], env=env_name)
+    resolved_key = scope.api_key
     if not resolved_key:
         click.echo(
             "Error: No API key found.\n"
@@ -723,7 +746,7 @@ def deploy(
         )
         sys.exit(1)
 
-    config = APIConfig(api_key=resolved_key, base_url=ctx.obj["base_url"])
+    config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
     api = APIClient(config)
 
     if entrypoint is None:
@@ -742,9 +765,12 @@ def deploy(
 
         _preflight_dependencies(project_dir)
 
-        # Resolve project ID for agent lookup/create
+        # Resolve project ID for agent lookup/create. The --project-id flag
+        # still wins; the scope is the floor, and it already applied the
+        # PAPAYYA_PROJECT_ID > envs[env].project_id > derive-from-key
+        # precedence this used to re-implement.
         if not project_id:
-            project_id = _resolve_project_id({**ctx.obj, "env": env_name or ctx.obj.get("env")})
+            project_id = scope.project_id
         if not project_id and not agent_id:
             # Not `papayya signup` — that only opens the dashboard, which is
             # where the user just came from.
@@ -834,7 +860,7 @@ def deploy(
                 click.echo(f"Error: {e}", err=True)
                 sys.exit(1)
 
-            _print_reconcile_plan(plan, api_base_url=ctx.obj["base_url"])
+            _print_reconcile_plan(plan, api_base_url=scope.base_url)
 
             # Plan 13 — PUT-dry-run preview for managed_by='code'. Probes
             # the same PUT endpoints apply_plan would call, so the preview
@@ -856,7 +882,7 @@ def deploy(
                 click.echo("\nNo changes to apply.")
             else:
                 result = _reconcile.apply_plan(plan, api)
-                _print_apply_result(result, api_base_url=ctx.obj["base_url"])
+                _print_apply_result(result, api_base_url=scope.base_url)
                 if result.error is not None:
                     sys.exit(1)
 

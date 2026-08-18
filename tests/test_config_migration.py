@@ -228,6 +228,49 @@ def test_login_rejects_bad_key(tmp_config: Path) -> None:
     assert load_cli_config() == {}  # nothing persisted
 
 
+def test_relogin_keeps_the_envs_base_url(tmp_config: Path) -> None:
+    """Plan 53 S8, same defect one command over. `login` cannot read its
+    endpoint from _env_scope — it is the command that WRITES an env — so it
+    reads the --base-url flag. But the flag's DEFAULT is not a user's choice,
+    and re-pasting a key for an env configured against localhost must not
+    silently repoint it at the public default."""
+    save_cli_config({
+        "version": 2, "current_env": "dev",
+        "envs": {"dev": {"api_key": "cpk_old", "base_url": "http://localhost:8090",
+                         "project_id": "p-only"}},
+    })
+    with patch.object(cli_module, "APIClient") as MockClient:
+        instance = MockClient.return_value
+        instance.list_projects.return_value = [{"id": "p-only", "name": "Only"}]
+        result = CliRunner().invoke(cli_module.main, ["login", "--key", "cpk_new"])
+
+    assert result.exit_code == 0, result.output
+    env_block = env_config(load_cli_config(), "dev")
+    assert env_block["base_url"] == "http://localhost:8090"
+    assert env_block["api_key"] == "cpk_new"
+    # And the client it validated against was that endpoint, not the default.
+    assert MockClient.call_args.args[0].base_url == "http://localhost:8090"
+
+
+def test_login_with_an_explicit_base_url_does_repoint(tmp_config: Path) -> None:
+    """The escape hatch stays: an EXPLICIT --base-url is a choice and wins."""
+    save_cli_config({
+        "version": 2, "current_env": "dev",
+        "envs": {"dev": {"api_key": "cpk_old", "base_url": "http://localhost:8090",
+                         "project_id": "p-only"}},
+    })
+    with patch.object(cli_module, "APIClient") as MockClient:
+        instance = MockClient.return_value
+        instance.list_projects.return_value = [{"id": "p-only", "name": "Only"}]
+        result = CliRunner().invoke(
+            cli_module.main,
+            ["--base-url", "https://moved.test", "login", "--key", "cpk_new"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert env_config(load_cli_config(), "dev")["base_url"] == "https://moved.test"
+
+
 def test_login_multi_project_requires_project_id(tmp_config: Path) -> None:
     with patch.object(cli_module, "APIClient") as MockClient:
         instance = MockClient.return_value
