@@ -84,6 +84,11 @@ def _write_jsonl(tmp_path: Path, rows: list[dict[str, Any]]) -> Path:
 def test_submit_converts_budget_dollars_to_cents_and_streams_file(
     fake_client: _FakeClient, tmp_path: Path
 ) -> None:
+    """Plan 53 S4: this test used to pass `--concurrency 10 --name "lead
+    enrichment"` and assert they reached create_stream — pinning the FORWARDING
+    of two flags the server drops on the floor. A test that asserts plumbing
+    rather than effect is how "accepted and ignored" survives a suite; both are
+    refused at the CLI now and are asserted in test_submit_unwired_flags.py."""
     file_ = _write_jsonl(tmp_path, [{"input": "a"}, {"input": "b"}, {"input": "c"}])
 
     result = _run([
@@ -91,8 +96,6 @@ def test_submit_converts_budget_dollars_to_cents_and_streams_file(
         "--agent", "agent-1",
         "--file", str(file_),
         "--budget", "20",
-        "--concurrency", "10",
-        "--name", "lead enrichment",
     ])
     assert result.exit_code == 0, result.output
 
@@ -101,8 +104,6 @@ def test_submit_converts_budget_dollars_to_cents_and_streams_file(
     assert kwargs["agent_id"] == "agent-1"
     assert kwargs["items"] == [{"input": "a"}, {"input": "b"}, {"input": "c"}]
     assert kwargs["budget_cents_cap"] == 2000  # $20 → 2000¢
-    assert kwargs["concurrency_cap"] == 10
-    assert kwargs["name"] == "lead enrichment"
     assert kwargs["callback_url"] is None
     assert kwargs["idempotency_key"] is None
     assert "Run submitted: batch-xyz" in result.output

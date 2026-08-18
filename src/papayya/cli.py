@@ -3791,13 +3791,69 @@ def runs_list(ctx: click.Context, agent_slug: str | None, limit: int,
         )
 
 
+def _refuse_unwired_submit_flags(
+    *, concurrency_cap: int | None, name: str | None, callback_url: str | None,
+) -> None:
+    """Refuse the three `runs submit` flags nothing reads (plan 53 S4).
+
+    Each message says what the flag would need and what to do instead, because
+    a refusal that only says "no" moves the dead end rather than removing it.
+    """
+    problems: list[str] = []
+    if concurrency_cap is not None:
+        # MEASURED, not asserted. 20 items of an 800ms agent on the compose
+        # stack: 17.1s with one worker, 4.2s with four — linear, because
+        # LeaseRuntimeItem is FOR UPDATE SKIP LOCKED and N workers never
+        # collide. Throughput is a property of the pool, not of the run.
+        #
+        # The per-key cap machinery this flag looks like it should use is real
+        # (runtime_pending.concurrency_per_key, enforced by the dispatcher's
+        # CheckAndReserve with deferral). It buckets on the PARTITION KEY,
+        # falling back to the account — so wiring `--concurrency 8` to it on a
+        # tenant-keyed run means 8 PER TENANT, which is `--budget`'s $2-becomes-
+        # $1000 defect in a different column. It needs a run-grain bucket first.
+        problems.append(
+            "--concurrency is not implemented. Nothing reads concurrency_cap: "
+            "each worker runs one item at a time, and throughput comes from "
+            "the number of workers (`docker compose up -d --scale worker=N` "
+            "locally; the hosted pool autoscales). A per-run cap needs a "
+            "run-grain bucket in the dispatcher's limiter, which today buckets "
+            "per tenant."
+        )
+    if name is not None:
+        problems.append(
+            "--name is not implemented. There is no column to put a run label "
+            "in — `invocations` has no `name` — which is why the run list shows "
+            "bare UUIDs. Use --idempotency-key if you need your own handle on a "
+            "submission."
+        )
+    if callback_url is not None:
+        problems.append(
+            "--callback-url is not implemented on the v2 run path. The delivery "
+            "machinery exists and is wired into the handler, and the handler "
+            "never calls it. Poll `papayya status <run-id>`, or use a @trigger "
+            "webhook."
+        )
+    if not problems:
+        return
+    for line in problems:
+        click.echo(f"Error: {line}", err=True)
+    sys.exit(2)
+
+
 @runs.command("submit")
 @click.option("--agent", "agent_id", required=True, help="Agent ID to run each item against")
 @click.option("--file", "file_path", required=True, type=click.Path(exists=False), help="JSONL file — one item per line, e.g. {\"input\": ..., \"metadata\"?: ...}")
 @click.option("--budget", "budget_dollars", type=float, default=None, help="Total run budget in whole dollars (converted to cents)")
-@click.option("--concurrency", "concurrency_cap", type=int, default=None, help="Max concurrent items the dispatcher will launch")
-@click.option("--name", "name", default=None, help="Human-readable run label")
-@click.option("--callback-url", "callback_url", default=None, help="Trigger URL invoked on terminal run status")
+@click.option("--concurrency", "concurrency_cap", type=int, default=None,
+              help="NOT IMPLEMENTED — refused rather than silently dropped. "
+                   "Throughput comes from the size of the worker pool.")
+@click.option("--name", "name", default=None,
+              help="NOT IMPLEMENTED — refused rather than silently dropped. "
+                   "There is no column to store a run label in yet.")
+@click.option("--callback-url", "callback_url", default=None,
+              help="NOT IMPLEMENTED — refused rather than silently dropped. "
+                   "Nothing delivers callbacks on the v2 run path.")
 @click.option("--idempotency-key", "idempotency_key", default=None, help="Client-supplied key to dedupe duplicate submissions")
 @click.pass_context
 def runs_submit(
@@ -3816,6 +3872,20 @@ def runs_submit(
     byte guard enforced by the backend. Prints the run ID on success.
     (Pre-0.3.0 spelling: `papayya batch submit` — kept as a hidden alias.)
     """
+    # REFUSED, NOT DROPPED (plan 47 S4/S7, closed in plan 53).
+    #
+    # `--budget` was the fourth flag in this family and the one that cost
+    # money: parsed, put on the request struct, and never read by the handler,
+    # so a customer capping a 200-item run at $2 got 200 x $5 of headroom. It
+    # is wired now. These three are not, and accepting them is the same defect
+    # with a cheaper blast radius — the customer believes they have a lever.
+    #
+    # Refusing is plan 47's own stated fallback ("either wire them or reject
+    # them at the CLI"), and the message names what each would actually take,
+    # because "not implemented" without a way forward is a dead end.
+    _refuse_unwired_submit_flags(
+        concurrency_cap=concurrency_cap, name=name, callback_url=callback_url)
+
     budget_cents_cap = int(round(budget_dollars * 100)) if budget_dollars is not None else None
 
     client = _make_papayya_client(ctx)
