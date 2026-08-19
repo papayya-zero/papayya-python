@@ -43,8 +43,20 @@ class _FakeItems:
         if self.raise_on == method:
             raise PapayyaAPIError(500, "boom")
 
-    def list(self) -> list[dict[str, Any]]:
-        self.calls.append(("list", {}))
+    def list(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        partition_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        # Records the scope so a test can assert `--run` actually reached the
+        # resource. Plan 56 F6: the server has always accepted parent_run_id,
+        # agent and partition_key — only the client never passed them.
+        self.calls.append((
+            "list",
+            {"run_id": run_id, "agent": agent, "partition_key": partition_key},
+        ))
         self._maybe_raise("list")
         return self.list_return
 
@@ -105,9 +117,27 @@ def test_items_list_outputs_ndjson(fake_client: _FakeClient) -> None:
     fake_client.items.list_return = [{"id": "r1"}, {"id": "r2"}]
     result = _run(["items", "list"])
     assert result.exit_code == 0, result.output
-    assert ("list", {}) in fake_client.items.calls
+    # Unscoped stays unscoped: every filter None is "the whole project", which
+    # is what this command has always done.
+    assert ("list", {"run_id": None, "agent": None, "partition_key": None}) \
+        in fake_client.items.calls
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
+
+
+def test_items_list_scopes_to_a_run(fake_client: _FakeClient) -> None:
+    """Plan 56 F6 / plan 55 D6.3.
+
+    `papayya status` prints "Items in this run: papayya items list", and that
+    command took no options — so the only route from a submitted run id to one
+    wedged item was dumping every item in the project as NDJSON and reading for
+    "running". The server accepted parent_run_id the whole time.
+    """
+    fake_client.items.list_return = [{"id": "r1"}]
+    result = _run(["items", "list", "--run", "run-42", "--tenant", "northwind"])
+    assert result.exit_code == 0, result.output
+    assert ("list", {"run_id": "run-42", "agent": None, "partition_key": "northwind"}) \
+        in fake_client.items.calls
 
 
 def test_items_get_pretty_prints(fake_client: _FakeClient) -> None:

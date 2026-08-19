@@ -106,8 +106,41 @@ class Items:
     def get(self, run_id: str) -> dict[str, Any]:
         return self._api._request("GET", f"/v1/durable/runs/{run_id}")
 
-    def list(self) -> list[dict[str, Any]]:
-        return self._api._request("GET", "/v1/durable/runs")
+    def list(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        partition_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List items, optionally scoped.
+
+        THE SERVER HAS ALWAYS SUPPORTED THESE (plan 56 F6). ListRuns reads
+        ``parent_run_id``, ``agent`` and ``partition_key`` off the query
+        string; the filters grew for the dashboard, which is their only
+        consumer, and this client was never brought forward. So
+        ``papayya status`` printed "Items in this run: papayya items list",
+        and ``items list`` took no options — the only route from a submitted
+        run id to one wedged item was dumping every item in the project as
+        NDJSON and reading for "running" (plan 54 N5, plan 55 D6.3).
+
+        ``run_id`` maps to ``parent_run_id``: a submission's group id is the
+        parent of the items it fanned out into (plan 42 — the group id IS the
+        invocation id), so "the items in this run" is that filter.
+        """
+        params: dict[str, str] = {}
+        if run_id:
+            params["parent_run_id"] = run_id
+        if agent:
+            params["agent"] = agent
+        if partition_key:
+            params["partition_key"] = partition_key
+        path = "/v1/durable/runs"
+        if params:
+            from urllib.parse import urlencode
+
+            path = f"{path}?{urlencode(params)}"
+        return self._api._request("GET", path)
 
     def steps(self, run_id: str) -> list[dict[str, Any]]:
         # Durable checkpoints — {label, result, cost_usd, ...}, not the v1

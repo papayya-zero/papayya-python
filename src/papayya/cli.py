@@ -2060,12 +2060,29 @@ def items() -> None:
 
 
 @items.command("list")
+@click.option("--run", "run_id", default=None,
+              help="Only items belonging to this run (the id `papayya run` printed).")
+@click.option("--agent", default=None, help="Only items for this agent.")
+@click.option("--tenant", "partition_key", default=None,
+              help="Only items for this partition key.")
 @click.pass_context
-def items_list(ctx: click.Context) -> None:
-    """List hosted items (NDJSON, one item per line)."""
+def items_list(
+    ctx: click.Context,
+    run_id: str | None,
+    agent: str | None,
+    partition_key: str | None,
+) -> None:
+    """List hosted items (NDJSON, one item per line).
+
+    ``--run`` is the one `papayya status` has been pointing at all along: it
+    prints "Items in this run: papayya items list", and until now that command
+    could not be scoped to a run.
+    """
     client = _make_papayya_client(ctx)
     try:
-        rows = client.items.list()
+        rows = client.items.list(
+            run_id=run_id, agent=agent, partition_key=partition_key
+        )
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -3245,7 +3262,7 @@ def _echo_submission_status(api: "APIClient", run_id: str,
                   f"{run.get('completed_count', 0)} completed"
                   if run.get("status") not in ("completed",) else ""))
     click.echo(f"Cost:    {_fmt_run_cost(run)}")
-    click.echo(f"\nItems in this run:  papayya items list")
+    click.echo(f"\nItems in this run:  papayya items list --run {run_id}")
 
 
 def _fmt_run_cost(run: dict[str, Any]) -> str:
@@ -3360,11 +3377,41 @@ def status(ctx: click.Context, run_id: str) -> None:
         api.close()
 
 
+def _fmt_step_time(raw: object) -> str:
+    """Wall-clock HH:MM:SS for a step, or "" when there is nothing to show.
+
+    `papayya logs` printed durations and no timestamps, so "where did it stop"
+    meant reading to the end and inferring (plan 55 D6.1). A duration says how
+    long a step took; only a timestamp says when the run went quiet.
+
+    Never raises on a shape it does not recognise — a log command that dies on
+    an unexpected date format is worse than one that omits a column.
+    """
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        from datetime import datetime
+
+        # Server sends RFC3339 with a Z; fromisoformat wants +00:00 before 3.11.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except Exception:  # noqa: BLE001 — see docstring
+        return ""
+
+
 @main.command()
 @click.argument("run_id")
+@click.option(
+    "--tail", "-n", type=int, default=None,
+    help="Show only the last N steps. A wedged run is found at the END.",
+)
 @click.pass_context
-def logs(ctx: click.Context, run_id: str) -> None:
-    """Show step-by-step logs for a run."""
+def logs(ctx: click.Context, run_id: str, tail: int | None) -> None:
+    """Show step-by-step logs for a run.
+
+    Prints the customer's own ``item_id`` per step, not just the step label —
+    "where did it stop" is a question about the record, and a 150-page
+    document dumps 150 entries without ``--tail``.
+    """
     scope = _env_scope(ctx.obj)
     resolved_key = _require_api_key(scope)
     config = APIConfig(api_key=resolved_key, base_url=scope.base_url)
@@ -3386,6 +3433,13 @@ def logs(ctx: click.Context, run_id: str) -> None:
         # empty result, and gives us the verdict for the trailer below.
         run = api.get_run(run_id)
         steps = api.get_steps(run_id)
+        total = len(steps)
+        if tail is not None and tail > 0 and total > tail:
+            # Say what was hidden. A silently truncated list reads as a
+            # complete one, and the operator counting steps would be counting
+            # the wrong number.
+            steps = steps[-tail:]
+            click.echo(f"(showing the last {tail} of {total} steps)\n")
         if not steps:
             click.echo(
                 f"Run {run.get('run_id') or run_id} is "
@@ -3408,7 +3462,23 @@ def logs(ctx: click.Context, run_id: str) -> None:
             outcome = s.get("outcome_status") or "?"
             duration = s.get("duration_ms") or 0
 
-            click.echo(f"{i}. {label} — {outcome}  ({duration}ms)")
+            # THE CUSTOMER'S OWN ID, which this command has never printed
+            # (plan 55 D6.1). It printed the step LABEL, and the `#72` in
+            # `read-photo#72` is the auto-suffix on a repeated label — not the
+            # id the customer set. They coincided in plan 55 only because that
+            # loop happened to be 1:1 with pages, which is exactly the kind of
+            # coincidence that makes a missing field look present.
+            #
+            # The renderer's field list predates item_id on the checkpoint
+            # model; nobody re-derived it when the model grew.
+            item = s.get("item_id")
+            when = _fmt_step_time(s.get("created_at") or s.get("completed_at"))
+            head = f"{i}. {label} — {outcome}  ({duration}ms)"
+            if when:
+                head += f"  [{when}]"
+            click.echo(head)
+            if item:
+                click.echo(f"   Item: {item}")
 
             # Tokens and cost only when the step actually made a model call.
             # llm_*_tokens are omitempty server-side, so defaulting them to 0
