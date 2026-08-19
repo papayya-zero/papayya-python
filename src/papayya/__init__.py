@@ -5,7 +5,7 @@ from papayya.papayya import Papayya
 from papayya.client import Client, RunResult
 from papayya.tools import tool
 from papayya.durable import papayya, Item, PapayyaRun
-from papayya.errors import CreditExhausted, WorkloadPaused
+from papayya.errors import CreditExhausted, NonRetriable, WorkloadPaused
 from papayya.classify import is_credit_exhaustion_error, classify_provider_error
 from papayya.checks import CheckVerdict, llm_judge
 
@@ -65,7 +65,7 @@ __all__ = [
     "schedule", "trigger",
     "Papayya", "Client", "RunResult",
     "papayya", "Item", "PapayyaRun",
-    "CreditExhausted", "WorkloadPaused",
+    "CreditExhausted", "NonRetriable", "WorkloadPaused",
     "is_credit_exhaustion_error", "classify_provider_error",
     "CheckVerdict", "llm_judge",
     # iter/map deactivated (Plan 37) — see __getattr__.

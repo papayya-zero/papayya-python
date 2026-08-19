@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from papayya import CreditExhausted
+from papayya.durable import run as run_module
 from papayya.durable.run import PapayyaRun
 from papayya.durable.types import DurableRunConfig
 from papayya.llm_extract import LlmUsage
@@ -192,8 +193,12 @@ def test_unpatched_transient_error_emits_then_propagates():
     finally:
         reset_current_reporter(token)
 
-    assert len(reporter.emitted) == 1
-    assert reporter.emitted[0]["error_category"] == "transient"
+    # THREE emissions, not one — a 500 is the paradigm transient error, so
+    # plan 58 R retries it twice more, and each attempt is a real provider call
+    # the customer paid for. One telemetry row per call is the honest count;
+    # collapsing them would hide two thirds of the spend.
+    assert len(reporter.emitted) == 1 + run_module.DEFAULT_STEP_RETRIES
+    assert {e["error_category"] for e in reporter.emitted} == {"transient"}
 
 
 # ---------------------------------------------------------------------------

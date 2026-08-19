@@ -72,6 +72,34 @@ def _isolate_papayya_globals(monkeypatch, tmp_path):
         monkeypatch.setattr(cli_module, "_projects_for_api_key",
                             lambda api_key, base_url: None)
 
+    # Plan 58 R — DO NOT SERVE THE RETRY BACKOFF IN TESTS.
+    #
+    # `run.step` now retries a raising step four times with a 1/2/4/8s ladder.
+    # Six existing tests raise on purpose and have no reason to care, and they
+    # took the suite from 57s to 142s the moment the ladder landed. A suite
+    # that slow stops being run, which costs more than the coverage it buys.
+    #
+    # THE CONSTANTS, NOT `time.sleep`. The first version of this patched
+    # `run_module._time.sleep` — and `run.py` does `import time as _time`, so
+    # `_time` IS the time module and that setattr replaced `time.sleep` FOR THE
+    # WHOLE PROCESS. Three unrelated tests broke on it: the heartbeat harness
+    # recorded no beats, a duration came back 0ms, and an llm-judge timeout
+    # stopped containing anything. Worse, the damage depended on test ORDER, so
+    # a shuffled run passed and `-p no:randomly` failed. That is precisely the
+    # leak class this file exists to contain, introduced by the file itself.
+    #
+    # Zeroing the ladder keeps the RETRY and removes only the waiting, so call
+    # counts, emission counts and propagation stay production-identical. A test
+    # that wants the real ladder restores these itself; its monkeypatch runs
+    # after this one and wins (test_step_retry.py).
+    try:
+        from papayya.durable import run as _run_module
+    except Exception:  # pragma: no cover - durable extras absent
+        pass
+    else:
+        monkeypatch.setattr(_run_module, "STEP_RETRY_BASE_SECONDS", 0.0)
+        monkeypatch.setattr(_run_module, "STEP_RETRY_MAX_SECONDS", 0.0)
+
     # HOME too, so anything that reads it at CALL time (rather than at import,
     # which is the bug above) also lands in the sandbox.
     monkeypatch.setenv("HOME", str(tmp_path / "_papayya_home"))

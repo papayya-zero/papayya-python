@@ -19,6 +19,7 @@ import pytest
 
 from papayya.agent import _clear_agent_version_cache
 from papayya.durable import _schema
+from papayya.durable import run as run_module
 from papayya.durable.client import replay
 from papayya.durable._replay import ReplayError
 from papayya.durable.sqlite_store import SQLiteStore
@@ -468,7 +469,22 @@ def test_replay_bounded_by_captured_input_propagates_keyerror(
     assert "industry" in str(excinfo.value)
 
     # Cached steps did not re-run; only summarize attempted (and failed).
-    assert _read_log(log_path) == ["summarize"]
+    #
+    # THREE TIMES, because plan 58 R retries a raising step by default and this
+    # KeyError is not one the platform can rule out. Worth naming, because this
+    # is the shape where the default is pure cost: `prev` is a CACHED
+    # checkpoint result, so the arguments are byte-identical on every attempt
+    # and the lookup fails identically. A deterministic failure buys two extra
+    # executions and ~3s of backoff for nothing.
+    #
+    # The default stands anyway, one rule and two opt-outs (`NonRetriable`,
+    # `retries=0`), because the alternative is a hand-made taxonomy of "which
+    # exception classes are deterministic" — and KeyError is exactly the one
+    # that argues both ways (`resp.json()["data"]` on a malformed response is a
+    # KeyError a retry CAN fix). Revisit with real data, not with a guess.
+    assert _read_log(log_path) == ["summarize"] * (
+        1 + run_module.DEFAULT_STEP_RETRIES
+    )
     # Original still marked replayed — Phase 1+2 mark-on-either-outcome
     # semantics preserved.
     conn = sqlite3.connect(db_env)

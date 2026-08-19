@@ -8,6 +8,7 @@ checkpoint-able steps exactly as before; only the noun changed.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
@@ -20,7 +21,7 @@ from typing import Any, Callable, TypeVar, overload
 
 from papayya import outcomes
 from papayya._serialize import bind_arguments, build_input_snapshot
-from papayya.classify import classify_provider_error
+from papayya.classify import classify_provider_error, is_retryable
 from papayya.errors import CreditExhausted, WorkloadPaused
 from papayya.llm_extract import LlmUsage, extract_llm_usage
 from papayya.runtime_context import get_current_reporter
@@ -38,6 +39,58 @@ from .types import (
 
 
 log = logging.getLogger("papayya.durable")
+
+# ── Step retry defaults (plan 58 R1) ──────────────────────────────────────
+#
+# FIVE ATTEMPTS: waits of 1s, 2s, 4s and 8s, so a step gets ~15s of ladder.
+#
+# BOUNDED, NOT UNLIMITED, and that is a scoping decision rather than a tuning
+# one. Temporal retries an activity until the workflow timeout; Papayya's
+# `max_duration_seconds` watchdog lives in the WORKER (SIGALRM around the whole
+# invocation, worker.py:1557) and the run object cannot see it, so the SDK has
+# no deadline to retry against. A fixed ladder is what can be made correct
+# without inventing that channel first.
+#
+# THE NUMBER WAS MEASURED, not picked. The first cut was 3 attempts / 3s, and
+# driving walk 57's workload against a 9-second sidecar outage showed the
+# ladder giving up while the outage was still going:
+#
+#     step read-photo failed on attempt 1/3 ...; retrying in 1.0s
+#     step read-photo failed on attempt 2/3 ...; retrying in 2.0s
+#     step read-photo failed on attempt 3/3, giving up: OcrUnavailable: ...
+#
+# 15s is ~0.8% of the 1800s default run budget (dispatch.DefaultMaxDurationSeconds),
+# so one bad step cannot eat the run, and it bridges the outage class this unit
+# exists for: a sidecar restart, a deploy blip, a rate limit, a dropped socket.
+#
+# WHAT IT STILL DOES NOT COVER, said plainly because the difference is the
+# customer's: a four-minute provider outage. That one wants the run to PARK and
+# resume rather than spin — the pause covenant's shape, which `CreditExhausted`
+# already implements for an unfunded account. Separate unit.
+#
+# THE COST SIDE IS REAL TOO. A deterministic failure — a KeyError on a cached
+# checkpoint result, where the arguments are byte-identical every attempt — now
+# buys four extra executions and 15s for nothing. That is the price of one rule
+# instead of a hand-made taxonomy of which exception classes are deterministic,
+# and the two opt-outs (`NonRetriable`, `retries=0`) are how a customer who
+# knows better says so. Revisit with production data, not with a guess.
+DEFAULT_STEP_RETRIES = 4
+STEP_RETRY_BASE_SECONDS = 1.0
+STEP_RETRY_MAX_SECONDS = 8.0
+
+
+# Module-level seams so a test can observe the backoff WITHOUT reaching
+# `time.sleep`. `run.py` does `import time as _time`, so `_time` IS the time
+# module and monkeypatching `_time.sleep` replaces it for the whole process —
+# which broke the heartbeat harness, a duration assertion and an llm-judge
+# timeout in three unrelated files, order-dependently, the one time it was
+# tried. One indirection is cheaper than that class of leak.
+def _sleep(seconds: float) -> None:
+    _time.sleep(seconds)
+
+
+async def _async_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 T = TypeVar("T")
 
@@ -417,6 +470,7 @@ class Item:
         item_id: str | None = None,
         snapshot: Any = _AUTO,
         kind: str | None = None,
+        retries: int | None = None,
         expect_count: Any = None,
         expect_coverage: str | None = None,
         expect_fields: Any = None,
@@ -461,6 +515,16 @@ class Item:
           observability path (tokens, model, stop_reason, credit-error
           classification). Use ``run.llm_step(label, fn)`` instead;
           ``kind=`` will be removed in the next minor release.
+        * ``retries`` — how many EXTRA attempts a raising step gets, on top of
+          the first (plan 58 R1). Defaults to ``DEFAULT_STEP_RETRIES``. Pass
+          ``retries=0`` for a step whose side effect must happen at most once
+          and that you have no idempotency key for::
+
+              run.step("charge-card", charge, retries=0)(order)
+
+          Per-raise control is :class:`papayya.NonRetriable`, which is usually
+          the better tool: it keeps the retry for the failures that deserve
+          one and skips it for the failure you can already rule out.
 
         Conservation contracts — what this step's output must conserve
         about its input. All three default to absent, and absence means no
@@ -503,7 +567,7 @@ class Item:
         if isinstance(label_or_fn, str) and fn is not None:
             return self._wrap(
                 label_or_fn, fn, item_id=item_id, snapshot=snapshot, kind=kind,
-                contract=contract,
+                contract=contract, retries=retries,
             )
 
         # Case 2: run.task(fn) — DEPRECATED, label derived from fn.__name__.
@@ -517,7 +581,7 @@ class Item:
             self._warn_legacy_step_form("fn-only", label)
             return self._wrap(
                 label, label_or_fn, item_id=item_id, snapshot=snapshot, kind=kind,
-                contract=contract,
+                contract=contract, retries=retries,
             )
 
         # Case 3: @run.task("label") — DEPRECATED decorator form.
@@ -528,11 +592,12 @@ class Item:
             _snapshot = snapshot
             _kind = kind
             _contract = contract
+            _retries = retries
 
             def decorator(f: Callable[..., T]) -> Callable[..., T]:
                 return self._wrap(
                     label, f, item_id=_item_id, snapshot=_snapshot, kind=_kind,
-                    contract=_contract,
+                    contract=_contract, retries=_retries,
                 )
 
             return decorator
@@ -681,6 +746,7 @@ class Item:
         *,
         item_id: str | None = None,
         snapshot: Any = _AUTO,
+        retries: int | None = None,
         expect_count: Any = None,
         expect_coverage: str | None = None,
         expect_fields: Any = None,
@@ -694,6 +760,11 @@ class Item:
         ``classify_provider_error`` — credit-shaped exceptions are
         re-raised as ``CreditExhausted`` so the runtime pauses instead
         of failing.
+
+        ``retries`` behaves as it does on ``run.step``, with one interaction
+        worth naming: credit exhaustion is promoted to ``CreditExhausted``
+        BEFORE the retry decision, so an unfunded account pauses the run rather
+        than burning the ladder against a condition no retry can change.
 
         The ``expect_*`` conservation contracts behave exactly as they do on
         ``run.step`` — see its docstring. They read the value the step
@@ -711,6 +782,7 @@ class Item:
                 expect_coverage=expect_coverage,
                 expect_fields=expect_fields,
             ),
+            retries=retries,
         )
 
     def _warn_kind_llm_deprecated(self, label: str) -> None:
@@ -758,6 +830,7 @@ class Item:
         snapshot: Any = _AUTO,
         kind: str | None = None,
         contract: outcomes.ConservationContract | None = None,
+        retries: int | None = None,
     ) -> Callable[..., Any]:
         """Build the durable wrapper around ``fn``.
 
@@ -1063,6 +1136,83 @@ class Item:
             except Exception:
                 pass
 
+
+        # ── Retry (plan 58 R1) ────────────────────────────────────────────
+        #
+        # THE LOOP GOES AROUND `fn` ONLY, INSIDE ONE _pre_call ENVELOPE, and
+        # that placement is the whole design. Two existing contracts decide it,
+        # and the first draft of plan 58 got both backwards:
+        #
+        # 1. A FAILED EXECUTION WRITES NO CHECKPOINT. `_next_execution` — the
+        #    only thing that mints an `attempt` — is called from
+        #    `_post_call_success`. So `attempt` counts re-executions ACROSS
+        #    PASSES (a resume, a replay, a re-lease), seeded from STORED rows.
+        #    An in-process retry stores nothing, so it must not advance it, or
+        #    the number an operator reads stops meaning what plan 41 R3 built
+        #    it to mean.
+        #
+        # 2. `run.idempotency_key` MUST NOT ADVANCE EITHER, and its own
+        #    docstring already says why: "a crash before the checkpoint
+        #    persisted leaves nothing recorded, so the resumed execution sends
+        #    the SAME key and the provider replays its stored response. That is
+        #    the point of the key — it is what stops the retry billing your
+        #    provider account twice." A retry after a raise is exactly that
+        #    case. If the provider had already done the work when the
+        #    connection dropped, the same key gets the stored answer back
+        #    instead of paying for it again.
+        #
+        # Everything above the call boundary — the pause fence, the occurrence
+        # counter, the cache lookup, the LLM interceptor token — therefore runs
+        # once, which is also the only way `label#N` alignment survives.
+        attempts_allowed = 1 + (
+            DEFAULT_STEP_RETRIES if retries is None else max(0, int(retries))
+        )
+
+        def _retry_wait(attempt: int) -> float:
+            """Seconds to sleep before attempt ``attempt + 1`` (1-indexed).
+
+            Exponential from a 1s base, capped. Deliberately NOT the api.py
+            ladder (0.1s → 2.0s): that one guards a control-plane round trip
+            where the far side is either up or down. This one guards a
+            PROVIDER outage, which is measured in seconds at best — a
+            sub-second ladder would spend the whole budget before the sidecar
+            has finished restarting.
+            """
+            return min(STEP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                       STEP_RETRY_MAX_SECONDS)
+
+        def _should_retry(exc: BaseException, attempt: int) -> bool:
+            """Decide, log the decision, and sleep. Returns True to go again.
+
+            THE LOG LINE IS NOT DECORATION. A retry that leaves no trace is the
+            platform quietly spending the customer's money and their wall
+            clock — the same rule that makes cohort truncation say so out loud.
+            Until a failed attempt has somewhere to live on the record, this
+            line is the only place it exists.
+            """
+            if attempt >= attempts_allowed:
+                if attempts_allowed > 1:
+                    log.warning(
+                        "step %s failed on attempt %d/%d, giving up: %s: %s",
+                        label, attempt, attempts_allowed,
+                        type(exc).__name__, exc,
+                    )
+                return False
+            if not is_retryable(exc):
+                log.info(
+                    "step %s failed on attempt %d/%d and will not be retried "
+                    "(%s): %s",
+                    label, attempt, attempts_allowed, type(exc).__name__, exc,
+                )
+                return False
+            wait = _retry_wait(attempt)
+            log.warning(
+                "step %s failed on attempt %d/%d (%s: %s); retrying in %.1fs",
+                label, attempt, attempts_allowed,
+                type(exc).__name__, exc, wait,
+            )
+            return True
+
         if is_async:
 
             @functools.wraps(fn)
@@ -1071,18 +1221,27 @@ class Item:
                 if ctx is None:
                     return cache_hit
                 try:
-                    try:
-                        result = await fn(*args, **kwargs)
-                    except Exception as exc:
-                        _post_call_exception(exc, ctx)
-                        if kind == "llm":
-                            category = classify_provider_error(exc)
-                            if category == "credit" and not isinstance(exc, CreditExhausted):
-                                raise CreditExhausted(
-                                    f"{label}: provider credits exhausted ({exc})"
-                                ) from exc
-                        raise
-                    return _post_call_success(result, ctx, args, kwargs)
+                    for attempt in range(1, attempts_allowed + 1):
+                        try:
+                            result = await fn(*args, **kwargs)
+                        except Exception as exc:
+                            _post_call_exception(exc, ctx)
+                            if kind == "llm":
+                                category = classify_provider_error(exc)
+                                if category == "credit" and not isinstance(exc, CreditExhausted):
+                                    raise CreditExhausted(
+                                        f"{label}: provider credits exhausted ({exc})"
+                                    ) from exc
+                            if _should_retry(exc, attempt):
+                                # asyncio.sleep, not _time.sleep — blocking the
+                                # loop here would stall every other coroutine
+                                # in the same @agent body, including the ones
+                                # that are working.
+                                await _async_sleep(_retry_wait(attempt))
+                                continue
+                            raise
+                        return _post_call_success(result, ctx, args, kwargs)
+                    raise AssertionError("unreachable: retry loop fell through")
                 finally:
                     _ensure_cleanup(ctx)
 
@@ -1094,18 +1253,26 @@ class Item:
             if ctx is None:
                 return cache_hit
             try:
-                try:
-                    result = fn(*args, **kwargs)
-                except Exception as exc:
-                    _post_call_exception(exc, ctx)
-                    if kind == "llm":
-                        category = classify_provider_error(exc)
-                        if category == "credit" and not isinstance(exc, CreditExhausted):
-                            raise CreditExhausted(
-                                f"{ctx.effective_label}: provider credits exhausted ({exc})"
-                            ) from exc
-                    raise
-                return _post_call_success(result, ctx, args, kwargs)
+                for attempt in range(1, attempts_allowed + 1):
+                    try:
+                        result = fn(*args, **kwargs)
+                    except Exception as exc:
+                        _post_call_exception(exc, ctx)
+                        if kind == "llm":
+                            category = classify_provider_error(exc)
+                            if category == "credit" and not isinstance(exc, CreditExhausted):
+                                # Promoted BEFORE the retry decision, so the
+                                # pause path wins over the retry loop — you
+                                # cannot retry an unfunded account.
+                                raise CreditExhausted(
+                                    f"{ctx.effective_label}: provider credits exhausted ({exc})"
+                                ) from exc
+                        if _should_retry(exc, attempt):
+                            _sleep(_retry_wait(attempt))
+                            continue
+                        raise
+                    return _post_call_success(result, ctx, args, kwargs)
+                raise AssertionError("unreachable: retry loop fell through")
             finally:
                 _ensure_cleanup(ctx)
 

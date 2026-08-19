@@ -126,3 +126,60 @@ def classify_provider_error(exc: BaseException) -> str:
 
     # Everything else (400, 401, 403, 404, ...) is permanent.
     return "permanent"
+
+
+# Statuses that are POSITIVE evidence a second attempt is pointless. A bad
+# request is still bad in four seconds; a 401 is still a 401.
+#
+# 429 IS DELIBERATELY ABSENT even though it is a client-error status — a rate
+# limit is the single most retryable thing a provider produces.
+_PERMANENT_STATUSES = frozenset({400, 401, 403, 404, 405, 409, 410, 422})
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """Whether ``run.step`` should run this step again (plan 58 R1).
+
+    **This deliberately does NOT delegate to :func:`classify_provider_error`,
+    and the reason is the measurement that shaped the whole unit.** That
+    function's final line is ``return "permanent"`` — so ``permanent`` means
+    *either* "we saw a 401" *or* "we have never seen this exception before",
+    and it cannot tell you which. Executed against the exception this feature
+    exists to fix::
+
+        >>> classify_provider_error(OcrUnavailable(
+        ...     "ocr sidecar returned 503 for page 17 of DOC-2001"))
+        'permanent'
+
+    A customer-raised exception carries no ``status_code`` attribute and does
+    not match the keyword list, so it falls through to the default. Gating
+    retries on that verdict means **retrying only exceptions raised by an LLM
+    SDK we already recognise** — which is every case except the ones customers
+    actually write.
+
+    So the rule inverts: **retry unless there is positive evidence it is
+    pointless.** Unknown is not evidence.
+
+    Three things stop a retry, each for its own reason:
+
+    * :class:`NonRetriable` — the customer said so, and they know their domain.
+    * Credit exhaustion — retrying cannot fund an account. The existing
+      ``CreditExhausted`` path pauses the run instead, which is a better
+      outcome than either failing or spinning.
+    * An identified permanent HTTP status — the only case where the platform
+      itself has grounds.
+
+    ``classify_provider_error`` keeps its job of labelling
+    ``error_category`` on the record; it is just no longer the gate.
+    """
+    from papayya.errors import CreditExhausted, NonRetriable, WorkloadPaused
+
+    # WorkloadPaused is control flow, not a failure: a fence stopped the run
+    # between steps. Retrying it would fight the fence.
+    if isinstance(exc, (NonRetriable, WorkloadPaused, CreditExhausted)):
+        return False
+    if is_credit_exhaustion_error(exc):
+        return False
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status in _PERMANENT_STATUSES:
+        return False
+    return True

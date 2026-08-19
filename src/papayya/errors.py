@@ -54,3 +54,34 @@ class WorkloadPaused(Exception):
         super().__init__(reason)
         self.reason = reason
         self.run_id = run_id
+
+
+class NonRetriable(Exception):
+    """Raise this to tell the runtime NOT to retry the step (plan 58 R1).
+
+    ``run.step`` retries a raising step by default, because a transient
+    provider outage should not become an operator's incident. That default is
+    wrong for work you know cannot succeed on a second attempt — a malformed
+    document, a validation failure, an unroutable record — and re-running it
+    costs the customer time and money for a certainty::
+
+        from papayya import NonRetriable
+
+        def classify(doc):
+            if doc["kind"] not in KNOWN:
+                raise NonRetriable(f"unknown document kind: {doc['kind']}")
+
+    Wrap the real cause rather than replacing it::
+
+        except MyValidationError as e:
+            raise NonRetriable(str(e)) from e
+
+    The exception surfaces to the run exactly as any other failure — the run
+    fails, the record enters triage, `error` carries this message. The only
+    thing this class changes is how many times the step ran first.
+
+    For provider credit exhaustion use :class:`CreditExhausted` instead: that
+    one pauses the run rather than failing it, which is a different and better
+    outcome for a condition the operator can actually fix.
+    """
+    pass
