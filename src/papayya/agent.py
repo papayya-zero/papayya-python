@@ -175,6 +175,46 @@ def reset_bootstrap_item_id(token) -> None:
     _BOOTSTRAP_ITEM_ID.reset(token)
 
 
+# The lease this invocation is executing under (plan 56 F3). Read by
+# CloudStore on every checkpoint/status write and sent as X-Papayya-Lease, so
+# the control-plane can reject writes from a worker whose lease was revoked.
+#
+# WHY THE WRITES NEED IT AT ALL. The lease lane (/lease, /complete,
+# /heartbeat) and the record lane (/runs/{id}/checkpoints, PATCH /runs/{id})
+# are two subsystems that shared no token, so a revoked lease was a request
+# the server hoped the client would honour. Plan 55 measured what that is
+# worth: a worker that got HTTP 410 logged the rejection and then wrote three
+# checkpoints and PATCHed the run to `completed`, all accepted, after another
+# worker had already been given the item.
+#
+# It is None outside a hosted invocation — the local path and the tenant API
+# have no lease, and the header is simply absent there.
+_BOOTSTRAP_LEASE_ID: ContextVar[str | None] = ContextVar(
+    "papayya_bootstrap_lease_id", default=None
+)
+
+
+def set_bootstrap_lease_id(lease_id: str | None):
+    """Set the lease id for this invocation. Returns the contextvar token;
+    the worker resets it in a finally."""
+    return _BOOTSTRAP_LEASE_ID.set(lease_id)
+
+
+def reset_bootstrap_lease_id(token) -> None:
+    """Restore the bootstrap-lease-id contextvar to its prior value."""
+    _BOOTSTRAP_LEASE_ID.reset(token)
+
+
+def current_lease_id() -> str | None:
+    """The lease this thread is executing under, or None.
+
+    Read on the write path rather than passed down: the customer's function
+    sits between the worker and the store, and threading a lease id through
+    it would put a platform concern in a user-facing signature.
+    """
+    return _BOOTSTRAP_LEASE_ID.get()
+
+
 def consume_bootstrap_run_id() -> str | None:
     """One-shot read of the worker-injected run_id. Returns the lease's
     run_id when a worker set it for this invocation, None otherwise.

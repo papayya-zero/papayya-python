@@ -117,6 +117,26 @@ class CloudStoreConfig:
     platform_auth: bool = False
 
 
+def _attach_lease_header(request: "httpx.Request") -> None:
+    """Stamp X-Papayya-Lease on outbound writes when one is in scope.
+
+    Absent outside a hosted invocation — the local path and the tenant-scoped
+    API have no lease, and the server only fences the /v1/runtime/* routes.
+
+    Read from a contextvar rather than passed as an argument because the
+    customer's function sits between the worker and this client; threading a
+    lease id through it would put a platform concern into a user-facing
+    signature, and any customer who spawned a thread would drop it.
+    """
+    # Local import: papayya.agent imports the durable package, so a
+    # module-level import here is a cycle.
+    from papayya.agent import current_lease_id
+
+    lease_id = current_lease_id()
+    if lease_id:
+        request.headers["X-Papayya-Lease"] = lease_id
+
+
 class CloudStore:
     """Checkpoint store that persists to the Papayya control plane via HTTP.
 
@@ -137,6 +157,16 @@ class CloudStore:
             base_url=config.base_url,
             headers=headers,
             timeout=config.timeout,
+            # Plan 56 F3. The lease this invocation runs under is stamped on
+            # every write so the control-plane can reject one from a worker
+            # whose lease was revoked — see _attach_lease_header.
+            #
+            # AN EVENT HOOK, NOT A CONSTRUCTOR HEADER, and that is forced: the
+            # store is built ONCE per worker process, before the customer's
+            # module is even imported, and the lease changes per item. A
+            # header baked in here would pin every write for the process
+            # lifetime to whichever lease happened to be first.
+            event_hooks={"request": [_attach_lease_header]},
         )
         self._journal = LineageJournal(resolve_journal_path())
         # Plan 33: pause reason per run_id, set from a SaveCheckpoint response
