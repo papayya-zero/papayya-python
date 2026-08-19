@@ -126,3 +126,25 @@ def test_success_does_not_raise():
 
     request = httpx.Request("POST", "http://cp.invalid/x")
     _raise_with_server_message(httpx.Response(201, json={}, request=request))
+
+
+def test_http_error_includes_the_request_id():
+    # Plan 56 F7 echoes X-Request-Id on every response. Surfacing it here is
+    # what makes a 500 findable in a log the operator does not control.
+    import httpx
+    import pytest
+
+    from papayya.durable.cloud_store import _raise_with_server_message
+
+    request = httpx.Request("POST", "http://cp.invalid/v1/agents/x/deployments")
+    resp = httpx.Response(
+        500,
+        json={"error": {"message": "failed to upload artifact"}},
+        headers={"X-Request-Id": "abc123/xyz-000042"},
+        request=request,
+    )
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        _raise_with_server_message(resp)
+
+    assert "failed to upload artifact" in str(exc.value)
+    assert "abc123/xyz-000042" in str(exc.value)

@@ -158,6 +158,13 @@ def _raise_with_server_message(resp: "httpx.Response") -> None:
     message = f"{resp.status_code} from {resp.request.method} {resp.request.url}"
     if detail:
         message += f": {detail}"
+    # The server's own correlation id, echoed on every response since plan 56
+    # F7. It is what turns "it 500'd" into a line an operator can actually
+    # find — the API log was 100% idle-poll noise, so the deploy failure that
+    # read as "logs nothing server-side" was in there and ungreppable.
+    request_id = resp.headers.get("X-Request-Id")
+    if request_id:
+        message += f" (request_id={request_id})"
     raise httpx.HTTPStatusError(message, request=resp.request, response=resp)
 
 
