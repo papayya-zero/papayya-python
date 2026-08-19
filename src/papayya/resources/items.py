@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 import json
+import uuid as _uuid
 from typing import Any, Iterator, TYPE_CHECKING
 
 import httpx
 
+from papayya.api import PapayyaAPIError
+
 if TYPE_CHECKING:
     from papayya.api import APIClient
+
+
+def _looks_like_uuid(value: str) -> bool:
+    """Whether to spend a round trip treating `value` as OUR id first.
+
+    Shape only. A customer's own key is allowed to be a uuid — order numbers
+    from an upstream system often are — so this decides the ORDER of two
+    lookups, never which one is authoritative.
+    """
+    try:
+        _uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def _ensure_run_id(resp: Any) -> Any:
@@ -103,8 +120,79 @@ class Items:
     # — their endpoints are gone and the durable triage-action lifecycle
     # (dlq_disposition) is a deferred follow-up.
 
-    def get(self, run_id: str) -> dict[str, Any]:
-        return self._api._request("GET", f"/v1/durable/runs/{run_id}")
+    def get(self, item_id: str) -> dict[str, Any]:
+        """Fetch ONE record, by our run id or by the customer's own key.
+
+        The argument has been named ``item_id`` on the CLI since 0.3.0 and the
+        help has said "fetch one hosted item by id" for as long — and it
+        resolved ONLY a run uuid, so ``papayya items get DOC-2001`` answered
+        "durable run not found" about a document the product had just named in
+        the triage feed (plan 57 D5). Plan 43 B2a exists so a customer can
+        address a record by their own key; this was the one command whose
+        signature promised exactly that and the one that refused.
+
+        Resolution order, and the ordering is a round-trip decision:
+
+        * A uuid-shaped argument is tried as a run id first — that is what it
+          almost always is, and the direct GET is one call.
+        * Anything else goes straight to the key lookup; trying it as a run id
+          would be a guaranteed 404.
+        * A uuid-shaped argument that 404s falls through to the key lookup
+          anyway, because a customer's own id is allowed to be a uuid.
+
+        When a key names several records — which is the NORMAL state after a
+        re-drive, since replay mints a new run id under the same key — the
+        newest is returned. Use :meth:`resolve` to see all of them; the CLI
+        does, and says so.
+        """
+        def by_run_id() -> dict[str, Any] | None:
+            try:
+                return self._api._request("GET", f"/v1/durable/runs/{item_id}")
+            except PapayyaAPIError as e:
+                # 404 only. A 403 means the caller has a real problem with THAT
+                # run, and retrying it as a customer key would replace a clear
+                # error with "not found".
+                if e.status != 404:
+                    raise
+                return None
+
+        def by_customer_key() -> dict[str, Any] | None:
+            matches = self.resolve(item_id)
+            return matches[0] if matches else None
+
+        # BOTH are tried either way; the shape only decides which goes first.
+        # run_id is a TEXT column, so "not uuid-shaped" is not proof it is not
+        # a run id, and a customer's own key is allowed to be a uuid.
+        order = (by_run_id, by_customer_key) if _looks_like_uuid(item_id) \
+            else (by_customer_key, by_run_id)
+        for lookup in order:
+            found = lookup()
+            if found is not None:
+                return found
+
+        raise PapayyaAPIError(
+            404,
+            f"no record found for {item_id!r} — it is not a run id, and no "
+            f"item carries it as its item_id",
+        )
+
+    def resolve(self, item_id: str) -> list[dict[str, Any]]:
+        """Every record carrying the customer's ``item_id``, newest first.
+
+        More than one is the ordinary case for a document that was re-driven:
+        the submission that failed and the replay that fixed it are two runs
+        under one key, and until plan 57 D5 the only surface that joined them
+        was the dashboard item page — which you can only reach if you already
+        hold the uuid of the run that failed.
+        """
+        rows = self.list(item_id=item_id)
+        if not isinstance(rows, list):
+            return []
+        return sorted(
+            (r for r in rows if isinstance(r, dict)),
+            key=lambda r: r.get("created_at") or "",
+            reverse=True,
+        )
 
     def list(
         self,
@@ -112,6 +200,9 @@ class Items:
         run_id: str | None = None,
         agent: str | None = None,
         partition_key: str | None = None,
+        item_id: str | None = None,
+        item_id_prefix: str | None = None,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         """List items, optionally scoped.
 
@@ -127,6 +218,17 @@ class Items:
         ``run_id`` maps to ``parent_run_id``: a submission's group id is the
         parent of the items it fanned out into (plan 42 — the group id IS the
         invocation id), so "the items in this run" is that filter.
+
+        ``item_id`` / ``item_id_prefix`` / ``status`` ARE NEW ON BOTH SIDES
+        (plan 57 D4). The server accepted those names and ignored them, so
+        ``?item_id=DOC-2001`` returned every run in the project and a client
+        that trusted it rendered one document's history under another's
+        heading. They are honored now, and an unknown param is a 400 — so this
+        method sending a name the server does not implement fails loudly
+        instead of over-returning.
+
+        ``item_id_prefix`` is the unit BELOW the document: ``DOC-2001#``
+        selects every page-grained record of one photo report.
         """
         params: dict[str, str] = {}
         if run_id:
@@ -135,6 +237,12 @@ class Items:
             params["agent"] = agent
         if partition_key:
             params["partition_key"] = partition_key
+        if item_id:
+            params["item_id"] = item_id
+        if item_id_prefix:
+            params["item_id_prefix"] = item_id_prefix
+        if status:
+            params["status"] = status
         path = "/v1/durable/runs"
         if params:
             from urllib.parse import urlencode

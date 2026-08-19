@@ -57,10 +57,20 @@ def _isolate_papayya_globals(monkeypatch, tmp_path):
         pass
     else:
         monkeypatch.setattr(cli_module, "_CONFIG_FILE", config_dir / "config.json")
-        # Resolving a project id from a key is a network call the CLI memoises
-        # for the life of the process; a stale entry would answer for a later
-        # test's key.
-        cli_module._PROJECT_ID_BY_KEY.clear()
+        # Resolving a key's projects is a network call the CLI memoises for the
+        # life of the process; a stale entry would answer for a later test's
+        # key. Cleared AND stubbed: since plan 57 D8 an explicit
+        # PAPAYYA_API_KEY makes the CLI ask the control plane which project
+        # that key can reach, so without a stub most of this suite would dial
+        # api.getpapayya.com through five retries.
+        #
+        # None is the honest stub — it is what the real function returns when
+        # it cannot ask, and callers must treat that as "unknown", never as a
+        # refusal. A test that cares about the lookup monkeypatches this
+        # itself; its patch runs after and wins.
+        cli_module._PROJECTS_BY_KEY.clear()
+        monkeypatch.setattr(cli_module, "_projects_for_api_key",
+                            lambda api_key, base_url: None)
 
     # HOME too, so anything that reads it at CALL time (rather than at import,
     # which is the bug above) also lands in the sandbox.

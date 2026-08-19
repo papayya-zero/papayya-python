@@ -39,6 +39,7 @@ class Runs:
         self,
         *,
         agent: str | None = None,
+        item_id: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """List this project's runs (invocations), newest first.
@@ -50,13 +51,26 @@ class Runs:
 
         ``agent`` narrows to one slug; omitted means every agent, which is the
         question as usually asked.
+
+        ``item_id`` narrows to the runs that touched ONE of your records (plan
+        57 D5) — the question "what ran my document", which had no answer at
+        all. A re-driven document is spread across the submission that failed
+        and the replay that fixed it; this returns both.
+
+        The query string is urlencoded rather than concatenated: an agent slug
+        or a document id containing `&` or a space used to produce a request
+        the server read as different parameters entirely.
         """
-        query = []
+        from urllib.parse import urlencode
+
+        params: dict[str, str] = {}
         if agent:
-            query.append(f"agent={agent}")
+            params["agent"] = agent
+        if item_id:
+            params["item_id"] = item_id
         if limit is not None:
-            query.append(f"limit={limit}")
-        suffix = ("?" + "&".join(query)) if query else ""
+            params["limit"] = str(limit)
+        suffix = ("?" + urlencode(params)) if params else ""
         return self._api._request("GET", f"/v2/runs{suffix}")
 
     def create(

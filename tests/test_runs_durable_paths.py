@@ -38,18 +38,27 @@ def _record(paths: list[str], json_body: object) -> Callable[[httpx.Request], ht
     return handler
 
 
+# A REAL run id, not "r-1". The SDK mints uuid4 throughout and the control
+# plane's acceptance gate parses them as uuids even though the column is TEXT —
+# and since plan 57 D5 `items.get` uses that shape to decide which lookup to
+# spend first (a bare key like DOC-2001 goes straight to ?item_id=, because
+# trying it as a run id would be a guaranteed 404). A fixture id that no real
+# run could have was asserting an order production never takes.
+RUN_ID = "0ac9eb00-1111-4111-8111-111111111111"
+
+
 def test_runs_resource_read_paths_are_durable() -> None:
     paths: list[str] = []
-    runs, _ = _make(_record(paths, {"run_id": "r-1", "status": "queued"}))
+    runs, _ = _make(_record(paths, {"run_id": RUN_ID, "status": "queued"}))
 
-    runs.get("r-1")
+    runs.get(RUN_ID)
     runs.list()
-    runs.steps("r-1")
+    runs.steps(RUN_ID)
 
     assert paths == [
-        "/v1/durable/runs/r-1",
+        f"/v1/durable/runs/{RUN_ID}",
         "/v1/durable/runs",
-        "/v1/durable/runs/r-1/checkpoints",
+        f"/v1/durable/runs/{RUN_ID}/checkpoints",
     ]
 
 

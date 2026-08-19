@@ -36,6 +36,7 @@ class _FakeItems:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.list_return: list[dict[str, Any]] = []
         self.get_return: dict[str, Any] = {"id": "i1", "status": "completed"}
+        self.resolve_return: list[dict[str, Any]] = []
         self.stream_events: list[dict[str, Any]] = []
         self.raise_on: str | None = None
 
@@ -49,13 +50,19 @@ class _FakeItems:
         run_id: str | None = None,
         agent: str | None = None,
         partition_key: str | None = None,
+        item_id: str | None = None,
+        item_id_prefix: str | None = None,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         # Records the scope so a test can assert `--run` actually reached the
         # resource. Plan 56 F6: the server has always accepted parent_run_id,
-        # agent and partition_key — only the client never passed them.
+        # agent and partition_key — only the client never passed them. Plan 57
+        # D4: it ACCEPTED the three below and ignored them, which is worse.
         self.calls.append((
             "list",
-            {"run_id": run_id, "agent": agent, "partition_key": partition_key},
+            {"run_id": run_id, "agent": agent, "partition_key": partition_key,
+             "item_id": item_id, "item_id_prefix": item_id_prefix,
+             "status": status},
         ))
         self._maybe_raise("list")
         return self.list_return
@@ -64,6 +71,11 @@ class _FakeItems:
         self.calls.append(("get", {"item_id": item_id}))
         self._maybe_raise("get")
         return self.get_return
+
+    def resolve(self, item_id: str) -> list[dict[str, Any]]:
+        self.calls.append(("resolve", {"item_id": item_id}))
+        self._maybe_raise("resolve")
+        return self.resolve_return
 
     def stream(self, item_id: str, *, from_step: int | None = None):
         self.calls.append(("stream", {"item_id": item_id, "from_step": from_step}))
@@ -76,8 +88,9 @@ class _FakeRuns:
         self.calls: list[dict[str, Any]] = []
         self.list_return: list[dict[str, Any]] = []
 
-    def list(self, *, agent: str | None = None, limit: int | None = None):
-        self.calls.append({"agent": agent, "limit": limit})
+    def list(self, *, agent: str | None = None, item_id: str | None = None,
+             limit: int | None = None):
+        self.calls.append({"agent": agent, "item_id": item_id, "limit": limit})
         return self.list_return
 
 
@@ -119,7 +132,8 @@ def test_items_list_outputs_ndjson(fake_client: _FakeClient) -> None:
     assert result.exit_code == 0, result.output
     # Unscoped stays unscoped: every filter None is "the whole project", which
     # is what this command has always done.
-    assert ("list", {"run_id": None, "agent": None, "partition_key": None}) \
+    assert ("list", {"run_id": None, "agent": None, "partition_key": None,
+                     "item_id": None, "item_id_prefix": None, "status": None}) \
         in fake_client.items.calls
     lines = [ln for ln in result.output.splitlines() if ln.strip()]
     assert [json.loads(ln)["id"] for ln in lines] == ["r1", "r2"]
@@ -136,7 +150,8 @@ def test_items_list_scopes_to_a_run(fake_client: _FakeClient) -> None:
     fake_client.items.list_return = [{"id": "r1"}]
     result = _run(["items", "list", "--run", "run-42", "--tenant", "northwind"])
     assert result.exit_code == 0, result.output
-    assert ("list", {"run_id": "run-42", "agent": None, "partition_key": "northwind"}) \
+    assert ("list", {"run_id": "run-42", "agent": None, "partition_key": "northwind",
+                     "item_id": None, "item_id_prefix": None, "status": None}) \
         in fake_client.items.calls
 
 
@@ -256,7 +271,7 @@ def test_runs_list_passes_the_agent_filter_through(fake_client: _FakeClient) -> 
     fake_client.runs.list_return = []
     _run(["runs", "list", "--agent", "triage"])
 
-    assert fake_client.runs.calls == [{"agent": "triage", "limit": 20}]
+    assert fake_client.runs.calls == [{"agent": "triage", "item_id": None, "limit": 20}]
 
 
 def test_runs_list_json_is_one_run_per_line(fake_client: _FakeClient) -> None:
@@ -267,3 +282,69 @@ def test_runs_list_json_is_one_run_per_line(fake_client: _FakeClient) -> None:
 
     lines = [json.loads(ln) for ln in result.output.splitlines() if ln.strip()]
     assert [r["id"] for r in lines] == ["r-1", "r-2"]
+
+
+# ---------------------------------------------------------------------------
+# Plan 57 D4/D5 — the document becomes addressable from the CLI.
+# ---------------------------------------------------------------------------
+
+def test_items_list_passes_the_item_filters_through(fake_client: _FakeClient) -> None:
+    """These three names were ACCEPTED by the server and ignored, which is
+    worse than unsupported: `?item_id=DOC-2001` returned every run in the
+    project, so a client that trusted it rendered one document's history under
+    another's heading."""
+    fake_client.items.list_return = []
+    result = _run(["items", "list", "--item-prefix", "DOC-2001#", "--status", "failed"])
+    assert result.exit_code == 0, result.output
+    assert ("list", {"run_id": None, "agent": None, "partition_key": None,
+                     "item_id": None, "item_id_prefix": "DOC-2001#",
+                     "status": "failed"}) in fake_client.items.calls
+
+
+def test_runs_list_passes_the_item_filter_through(fake_client: _FakeClient) -> None:
+    fake_client.runs.list_return = []
+    _run(["runs", "list", "--item", "DOC-2001"])
+    assert fake_client.runs.calls == [
+        {"agent": None, "item_id": "DOC-2001", "limit": 20}]
+
+
+def test_runs_list_empty_under_item_names_the_filter(fake_client: _FakeClient) -> None:
+    """An empty list under a narrowing flag reads as "you have never run
+    anything" — the zero-returning default this codebase keeps meeting."""
+    fake_client.runs.list_return = []
+    result = _run(["runs", "list", "--item", "DOC-9999"])
+    assert result.exit_code == 0
+    assert "DOC-9999" in result.output
+    assert "items get" in result.output
+
+
+def test_items_get_names_the_other_runs_of_the_same_document(
+    fake_client: _FakeClient,
+) -> None:
+    """THE plan 57 D5 case. After a re-drive the document lives under two run
+    ids and no CLI surface joined them, so a customer who fixed a document
+    could not get from the run that failed to the run that fixed it."""
+    fake_client.items.get_return = {
+        "run_id": "9be12e39", "item_id": "DOC-2001", "status": "completed"}
+    fake_client.items.resolve_return = [
+        {"run_id": "9be12e39", "item_id": "DOC-2001", "status": "completed",
+         "created_at": "2026-08-19T10:04:00Z"},
+        {"run_id": "0ac9eb00", "item_id": "DOC-2001", "status": "failed",
+         "created_at": "2026-08-19T10:00:00Z"},
+    ]
+    result = _run(["items", "get", "DOC-2001"])
+    assert result.exit_code == 0, result.output
+    assert "0ac9eb00" in result.output, "the earlier run must be named"
+    assert "1 earlier run" in result.output
+
+
+def test_items_get_on_a_lone_record_says_nothing_extra(
+    fake_client: _FakeClient,
+) -> None:
+    fake_client.items.get_return = {
+        "run_id": "9be12e39", "item_id": "DOC-2000", "status": "completed"}
+    fake_client.items.resolve_return = [
+        {"run_id": "9be12e39", "item_id": "DOC-2000", "status": "completed"}]
+    result = _run(["items", "get", "DOC-2000"])
+    assert result.exit_code == 0
+    assert "earlier run" not in result.output

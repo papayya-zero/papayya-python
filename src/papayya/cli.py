@@ -118,14 +118,51 @@ def _distinct_step_count(checkpoints: Any) -> int:
     return len({c.get("label") for c in (checkpoints or [])})
 
 
-# Memo for _project_id_from_api_key, keyed by (api_key, base_url). _env_scope
-# is called more than once per command by some code paths, and the lookup is a
+# Memo for _projects_for_api_key, keyed by (api_key, base_url). _env_scope is
+# called more than once per command by some code paths, and the lookup is a
 # network round trip.
-_PROJECT_ID_BY_KEY: dict[tuple[str, str], str | None] = {}
+_PROJECTS_BY_KEY: dict[tuple[str, str], list[str] | None] = {}
+
+
+def _projects_for_api_key(api_key: str | None, base_url: str) -> list[str] | None:
+    """The project ids this API key can actually operate on, or None if unknown.
+
+    None means "we could not ask" — no key, or the control plane was
+    unreachable — and is deliberately distinct from `[]`, "we asked and the
+    answer was none". Callers must not turn None into a refusal: this runs on
+    paths that would otherwise have failed anyway and must not convert a clear
+    server error into a guess about the user's config.
+
+    GET /v1/projects is KEY-SCOPED as of plan 48: a project-scoped credential
+    sees exactly its own project, not its siblings. That is what makes this
+    authoritative rather than a heuristic — before it, a project key on a
+    two-project account listed both, so "exactly one project" meant "this
+    account only has one" and deploy dead-ended the moment a second appeared.
+    """
+    if not api_key:
+        return None
+
+    memo_key = (api_key, base_url)
+    if memo_key in _PROJECTS_BY_KEY:
+        return _PROJECTS_BY_KEY[memo_key]
+
+    ids: list[str] | None = None
+    try:
+        api = APIClient(APIConfig(api_key=api_key, base_url=base_url))
+        try:
+            projects = api.list_projects()
+        finally:
+            api.close()
+        ids = [p["id"] for p in projects if p.get("id")]
+    except Exception:
+        ids = None
+
+    _PROJECTS_BY_KEY[memo_key] = ids
+    return ids
 
 
 def _project_id_from_api_key(api_key: str | None, base_url: str) -> str | None:
-    """Ask the control plane which project an API key should operate on.
+    """The single project an API key names, or None when that is not one thing.
 
     Onboarding tells a new user to export PAPAYYA_API_KEY and nothing else, so
     for their first `papayya deploy` the key is the ONLY thing they have. Every
@@ -134,36 +171,10 @@ def _project_id_from_api_key(api_key: str | None, base_url: str) -> str | None:
     path dead-ends on itself.
 
     Same rule `papayya login` already applies: exactly one reachable project
-    means there is nothing to choose. Note the listing is ACCOUNT-scoped, not
-    key-scoped — a project key still sees its siblings — so more than one
-    project is genuinely ambiguous here and has to be resolved by the user.
-
-    Best effort by construction: any unclear answer returns None so the
-    caller's existing "no project id" error is still what the user sees. It
-    never raises, because this runs on paths that would otherwise have failed
-    anyway and must not turn a clear error into a traceback.
+    means there is nothing to choose.
     """
-    if not api_key:
-        return None
-
-    memo_key = (api_key, base_url)
-    if memo_key in _PROJECT_ID_BY_KEY:
-        return _PROJECT_ID_BY_KEY[memo_key]
-
-    project_id: str | None = None
-    try:
-        api = APIClient(APIConfig(api_key=api_key, base_url=base_url))
-        try:
-            projects = api.list_projects()
-        finally:
-            api.close()
-        if len(projects) == 1:
-            project_id = projects[0].get("id")
-    except Exception:
-        project_id = None
-
-    _PROJECT_ID_BY_KEY[memo_key] = project_id
-    return project_id
+    ids = _projects_for_api_key(api_key, base_url)
+    return ids[0] if ids and len(ids) == 1 else None
 
 
 # _resolve_project_id IS GONE, and so is _resolve_api_key below it (plan 53
@@ -307,6 +318,17 @@ class _EnvScope:
     api_key: str | None
     project_id: str | None
     base_url: str
+    # WHERE THE PROJECT CAME FROM, which is a fact the caller needs and could
+    # not previously ask for (plan 57 D8). "key" | "flag" | "env-config" |
+    # "none". A command that signs off with `papayya --env <name> ...` is
+    # telling the user their env decided this; when the project came from an
+    # explicit key instead, that instruction routes them to a DIFFERENT
+    # ACCOUNT and they have no way to know.
+    project_source: str = "none"
+
+    @property
+    def env_decided_the_project(self) -> bool:
+        return self.project_source == "env-config"
 
 
 def _require_known_env(cfg: dict, requested: str | None) -> None:
@@ -353,15 +375,15 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
     _require_known_env(cfg, ctx_obj.get("env"))
     env_cfg = _env_config(cfg, env_name)
 
-    api_key = (
-        ctx_obj.get("api_key")
-        or os.environ.get("PAPAYYA_API_KEY")
-        or env_cfg.get("api_key")
-    )
-    project_id = (
-        os.environ.get("PAPAYYA_PROJECT_ID")
-        or env_cfg.get("project_id")
-    )
+    # An EXPLICIT key is one the user supplied for THIS invocation — the
+    # --api-key flag or PAPAYYA_API_KEY (click folds both into ctx.obj). A key
+    # read out of the saved env config is not explicit: it came with the env,
+    # so the env's project is its natural partner.
+    explicit_key = ctx_obj.get("api_key") or os.environ.get("PAPAYYA_API_KEY")
+    api_key = explicit_key or env_cfg.get("api_key")
+
+    flag_project = os.environ.get("PAPAYYA_PROJECT_ID")
+    remembered_project = env_cfg.get("project_id")
 
     # Explicit --base-url (flag or PAPAYYA_BASE_URL) beats the env's stored
     # base_url; env-stored wins over DEFAULT_BASE_URL when the flag defaults.
@@ -369,12 +391,95 @@ def _env_scope(ctx_obj: dict) -> _EnvScope:
     ctx_base = ctx_obj.get("base_url") or DEFAULT_BASE_URL
     base_url = ctx_base if explicit else (env_cfg.get("base_url") or ctx_base)
 
+    project_id, source = _resolve_project(
+        explicit_key=bool(explicit_key),
+        api_key=api_key,
+        base_url=base_url,
+        flag_project=flag_project,
+        remembered_project=remembered_project,
+        env_name=env_name,
+    )
+
+    return _EnvScope(env=env_name, api_key=api_key, project_id=project_id,
+                     base_url=base_url, project_source=source)
+
+
+def _resolve_project(
+    *,
+    explicit_key: bool,
+    api_key: str | None,
+    base_url: str,
+    flag_project: str | None,
+    remembered_project: str | None,
+    env_name: str,
+) -> tuple[str | None, str]:
+    """Decide which project this invocation operates on, and refuse a mix.
+
+    PLAN 57 D8 — `PAPAYYA_API_KEY` WAS HONORED FOR AUTH AND IGNORED FOR SCOPE.
+    The key authenticated the request; `project_id` came from `current_env` in
+    ~/.papayya/config.json, left over from an earlier session and pointing at a
+    project on a DIFFERENT ACCOUNT. Two sources, no check that they agree, and
+    the server's 403 then blamed the key — the one half that was correct. It
+    survived success too: with the mismatch worked around, deploy signed off
+    with `Env: alpha` / `papayya --env alpha logs <run-id>`, sending the user
+    to look for their run in the other account.
+
+    So an explicit key now CARRIES ITS OWN PROJECT and outranks a remembered
+    env. The key is the credential the user chose for this command; the env is
+    a note the CLI wrote to itself weeks ago. When the note contradicts the
+    credential, the credential wins — and when TWO EXPLICIT sources contradict
+    each other (a key and a PAPAYYA_PROJECT_ID that key cannot reach), nothing
+    wins: it refuses and names both, because guessing which one the user meant
+    is how the original 403 came to be misleading.
+
+    The key's projects are only consulted when the key is explicit. Otherwise
+    the old precedence stands (flag > env config > derive from key), which is
+    right: an env's own key and an env's own project belong together.
+
+    Returns (project_id, source) where source is one of
+    "flag" | "key" | "env-config" | "none".
+    """
+    key_projects = _projects_for_api_key(api_key, base_url) if explicit_key else None
+
+    # None means "could not ask" (offline, or no key) — never a refusal. A
+    # network blip must not turn into an accusation about the user's config.
+    if key_projects is not None:
+        reachable = ", ".join(key_projects) if key_projects else "no projects"
+        if flag_project and flag_project not in key_projects:
+            raise click.ClickException(
+                f"PAPAYYA_PROJECT_ID and PAPAYYA_API_KEY disagree.\n"
+                f"  PAPAYYA_PROJECT_ID: {flag_project}\n"
+                f"  the key reaches:    {reachable}\n"
+                "Unset one of them. (This used to reach the server as a 403 "
+                "blaming the key, which was the half that was right.)"
+            )
+        if flag_project:
+            return flag_project, "flag"
+        if len(key_projects) == 1:
+            # The key names one project. That outranks whatever the saved env
+            # remembers — including, and especially, a project on another
+            # account.
+            return key_projects[0], "key"
+        if remembered_project and remembered_project in key_projects:
+            return remembered_project, "env-config"
+        if remembered_project:
+            raise click.ClickException(
+                f"env '{env_name}' remembers project {remembered_project}, "
+                f"which PAPAYYA_API_KEY cannot reach (it reaches: "
+                f"{reachable}).\n"
+                "Set PAPAYYA_PROJECT_ID to one of those, or "
+                f"`papayya envs link {env_name} --project-id <id>`."
+            )
+        return None, "none"
+
+    if flag_project:
+        return flag_project, "flag"
+    if remembered_project:
+        return remembered_project, "env-config"
     # Resolved last, and only when nothing else answered — it needs base_url,
     # and it costs a round trip on a path that would otherwise hard-error.
-    if not project_id:
-        project_id = _project_id_from_api_key(api_key, base_url)
-
-    return _EnvScope(env=env_name, api_key=api_key, project_id=project_id, base_url=base_url)
+    derived = _project_id_from_api_key(api_key, base_url)
+    return (derived, "key") if derived else (None, "none")
 
 
 def _require_api_key(scope: _EnvScope) -> str:
@@ -767,8 +872,24 @@ def deploy(
 
         # Resolve project ID for agent lookup/create. The --project-id flag
         # still wins; the scope is the floor, and it already applied the
-        # PAPAYYA_PROJECT_ID > envs[env].project_id > derive-from-key
-        # precedence this used to re-implement.
+        # key-vs-env precedence this used to re-implement (plan 57 D8).
+        #
+        # A flag that CONTRADICTS the key is refused here rather than sent to
+        # the server, for the same reason _resolve_project refuses the env-var
+        # form: the 403 that comes back says "this API key is scoped to a
+        # different project", which reads as the key being wrong when the key
+        # was the correct half. --project-id arrives on the command line, so
+        # _env_scope never saw it; this is the same check at the one site that
+        # can.
+        if project_id and scope.project_source == "key" and project_id != scope.project_id:
+            click.echo(
+                f"Error: --project-id and PAPAYYA_API_KEY disagree.\n"
+                f"  --project-id:    {project_id}\n"
+                f"  the key reaches: {scope.project_id}\n"
+                "Drop --project-id to deploy where the key points.",
+                err=True,
+            )
+            sys.exit(1)
         if not project_id:
             project_id = scope.project_id
         if not project_id and not agent_id:
@@ -886,14 +1007,29 @@ def deploy(
                 if result.error is not None:
                     sys.exit(1)
 
-        # Per-env next-step nudge
+        # Per-env next-step nudge.
+        #
+        # IT NAMES WHAT ACTUALLY ROUTED THIS DEPLOY (plan 57 D8). It used to
+        # print `Env: alpha` / `papayya --env alpha logs <run-id>`
+        # unconditionally — including on a deploy whose project came from an
+        # explicit PAPAYYA_API_KEY, where `alpha` was a stale pointer at
+        # another account's project. So the last line of a SUCCESSFUL deploy
+        # sent the user to look for their run somewhere it does not exist.
+        # Plan 52's lesson — deploy's own sign-off held three defects — with a
+        # fourth.
         if deployed:
-            current = env_name or _current_env(_load_cli_config())
             first_slug = next(iter(deployed))
-            click.echo(f"\nEnv: {current}")
-            click.echo("\nNext:")
-            click.echo(f'  papayya run {first_slug} "your input"')
-            click.echo(f"  papayya --env {current} logs <run-id>")
+            if scope.project_source == "key":
+                click.echo(f"\nProject: {project_id}  (from your API key)")
+                click.echo("\nNext:")
+                click.echo(f'  papayya run {first_slug} "your input"')
+                click.echo("  papayya logs <run-id>")
+            else:
+                current = env_name or _current_env(_load_cli_config())
+                click.echo(f"\nEnv: {current}")
+                click.echo("\nNext:")
+                click.echo(f'  papayya run {first_slug} "your input"')
+                click.echo(f"  papayya --env {current} logs <run-id>")
 
     finally:
         api.close()
@@ -2065,12 +2201,23 @@ def items() -> None:
 @click.option("--agent", default=None, help="Only items for this agent.")
 @click.option("--tenant", "partition_key", default=None,
               help="Only items for this partition key.")
+@click.option("--item", "item_id", default=None,
+              help="Only the record with this id — YOUR id for it.")
+@click.option("--item-prefix", "item_id_prefix", default=None,
+              help="Every record whose id starts with this — `DOC-2001#` is "
+                   "every page of one document.")
+@click.option("--status", default=None,
+              help="Only items in this run status (queued|running|completed|"
+                   "failed|paused|quarantine).")
 @click.pass_context
 def items_list(
     ctx: click.Context,
     run_id: str | None,
     agent: str | None,
     partition_key: str | None,
+    item_id: str | None,
+    item_id_prefix: str | None,
+    status: str | None,
 ) -> None:
     """List hosted items (NDJSON, one item per line).
 
@@ -2081,7 +2228,8 @@ def items_list(
     client = _make_papayya_client(ctx)
     try:
         rows = client.items.list(
-            run_id=run_id, agent=agent, partition_key=partition_key
+            run_id=run_id, agent=agent, partition_key=partition_key,
+            item_id=item_id, item_id_prefix=item_id_prefix, status=status,
         )
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
@@ -2097,10 +2245,31 @@ def items_list(
 @click.argument("item_id")
 @click.pass_context
 def items_get(ctx: click.Context, item_id: str) -> None:
-    """Fetch one hosted item by id."""
+    """Fetch one record — by YOUR id for it, or by the run id.
+
+    \b
+      papayya items get DOC-2001                        # your own key
+      papayya items get 0ac9eb00-...                    # our run id
+
+    Your key is the one you submitted on the item and the one every other
+    surface prints back at you — the triage feed, `papayya logs`, the item
+    page. It took a run uuid and nothing else until plan 57 D5, so the id the
+    product had just handed you was the one id this command could not resolve.
+
+    A document that has been re-driven has more than one run under one key.
+    The newest is printed; the others are named underneath.
+    """
     client = _make_papayya_client(ctx)
     try:
         row = client.items.get(item_id)
+        # Only worth a second call when the argument WAS the customer's key —
+        # a run id names exactly one record by construction.
+        siblings = []
+        if row.get("item_id") and row.get("item_id") != row.get("run_id"):
+            siblings = [
+                r for r in client.items.resolve(row["item_id"])
+                if r.get("run_id") != row.get("run_id")
+            ]
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -2108,6 +2277,21 @@ def items_get(ctx: click.Context, item_id: str) -> None:
         client.close()
 
     click.echo(json.dumps(row, indent=2))
+
+    # THE OTHER HALF OF THE DOCUMENT'S HISTORY. After a re-drive the record
+    # lives under two run ids and no CLI surface joined them, so a customer who
+    # fixed a document could not see the run that fixed it from the one that
+    # failed (plan 57 D5).
+    if siblings:
+        click.echo(
+            f"\n{len(siblings)} earlier run(s) of {row['item_id']}:", err=True)
+        for r in siblings:
+            click.echo(
+                f"  {r.get('run_id', '?')}  {r.get('status', '?'):<10} "
+                f"{_ago(r.get('created_at'))}",
+                err=True,
+            )
+        click.echo("  papayya logs <run-id>   to see one of them", err=True)
 
 
 @items.command("stream")
@@ -3810,23 +3994,31 @@ def _ago(iso: str | None) -> str:
 @runs.command("list")
 @click.option("--agent", "agent_slug", default=None,
               help="Only this agent's runs (slug, e.g. `triage`).")
+@click.option("--item", "item_id", default=None,
+              help="Only runs that touched this record — YOUR id for it "
+                   "(e.g. `DOC-2001`).")
 @click.option("--limit", type=int, default=20, show_default=True,
               help="How many runs to show, newest first.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="NDJSON instead of a table — one run per line, for jq.")
 @click.pass_context
-def runs_list(ctx: click.Context, agent_slug: str | None, limit: int,
-              as_json: bool) -> None:
+def runs_list(ctx: click.Context, agent_slug: str | None, item_id: str | None,
+              limit: int, as_json: bool) -> None:
     """List your runs, newest first.
 
     The answer to "what have I run?". Until now the CLI had none: `items list`
     prints per-record NDJSON, and `status` / `logs` both need a run id you had
     to keep — so losing the id `papayya run` printed left no way back to your
     own work (plan 52 G1).
+
+    `--item` answers the narrower question the customer actually asks: "what
+    ran my document?" (plan 57 D5). A record that has been re-driven belongs to
+    two runs — the submission that failed and the replay that fixed it — and
+    nothing joined them.
     """
     client = _make_papayya_client(ctx)
     try:
-        runs_ = client.runs.list(agent=agent_slug, limit=limit)
+        runs_ = client.runs.list(agent=agent_slug, item_id=item_id, limit=limit)
     except PapayyaAPIError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -3839,6 +4031,15 @@ def runs_list(ctx: click.Context, agent_slug: str | None, limit: int,
         return
 
     if not runs_:
+        if item_id:
+            # NAME THE FILTER that returned nothing. An empty list under a
+            # narrowing flag reads as "you have never run anything" — the
+            # zero-returning default this codebase has now met four times.
+            click.echo(f"No runs touched item {item_id}"
+                       f"{f' for agent {agent_slug}' if agent_slug else ''}.")
+            click.echo("  Check the id with `papayya items get <item-id>`, "
+                       "or drop --item to see every run.")
+            return
         click.echo(
             f"No runs yet{f' for agent {agent_slug}' if agent_slug else ''}."
         )
