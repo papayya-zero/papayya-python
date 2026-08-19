@@ -129,6 +129,12 @@ class Lease:
     # ``None`` for LocalDispatcher leases.
     account_id: str | None = None
     project_id: str | None = None
+    # The credential this invocation's checkpoint writes authenticate with
+    # (plan 60 S1). Minted by the dispatcher per lease, scoped to this item's
+    # run id alone, and handed to the customer's in-process code in place of
+    # PAPAYYA_PLATFORM_WORKER_KEY. ``None`` on LocalDispatcher leases and on
+    # any control-plane predating the mint.
+    run_token: str | None = None
 
     @property
     def agent_argument(self) -> Any:
@@ -507,8 +513,18 @@ class Worker:
                     runtime_store_base = runtime_store_base[: -len(suffix)]
                     break
             os.environ["PAPAYYA_RUNTIME_STORE_BASE"] = runtime_store_base
-            if self._api_key:
-                os.environ["PAPAYYA_PLATFORM_WORKER_KEY"] = self._api_key
+            # THE PLATFORM WORKER KEY DOES NOT GO IN THE ENVIRONMENT (plan 60
+            # S1). This process imports and calls the customer's @agent, and
+            # that key leases across every tenant, downloads any account's
+            # deployment bundle, and reads or writes any run by id — so an
+            # os.environ.get in any customer module read the platform's own
+            # credential. The base URL alone now selects the lane; the
+            # credential is the per-run token the dispatcher mints with each
+            # lease, carried in a contextvar and stamped per request.
+            #
+            # Popped, not merely unset: a key inherited from the parent shell
+            # would otherwise keep the old path alive silently.
+            os.environ.pop("PAPAYYA_PLATFORM_WORKER_KEY", None)
             os.environ.pop("PAPAYYA_LOCAL_DB_PATH", None)
         else:
             os.environ["PAPAYYA_LOCAL_DB_PATH"] = store_path
@@ -1040,6 +1056,7 @@ class Worker:
             agent_version=body.get("agent_version"),
             account_id=body.get("account_id"),
             project_id=body.get("project_id"),
+            run_token=body.get("run_token"),
         ))
 
     def _report_complete(
@@ -1279,9 +1296,11 @@ class Worker:
             reset_bootstrap_item_id,
             reset_bootstrap_lease_id,
             reset_bootstrap_run_id,
+            reset_bootstrap_run_token,
             set_bootstrap_item_id,
             set_bootstrap_lease_id,
             set_bootstrap_run_id,
+            set_bootstrap_run_token,
         )
 
         short = lease.lease_id[:8]
@@ -1310,6 +1329,12 @@ class Worker:
         # possibly inside C code), which is why the fence has to be at the
         # write door and not here.
         lease_bootstrap_token = set_bootstrap_lease_id(lease.lease_id)
+        # Plan 60 S1: the credential for THIS run, scoped to it and nothing
+        # else. Set before _mark_run_running and before the customer's function
+        # is entered, because the store the @agent uses reads it on every
+        # write — including the very first one, which may happen inside the
+        # first line of customer code.
+        run_token_bootstrap_token = set_bootstrap_run_token(lease.run_token)
         # The DECLARED item_id, handed down rather than guessed from the
         # function's arguments (plan 43 B2b C11). Since B2a the argument is the
         # customer's INPUT, so `args[0]` is an object — and an object reached
@@ -1506,6 +1531,12 @@ class Worker:
             reset_bootstrap_run_id(bootstrap_token)
             reset_bootstrap_item_id(item_bootstrap_token)
             reset_bootstrap_lease_id(lease_bootstrap_token)
+            # Cleared with the rest of the invocation scope. A token that
+            # outlived its item would let the next one's writes authenticate
+            # as the previous run — which the server would then reject on the
+            # run-id comparison, but leaving it set makes the failure a
+            # confusing 403 instead of a clean absence.
+            reset_bootstrap_run_token(run_token_bootstrap_token)
             with self._hb_lock:
                 self._in_flight_lease = None
             self._publish_lease_to_heartbeat(None)
@@ -1882,8 +1913,7 @@ class Worker:
                     "--worker-id", self.worker_id,
                     "--interval-seconds", str(self.heartbeat_interval_seconds),
                     "--timeout-seconds", str(self.http_timeout_seconds),
-                ]
-                + (["--api-key", self._api_key] if self._api_key else []),
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 text=True,
@@ -1896,6 +1926,31 @@ class Worker:
                 "holds the GIL", exc,
             )
             self._hb_proc = None
+
+        if self._hb_proc is not None:
+            # The credential, as the first line of the child's stdin — NOT on
+            # its argv (plan 60 S1b). This process imports and calls customer
+            # code, and it shares a PID namespace with the child, so a key on
+            # the child's command line was readable via /proc/<pid>/cmdline by
+            # the very code the key must be kept from. Always written, even
+            # when empty, so the child never has to guess whether its first
+            # line is a key or a lease id.
+            #
+            # Best-effort: a child that died between Popen and here is handled
+            # by the same fallback as one that never spawned.
+            try:
+                self._hb_proc.stdin.write(f"{self._api_key or ''}\n")
+                self._hb_proc.stdin.flush()
+            except Exception as exc:  # noqa: BLE001 — see docstring
+                log.warning(
+                    "could not hand the heartbeat process its credential (%s); "
+                    "falling back to the in-process thread", exc,
+                )
+                try:
+                    self._hb_proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._hb_proc = None
 
         if self._hb_proc is not None:
             # Drain the child's stdout so a 410 clears in-flight tracking the

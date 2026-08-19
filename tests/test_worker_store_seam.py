@@ -69,7 +69,15 @@ def test_hosted_worker_seam_selects_runtime_store():
         # The ROOT, not …/v1 — make_runtime_store() re-adds the /v1/runtime
         # path, so leaving a stray /v1 here doubles it into /v1/v1 (Plan 37).
         assert os.environ["PAPAYYA_RUNTIME_STORE_BASE"] == "http://control-pane-api:8090"
-        assert os.environ["PAPAYYA_PLATFORM_WORKER_KEY"] == "plat-secret"
+        # PLAN 60 S1 — THIS ASSERTION IS INVERTED FROM WHAT IT USED TO BE, and
+        # the old form was asserting the defect. The worker used to export the
+        # platform worker key into the environment of the process that then
+        # imports and calls the customer's @agent: one os.environ.get in any
+        # customer module, and they held the credential that leases across
+        # every tenant and downloads any account's deployment bundle. The base
+        # URL alone now selects the lane; the credential is the per-run token
+        # on the lease, carried in a contextvar.
+        assert "PAPAYYA_PLATFORM_WORKER_KEY" not in os.environ
         assert "PAPAYYA_LOCAL_DB_PATH" not in os.environ
         assert "PAPAYYA_API_KEY" not in os.environ  # popped so it can't shadow
 
@@ -91,6 +99,10 @@ def test_hosted_worker_seam_selects_runtime_store():
             str(req.url)
             == "http://control-pane-api:8090/v1/runtime/runs/run-1/checkpoints"
         )
+        # And the client carries NO credential of its own (plan 60 S1). A key
+        # baked in at construction would be process-wide and item-independent,
+        # which is exactly the property that made the old one dangerous.
+        assert "X-Api-Key" not in store._client.headers
 
 
 def test_local_worker_seam_keeps_sqlite():

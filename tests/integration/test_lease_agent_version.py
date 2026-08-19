@@ -68,7 +68,10 @@ def _teardown_worker(w: Worker) -> None:
     module bypass `run()` entirely.
     """
     w._hb_stop.set()
-    w._hb_thread.join(timeout=2)
+    # Plan 56 F2 made the heartbeat a PROCESS; _hb_thread is only set on the
+    # fallback path, so joining it unconditionally AttributeErrors on every
+    # run. _stop_heartbeat handles whichever form actually started.
+    w._stop_heartbeat()
 
 
 def test_worker_reads_agent_version_from_lease_json(tmp_path, monkeypatch):

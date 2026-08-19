@@ -141,11 +141,13 @@ class Papayya:
 
         Selection order:
           1. Runtime store — when the hosted worker set
-             ``PAPAYYA_RUNTIME_STORE_BASE`` + ``PAPAYYA_PLATFORM_WORKER_KEY``.
+             ``PAPAYYA_RUNTIME_STORE_BASE``.
              Customer @agent code running in-process on the worker pool writes
-             its checkpoints through the platform-authed ``/v1/runtime`` lane
-             (Plan 37 Unit 1), so hosted runs are visible in the dashboard —
-             including the per-step token/cost trace — from the first run.
+             its checkpoints through the ``/v1/runtime`` lane (Plan 37 Unit
+             1), so hosted runs are visible in the dashboard — including the
+             per-step token/cost trace — from the first run. It authenticates
+             with a per-run token minted by the dispatcher, NOT the platform
+             worker key (plan 60 S1).
           2. CloudStore — when a real ``cpk_`` project key is resolvable
              (non-worker in-process clients).
           3. SQLiteStore — ONLY when an explicit ``PAPAYYA_LOCAL_DB_PATH`` is
@@ -164,11 +166,16 @@ class Papayya:
         from papayya.durable.sqlite_store import SQLiteStore
 
         runtime_base = os.environ.get("PAPAYYA_RUNTIME_STORE_BASE")
-        runtime_key = os.environ.get("PAPAYYA_PLATFORM_WORKER_KEY")
-        if runtime_base and runtime_key:
+        if runtime_base:
             from papayya.durable.cloud_store import make_runtime_store
 
-            return make_runtime_store(runtime_base, runtime_key)
+            # NO KEY (plan 60 S1). The base alone selects the lane; the
+            # credential is this invocation's run token, stamped per request
+            # from a contextvar the worker sets around the customer's call.
+            # This used to also require PAPAYYA_PLATFORM_WORKER_KEY in the
+            # environment — which meant the shared, cross-tenant secret was in
+            # os.environ of the process that imports customer code.
+            return make_runtime_store(runtime_base)
 
         resolved_key, resolved_url = _resolve_durable_credentials(
             self._api_key, self._base_url

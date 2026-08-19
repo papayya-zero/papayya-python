@@ -168,6 +168,35 @@ def _raise_with_server_message(resp: "httpx.Response") -> None:
     raise httpx.HTTPStatusError(message, request=resp.request, response=resp)
 
 
+def _attach_run_token(request: "httpx.Request") -> None:
+    """Authenticate a hosted write with THIS run's token (plan 60 S1).
+
+    The store is built once per worker process, before the customer's module is
+    imported, and the credential changes per item — the same shape as the lease
+    header below, and forced by the same fact. So the key is stamped per
+    request from a contextvar rather than baked into the client's headers.
+
+    ONLY ON THE PLATFORM LANE. The tenant-scoped CloudStore authenticates with
+    the customer's own project key, which is theirs to hold and is set at
+    construction; overwriting it here would break every non-worker client.
+
+    WHEN NO TOKEN IS IN SCOPE THE REQUEST GOES OUT UNAUTHENTICATED AND THE
+    SERVER REFUSES IT, deliberately. Before this the fallback was the platform
+    worker key, which is precisely the credential this unit removes from
+    customer reach — so "fall back to something that works" here means "fall
+    back to the hole". The visible case is a customer thread: contextvars do
+    not cross ``threading.Thread``, so a write from one 401s where it used to
+    succeed with fleet-wide authority. That is a real behaviour change and it
+    is the intended one; the same thread already lost its lease header, so its
+    writes were already unfenced.
+    """
+    from papayya.agent import current_run_token
+
+    token = current_run_token()
+    if token:
+        request.headers["X-Api-Key"] = token
+
+
 def _attach_lease_header(request: "httpx.Request") -> None:
     """Stamp X-Papayya-Lease on outbound writes when one is in scope.
 
@@ -198,7 +227,15 @@ class CloudStore:
 
     def __init__(self, config: CloudStoreConfig) -> None:
         headers: dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
-        if config.platform_auth or config.api_key.startswith("cpk_"):
+        if config.platform_auth:
+            # No key at construction on the platform lane (plan 60 S1): the
+            # per-request hook supplies this run's token. An empty header is
+            # not set at all, so a request with no token in scope arrives
+            # unauthenticated and is refused, rather than arriving with a
+            # process-wide credential.
+            if config.api_key:
+                headers["X-Api-Key"] = config.api_key
+        elif config.api_key.startswith("cpk_"):
             headers["X-Api-Key"] = config.api_key
         else:
             headers["Authorization"] = f"Bearer {config.api_key}"
@@ -217,7 +254,7 @@ class CloudStore:
             # module is even imported, and the lease changes per item. A
             # header baked in here would pin every write for the process
             # lifetime to whichever lease happened to be first.
-            event_hooks={"request": [_attach_lease_header]},
+            event_hooks={"request": [_attach_run_token, _attach_lease_header]},
         )
         self._journal = LineageJournal(resolve_journal_path())
         # Plan 33: pause reason per run_id, set from a SaveCheckpoint response
@@ -563,7 +600,7 @@ class CloudStore:
         return self._pending_pause.get(run_id)
 
 
-def make_runtime_store(base_url: str, api_key: str, *, timeout: float = 15.0) -> CloudStore:
+def make_runtime_store(base_url: str, api_key: str = "", *, timeout: float = 15.0) -> CloudStore:
     """A CloudStore pointed at the platform-authed runtime lane (Plan 37
     Unit 1). Used by the hosted worker pool so customer @agent code running
     in-process writes its checkpoints + run status to
@@ -575,6 +612,12 @@ def make_runtime_store(base_url: str, api_key: str, *, timeout: float = 15.0) ->
 
     ``base_url`` is the control-plane root (e.g. ``http://control-pane-api:8090``);
     the ``runs_base`` supplies the ``/v1/runtime/runs`` path.
+
+    ``api_key`` DEFAULTS TO EMPTY AND SHOULD STAY THAT WAY (plan 60 S1). The
+    credential now arrives per request as the run token the dispatcher minted
+    with this item's lease — see ``_attach_run_token``. The parameter survives
+    for the LocalDispatcher path and for tests that drive the lane directly;
+    passing the platform worker key here re-opens exactly the hole S1 closes.
     """
     return CloudStore(
         CloudStoreConfig(

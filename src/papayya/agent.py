@@ -205,6 +205,52 @@ def reset_bootstrap_lease_id(token) -> None:
     _BOOTSTRAP_LEASE_ID.reset(token)
 
 
+# The credential the customer's @agent writes its own checkpoints with
+# (plan 60 S1).
+#
+# WHY A CONTEXTVAR AND NOT AN ENVIRONMENT VARIABLE, which is what this
+# replaces. The worker used to export PAPAYYA_PLATFORM_WORKER_KEY into the
+# environment of the process that then imports and calls customer code — and
+# that key leases across every tenant, downloads any account's deployment
+# bundle, and reads or writes any run by id. One os.environ.get in any @agent,
+# or in anything it imports, read it.
+#
+# A run token authorizes the three /v1/runtime/runs/{run_id} routes for ONE
+# run. It is minted by the dispatcher with the lease, changes per item, and
+# expires. Putting it in os.environ would work and would still be wrong: env is
+# process-global, so a customer's background thread would keep writing with the
+# PREVIOUS item's token after the worker moved on. A contextvar is scoped to
+# the invocation, which is exactly the credential's scope.
+#
+# None outside a hosted invocation — the local path and the tenant-scoped API
+# authenticate with the customer's own project key and never see one.
+_BOOTSTRAP_RUN_TOKEN: ContextVar[str | None] = ContextVar(
+    "papayya_bootstrap_run_token", default=None
+)
+
+
+def set_bootstrap_run_token(token: str | None):
+    """Set the run-scoped token for this invocation. Returns the contextvar
+    token; the worker resets it in a finally."""
+    return _BOOTSTRAP_RUN_TOKEN.set(token)
+
+
+def reset_bootstrap_run_token(token) -> None:
+    """Restore the run-token contextvar to its prior value."""
+    _BOOTSTRAP_RUN_TOKEN.reset(token)
+
+
+def current_run_token() -> str | None:
+    """The run-scoped credential this thread may write with, or None.
+
+    Read on the write path for the same reason the lease id is: the customer's
+    function sits between the worker and the store, so threading a credential
+    through it would put it in a user-facing signature — and in customer reach
+    by a second route.
+    """
+    return _BOOTSTRAP_RUN_TOKEN.get()
+
+
 def current_lease_id() -> str | None:
     """The lease this thread is executing under, or None.
 

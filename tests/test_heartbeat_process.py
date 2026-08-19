@@ -42,7 +42,11 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
-        OUT.write(json.dumps({"t": time.time(), "lease_id": body.get("lease_id")}) + "\n")
+        OUT.write(json.dumps({
+            "t": time.time(),
+            "lease_id": body.get("lease_id"),
+            "api_key": self.headers.get("X-Api-Key"),
+        }) + "\n")
         self.send_response(STATUS); self.end_headers()
     def log_message(self, *a): pass
 srv = socketserver.TCPServer(("127.0.0.1", 0), H)
@@ -71,14 +75,23 @@ def dispatcher(tmp_path):
         p.kill()
 
 
-def _start_child(port: int, interval: float = _INTERVAL) -> subprocess.Popen:
-    return subprocess.Popen(
+def _start_child(
+    port: int, interval: float = _INTERVAL, api_key: str = ""
+) -> subprocess.Popen:
+    child = subprocess.Popen(
         [sys.executable, "-m", "papayya.runtime.heartbeat",
          "--dispatcher-url", f"http://127.0.0.1:{port}",
          "--worker-id", "w-test",
          "--interval-seconds", str(interval)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
     )
+    # The credential handshake — first line of stdin, always sent even when
+    # empty (plan 60 S1b). It is NOT on the argv above, and that is the point:
+    # this child shares a PID namespace with the interpreter that runs customer
+    # code, so a key on its command line was readable at /proc/<pid>/cmdline.
+    child.stdin.write(f"{api_key}\n")
+    child.stdin.flush()
+    return child
 
 
 def _hits(path, since: float = 0.0) -> list[dict]:
@@ -176,5 +189,69 @@ def test_reports_a_revoked_lease_to_the_parent_exactly_once(dispatcher):
         except subprocess.TimeoutExpired:
             child.kill()
         assert child.stdout.read().strip() == "", "re-reported the same revoked lease"
+    finally:
+        child.kill()
+
+
+# --- plan 60 S1b: the credential is on the pipe, not the command line -------
+
+
+def test_the_credential_rides_stdin_and_reaches_the_header(dispatcher):
+    """The key handed over stdin is the key the dispatcher is authenticated with.
+
+    Without this the move off argv would be untested plumbing: the child could
+    silently send no X-Api-Key at all and every assertion about *where* the
+    secret lives would still pass, while every heartbeat 401'd in production.
+    """
+    port, hits = dispatcher()
+    child = _start_child(port, api_key="pk_secret_value")
+    try:
+        child.stdin.write("lease-1\n")
+        child.stdin.flush()
+        deadline = time.time() + 10
+        while time.time() < deadline and not _hits(hits):
+            time.sleep(0.1)
+        rows = _hits(hits)
+        assert rows, "the child never heartbeat at all"
+        assert rows[0]["api_key"] == "pk_secret_value", (
+            f"heartbeat authenticated with {rows[0]['api_key']!r}"
+        )
+    finally:
+        child.kill()
+
+
+def test_the_credential_is_not_on_the_child_command_line(dispatcher):
+    """/proc/<pid>/cmdline is readable by the customer code in the parent.
+
+    Asserted against the argv the parent actually passes, so it holds on macOS
+    too — reading /proc would make this a Linux-only test of a Linux-only
+    consequence, and the property being defended is about the argv itself.
+    """
+    port, _ = dispatcher()
+    child = _start_child(port, api_key="pk_secret_value")
+    try:
+        assert not any("pk_secret_value" in arg for arg in child.args), (
+            f"the platform key is on the heartbeat's argv: {child.args}"
+        )
+        assert not any(arg == "--api-key" for arg in child.args), (
+            "the --api-key flag is back; it is the hole plan 60 S1b closed"
+        )
+    finally:
+        child.kill()
+
+
+def test_an_empty_credential_sends_no_auth_header(dispatcher):
+    """Local dev has no platform key, and must still heartbeat."""
+    port, hits = dispatcher()
+    child = _start_child(port, api_key="")
+    try:
+        child.stdin.write("lease-1\n")
+        child.stdin.flush()
+        deadline = time.time() + 10
+        while time.time() < deadline and not _hits(hits):
+            time.sleep(0.1)
+        rows = _hits(hits)
+        assert rows, "the child never heartbeat at all"
+        assert rows[0]["api_key"] is None
     finally:
         child.kill()

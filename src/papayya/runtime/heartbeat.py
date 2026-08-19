@@ -92,6 +92,29 @@ def _post_heartbeat(
         return None
 
 
+def _read_credential() -> str | None:
+    """Take the platform key off the parent's stdin, as the first line.
+
+    THE ARGV IS NOT A CHANNEL FOR A SECRET (plan 60 S1b). This process used to
+    be spawned with ``--api-key <the platform worker key>``, and it shares a PID
+    namespace with the interpreter that imports and calls the customer's
+    @agent — so ``/proc/<pid>/cmdline`` handed that key to any customer who
+    looked, and every ``ps`` in every support session printed it. The
+    environment is no better: ``/proc/<pid>/environ`` is readable by the same
+    uid.
+
+    A pipe is: it has exactly two ends, and the customer's code holds neither.
+
+    An empty first line means "no credential", which is the LocalDispatcher
+    path. The line is always sent, so the protocol has no ambiguity about
+    whether the first lease id is really a key.
+    """
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return line.strip() or None
+
+
 def _read_stdin(state: dict, stop: threading.Event) -> None:
     """Track the parent's current lease until stdin closes.
 
@@ -115,8 +138,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--worker-id", required=True)
     ap.add_argument("--interval-seconds", type=float, default=5.0)
     ap.add_argument("--timeout-seconds", type=float, default=5.0)
-    ap.add_argument("--api-key", default=None)
     args = ap.parse_args(argv)
+
+    # First line of stdin, before anything else reads from it — see
+    # _read_credential. There is deliberately no --api-key flag to fall back
+    # to: leaving one would let the hole be reopened by a caller that predates
+    # this, silently and with no error.
+    api_key = _read_credential()
 
     state: dict = {"lease_id": None}
     stop = threading.Event()
@@ -135,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatcher_url=args.dispatcher_url,
             lease_id=lease_id,
             worker_id=args.worker_id,
-            api_key=args.api_key,
+            api_key=api_key,
             # Never longer than one interval: a heartbeat that hasn't landed
             # by the time the next is due has been superseded, and a long
             # budget here stretches the cadence toward the TTL it exists to
