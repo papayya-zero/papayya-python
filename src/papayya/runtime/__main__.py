@@ -125,6 +125,31 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--executor-reuse",
+        choices=("version", "item", "off"),
+        default=os.environ.get("PAPAYYA_EXECUTOR_REUSE", "version"),
+        help=(
+            "How long one executor child may be reused (plan 61 U1). "
+            "'version' (default) = one child per (account, agent, version), "
+            "recycled when the next lease differs — the account leads the key, "
+            "so reuse is never across tenants. 'item' = a fresh child per item. "
+            "'off' = import customer code into THIS process, which is the "
+            "pre-plan-61 behaviour and puts it in the interpreter holding the "
+            "platform key. Falls back to PAPAYYA_EXECUTOR_REUSE."
+        ),
+    )
+    p.add_argument(
+        "--executor-fallback",
+        choices=("refuse", "in-process"),
+        default=os.environ.get("PAPAYYA_EXECUTOR_FALLBACK", "refuse"),
+        help=(
+            "What to do when an executor cannot be spawned. 'refuse' (default) "
+            "fails the lease and lets the TTL redistribute it; 'in-process' "
+            "runs the item here instead, which is faster to recover and "
+            "reopens the hole the split exists to close."
+        ),
+    )
+    p.add_argument(
         "--bundle-url-base",
         default=None,
         help=(
@@ -361,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
         http_timeout_seconds=args.http_timeout_seconds,
+        executor_reuse=args.executor_reuse,
+        executor_fallback=args.executor_fallback,
         api_key=api_key,
         bundle_url_base=args.bundle_url_base,
         max_items_before_recycle=args.max_items_before_recycle,

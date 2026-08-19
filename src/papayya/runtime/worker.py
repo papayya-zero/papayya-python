@@ -35,6 +35,7 @@ import inspect
 import json
 import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -49,6 +50,12 @@ from urllib import request as urllib_request
 
 
 log = logging.getLogger("papayya.runtime")
+
+# Slack between the child's own SIGALRM deadline and the supervisor's kill.
+# The child's alarm is the graceful path and runs the customer's finally
+# blocks; this is the one that cannot be starved by a C loop holding the GIL,
+# which is the failure plan 55 D1 measured.
+_EXECUTOR_GRACE_SECONDS = 15.0
 
 # Mirrors papayya.runtime.heartbeat.IDLE. Duplicated rather than imported so
 # the worker never pulls the child module into its own process — the child
@@ -337,6 +344,194 @@ class _ReconnectBackoff:
         return self._current
 
 
+def import_bundle_module(
+    *,
+    bundle_path: Path,
+    entrypoint: str,
+    agent_name: str,
+    agent_version: str,
+    account_scope: str,
+) -> str:
+    """exec_module the bundle's entrypoint; return the sys.modules key.
+
+MODULE-LEVEL BECAUSE TWO PROCESSES DO THIS NOW (plan 61 U1). The executor
+child imports the customer's bundle and the supervisor does not; a copy in
+each would be two chances for the account-scoped ``sys.modules`` naming
+below to drift apart, and that naming is what plan 47 S1 was.
+
+
+    The entrypoint is interpreted relative to ``bundle_path`` (the
+    extracted tarball root). We use ``importlib.util`` to keep the
+    loader path-aware, and we register sys.modules under a name
+    suffixed with the agent_version so a future multi-version
+    registry (slice 3) can keep both modules resident.
+
+    Module identity collision is the slice-2 risk the hand-off
+    flagged: two bundles sharing entrypoint stems will produce
+    identical ``_papayya_user_<stem>`` keys without the version
+    suffix. Slice 2 namespaces the suffix so the warning fires only
+    when an actual collision happens.
+
+    ``account_scope`` extends that namespace across tenants. The
+    version suffix alone is not enough on a shared worker: two
+    accounts deploying ``agent.py`` at v1 both produce
+    ``_papayya_user_agent__v1`` and the second silently overwrites
+    the first in ``sys.modules`` — the "already in sys.modules —
+    overwriting" warning observed in plan 47 S1. The same scope keys
+    the bundle loader's root registration, so a sibling
+    ``from helpers import x`` resolves within the right account's
+    bundle rather than whichever landed first.
+    """
+    entry_path = (bundle_path / entrypoint).resolve()
+    if not entry_path.exists():
+        raise _VersionNotFound(
+            f"bundle for {agent_name}@{agent_version} missing entrypoint {entrypoint!r}"
+        )
+
+    # ADR-0003 § Worker #4 — register the bundle root with the
+    # per-version MetaPathFinder instead of mutating ``sys.path``.
+    # The finder, scoped via ``activate(version)`` below, intercepts
+    # top-level imports made *during* the bundle's execution so two
+    # versions' ``helpers.py`` siblings don't collide in
+    # ``sys.modules``.
+    from papayya.runtime import _bundle_loader
+
+    residency = _residency_token(account_scope, agent_version)
+    _bundle_loader.register_bundle(residency, bundle_path)
+
+    module_name = f"_papayya_user_{entry_path.stem}__{residency}"
+    if module_name in sys.modules:
+        log.warning(
+            "module name %s already in sys.modules — overwriting",
+            module_name,
+        )
+
+    spec = importlib.util.spec_from_file_location(module_name, entry_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot build module spec for: {entry_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    # Pin ``PAPAYYA_AGENT_VERSION`` for the duration of the bundle's
+    # exec so the customer's ``@agent`` decorator (which resolves
+    # version via decorator-arg → env → git → "unknown") stamps the
+    # registration with the lease's version. The env-cache is
+    # cleared before AND after so the resolution actually re-runs
+    # against this scoped value, and we don't poison subsequent
+    # imports with a cached "v1" after we've moved on.
+    # ADR-0003 § Worker #4.
+    from papayya.agent import _clear_agent_version_cache
+
+    prior_env = os.environ.get("PAPAYYA_AGENT_VERSION")
+    os.environ["PAPAYYA_AGENT_VERSION"] = agent_version
+    _clear_agent_version_cache()
+    try:
+        # ``activate`` wires top-level imports made during
+        # exec_module (e.g., the entrypoint's ``from helpers
+        # import ...``) to this version's bundle root, so two
+        # bundles' sibling files don't collide in sys.modules.
+        with _bundle_loader.activate(residency):
+            spec.loader.exec_module(module)
+    finally:
+        if prior_env is None:
+            os.environ.pop("PAPAYYA_AGENT_VERSION", None)
+        else:
+            os.environ["PAPAYYA_AGENT_VERSION"] = prior_env
+        _clear_agent_version_cache()
+    log.info(
+        "loaded bundle %s@%s from %s (module=%s)",
+        agent_name, agent_version, entry_path, module_name,
+    )
+    return module_name
+
+
+
+# --- the executor pool (plan 61 U1) --------------------------------------
+
+
+class _ExecutorDied(RuntimeError):
+    """The child went away mid-item, or never started."""
+
+
+class _ExecutorHandle:
+    """One live executor child, pinned to one (account, agent, version).
+
+    PINNED IS THE TENANCY BOUNDARY. The key leads with the account, and a lease
+    whose key differs tears this down before it is served — so tenant A's
+    module never shares a ``sys.modules``, a ``sys.path`` or an address space
+    with tenant B's. That is plan 60 S3, and it is a property of the key rather
+    than of anything the child does.
+    """
+
+    def __init__(self, key: tuple, proc: "subprocess.Popen", results, started_at: float):
+        self.key = key
+        self.proc = proc
+        self.results = results
+        self.started_at = started_at
+        self.items = 0
+
+    @property
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def send(self, job: dict) -> None:
+        try:
+            self.proc.stdin.write(json.dumps(job) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError) as exc:
+            raise _ExecutorDied(f"executor stdin closed: {exc}") from exc
+
+    def read_report(self, timeout: float | None) -> dict:
+        """One report, or raise. ``timeout`` is a wall-clock ceiling.
+
+        THE SUPERVISOR'S TIMEOUT IS THE ONE THAT CANNOT BE STARVED. The child
+        arms SIGALRM for the same budget, which is the graceful path and gives
+        the customer's ``finally`` blocks a chance to run — but a signal is
+        delivered to the main thread of an interpreter that may be inside a C
+        loop, which is exactly the shape plan 55 D1 measured. So this is the
+        backstop: when the read deadline passes, the child is killed and the
+        item is reported failed, from a process that was never blocked.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        fd = self.results.fileno()
+        buf = ""
+        while True:
+            budget = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if budget is not None and budget <= 0:
+                raise TimeoutError("executor exceeded its wall-clock budget")
+            ready, _, _ = select.select([fd], [], [], budget if budget is not None else 1.0)
+            if not ready:
+                if not self.alive:
+                    raise _ExecutorDied("executor exited without reporting")
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise _ExecutorDied("executor closed its result pipe")
+            buf += chunk.decode("utf-8", "replace")
+            if "\n" in buf:
+                line, _, _rest = buf.partition("\n")
+                return json.loads(line)
+
+    def close(self, grace: float) -> None:
+        """Stop the child. Closing stdin is the ordinary exit; kill is the rest."""
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.proc.wait(timeout=grace)
+        except Exception:  # noqa: BLE001
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self.results.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class Worker:
     """Long-running worker. Polls a dispatcher, runs ``@agent`` functions.
 
@@ -370,6 +565,8 @@ class Worker:
         max_items_before_recycle: int = _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
         max_rss_percent_before_recycle: float = _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE,
         rss_percent_provider: Optional[Callable[[], float]] = None,
+        executor_reuse: str = "version",
+        executor_fallback: str = "refuse",
     ) -> None:
         self.dispatcher_url = dispatcher_url.rstrip("/")
         self.store_path = store_path
@@ -453,6 +650,12 @@ class Worker:
         self._drain_started: bool = False
         self._drain_lock = threading.Lock()
         self._drain_thread: Optional[threading.Thread] = None
+
+        # The executor child that runs customer code (plan 61 U1). One at a
+        # time, pinned to a (account, agent, version); see _ExecutorHandle.
+        self._executor: Optional[_ExecutorHandle] = None
+        self._executor_reuse = executor_reuse
+        self._executor_fallback = executor_fallback
 
         # Recycle-pending flag (ADR-0003 § Worker #6, ADR-0002 #6).
         # Set when:
@@ -609,6 +812,52 @@ class Worker:
         if key in self._loaded_versions:
             return
 
+        bundle = self._ensure_bundle(lease)
+        if bundle is None:
+            return
+
+        scope = self._account_scope(lease)
+        # Through the method, not the module function it delegates to: the
+        # method is the seam tests patch to keep the import off the real
+        # filesystem, and the executor child calls the shared function
+        # directly. One implementation, two entry points.
+        module_name = self._import_bundle_module(
+            bundle_path=Path(bundle.path),
+            entrypoint=bundle.entrypoint or "agent.py",
+            agent_name=lease.agent,
+            agent_version=lease.agent_version,
+            account_scope=scope,
+        )
+        # Snapshot the registration this import just produced. The global
+        # registry is keyed (name, version) with no account, so a later
+        # import by another account would overwrite it — dispatching from
+        # the snapshot keeps each residency pointed at its own code.
+        self._loaded_versions[key] = _LoadedBundle(
+            agent_name=lease.agent,
+            agent_version=lease.agent_version,
+            bundle_path=str(bundle.path),
+            module_name=module_name,
+            dep_hash=bundle.dep_hash,
+            registration=_lookup_registration(lease.agent, lease.agent_version),
+        )
+
+    def _ensure_bundle(self, lease: "Lease"):
+        """Fetch and extract the lease's bundle. No import.
+
+        SPLIT OUT OF ``_ensure_loaded`` FOR THE EXECUTOR (plan 61 U1). Fetching
+        needs the platform key and importing needs the customer's code to run —
+        and those are now two processes. The supervisor does this half; the
+        executor child then reads the extracted directory, which is a cache HIT
+        by the time it looks, so the child never touches the bundle endpoint
+        and never needs a credential for it.
+
+        Returns the ``BundleEntry``, or ``None`` for a lease with no version
+        (LocalDispatcher). Raises exactly what ``_ensure_loaded`` used to:
+        ``_VersionNotFound``, ``_RecyclePending``, ``OSError``.
+        """
+        if lease.agent_version is None:
+            return None
+
         # Late import to keep the hot path (no agent_version) free of the
         # bundle-cache module's tarfile/fcntl pull-in cost. Worker boot
         # is unaffected; only the first hosted lease pays it.
@@ -671,25 +920,7 @@ class Worker:
                 f"and v{lease.agent_version}; recycling worker for fresh pip env"
             )
 
-        module_name = self._import_bundle_module(
-            bundle_path=Path(bundle.path),
-            entrypoint=bundle.entrypoint or "agent.py",
-            agent_name=lease.agent,
-            agent_version=lease.agent_version,
-            account_scope=scope,
-        )
-        # Snapshot the registration this import just produced. The global
-        # registry is keyed (name, version) with no account, so a later
-        # import by another account would overwrite it — dispatching from
-        # the snapshot keeps each residency pointed at its own code.
-        self._loaded_versions[key] = _LoadedBundle(
-            agent_name=lease.agent,
-            agent_version=lease.agent_version,
-            bundle_path=str(bundle.path),
-            module_name=module_name,
-            dep_hash=bundle.dep_hash,
-            registration=_lookup_registration(lease.agent, lease.agent_version),
-        )
+        return bundle
 
     @staticmethod
     def _account_scope(lease: "Lease") -> str:
@@ -810,90 +1041,278 @@ class Worker:
         agent_version: str,
         account_scope: str,
     ) -> str:
-        """exec_module the bundle's entrypoint; return the sys.modules key.
+        """Deprecated in-process import; delegates to :func:`import_bundle_module`.
 
-        The entrypoint is interpreted relative to ``bundle_path`` (the
-        extracted tarball root). We use ``importlib.util`` to keep the
-        loader path-aware, and we register sys.modules under a name
-        suffixed with the agent_version so a future multi-version
-        registry (slice 3) can keep both modules resident.
-
-        Module identity collision is the slice-2 risk the hand-off
-        flagged: two bundles sharing entrypoint stems will produce
-        identical ``_papayya_user_<stem>`` keys without the version
-        suffix. Slice 2 namespaces the suffix so the warning fires only
-        when an actual collision happens.
-
-        ``account_scope`` extends that namespace across tenants. The
-        version suffix alone is not enough on a shared worker: two
-        accounts deploying ``agent.py`` at v1 both produce
-        ``_papayya_user_agent__v1`` and the second silently overwrites
-        the first in ``sys.modules`` — the "already in sys.modules —
-        overwriting" warning observed in plan 47 S1. The same scope keys
-        the bundle loader's root registration, so a sibling
-        ``from helpers import x`` resolves within the right account's
-        bundle rather than whichever landed first.
+        Kept as a method because ``--executor-reuse=off`` still imports in this
+        process, and because the local ``--agent-module`` path never had a
+        child to import into. Everything hosted goes through the executor.
         """
-        entry_path = (bundle_path / entrypoint).resolve()
-        if not entry_path.exists():
-            raise _VersionNotFound(
-                f"bundle for {agent_name}@{agent_version} missing entrypoint {entrypoint!r}"
-            )
-
-        # ADR-0003 § Worker #4 — register the bundle root with the
-        # per-version MetaPathFinder instead of mutating ``sys.path``.
-        # The finder, scoped via ``activate(version)`` below, intercepts
-        # top-level imports made *during* the bundle's execution so two
-        # versions' ``helpers.py`` siblings don't collide in
-        # ``sys.modules``.
-        from papayya.runtime import _bundle_loader
-
-        residency = _residency_token(account_scope, agent_version)
-        _bundle_loader.register_bundle(residency, bundle_path)
-
-        module_name = f"_papayya_user_{entry_path.stem}__{residency}"
-        if module_name in sys.modules:
-            log.warning(
-                "module name %s already in sys.modules — overwriting",
-                module_name,
-            )
-
-        spec = importlib.util.spec_from_file_location(module_name, entry_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"cannot build module spec for: {entry_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        # Pin ``PAPAYYA_AGENT_VERSION`` for the duration of the bundle's
-        # exec so the customer's ``@agent`` decorator (which resolves
-        # version via decorator-arg → env → git → "unknown") stamps the
-        # registration with the lease's version. The env-cache is
-        # cleared before AND after so the resolution actually re-runs
-        # against this scoped value, and we don't poison subsequent
-        # imports with a cached "v1" after we've moved on.
-        # ADR-0003 § Worker #4.
-        from papayya.agent import _clear_agent_version_cache
-
-        prior_env = os.environ.get("PAPAYYA_AGENT_VERSION")
-        os.environ["PAPAYYA_AGENT_VERSION"] = agent_version
-        _clear_agent_version_cache()
-        try:
-            # ``activate`` wires top-level imports made during
-            # exec_module (e.g., the entrypoint's ``from helpers
-            # import ...``) to this version's bundle root, so two
-            # bundles' sibling files don't collide in sys.modules.
-            with _bundle_loader.activate(residency):
-                spec.loader.exec_module(module)
-        finally:
-            if prior_env is None:
-                os.environ.pop("PAPAYYA_AGENT_VERSION", None)
-            else:
-                os.environ["PAPAYYA_AGENT_VERSION"] = prior_env
-            _clear_agent_version_cache()
-        log.info(
-            "loaded bundle %s@%s from %s (module=%s)",
-            agent_name, agent_version, entry_path, module_name,
+        return import_bundle_module(
+            bundle_path=bundle_path,
+            entrypoint=entrypoint,
+            agent_name=agent_name,
+            agent_version=agent_version,
+            account_scope=account_scope,
         )
-        return module_name
+
+
+
+    def _handle_lease_in_executor(
+        self, lease: "Lease", bundle, run_id, short: str, started_at: float
+    ) -> None:
+        """Run one item in the child and act on what it reports.
+
+        THE ASYMMETRY IS THE SECURITY PROPERTY. The child reports; the
+        supervisor decides and makes the authenticated call. Everything below
+        that touches ``/complete``, ``/release`` or the run's status happens
+        here, on the strength of a report — never on the child's instruction,
+        because the child is the untrusted half.
+        """
+        max_duration = None
+        if isinstance(lease.payload, dict):
+            max_duration = lease.payload.get("max_duration_seconds")
+
+        report = self._run_in_executor(lease, bundle, max_duration)
+        kind = report.get("kind")
+        duration_ms = report.get(
+            "duration_ms", int((time.monotonic() - started_at) * 1000)
+        )
+
+        if kind == "completed":
+            log.info("finished %s item=%s duration=%dms", short, lease.item_id, duration_ms)
+            self._report_complete(lease.lease_id, status="completed")
+            if run_id:
+                self._mark_run_terminal(run_id, "completed", report.get("output"))
+            return
+
+        if kind == "released":
+            # Not a body failure: the run stopped with its checkpoints saved
+            # and must be resumable, so the lease is RELEASED. Completing it
+            # would put the item in runtime_completed, which is terminal by
+            # construction, and resume would have nothing to re-drive
+            # (plan 41 R6). The run's status is authoritative server-side and
+            # is deliberately left alone.
+            reason = report.get("reason", "paused")
+            log.warning(
+                "paused   %s item=%s duration=%dms reason=%s %s",
+                short, lease.item_id, duration_ms, reason, report.get("error", ""),
+            )
+            self._report_release(lease.lease_id, reason=reason)
+            return
+
+        if kind == "no_registration":
+            # Same two categories the in-process path distinguishes: a
+            # bootstrap worker handed a lease with no version is a
+            # misconfiguration, and it must not be filed as "agent name typo".
+            error = report.get("error", "unknown agent")
+            category = None
+            if self._bootstrap_mode and lease.agent_version is None:
+                category = "no_agent_module"
+                error = (
+                    "bootstrap worker received lease without agent_version "
+                    "(LocalDispatcher misconfigured against hosted worker?)"
+                )
+            log.warning(
+                "failed   %s item=%s duration=%dms %s",
+                short, lease.item_id, duration_ms, error,
+            )
+            self._report_complete(
+                lease.lease_id, status="failed", error=error, error_category=category
+            )
+            if run_id:
+                self._mark_run_terminal(run_id, "failed", error=error, error_category=category)
+            return
+
+        # Everything else is a failure, including protocol_error and the
+        # supervisor-synthesised timeout / executor_died.
+        error = report.get("error", "executor reported no outcome")
+        category = report.get("error_category")
+        log.warning(
+            "failed   %s item=%s duration=%dms category=%s %s",
+            short, lease.item_id, duration_ms, category, error,
+        )
+        self._report_complete(
+            lease.lease_id, status="failed", error=error, error_category=category
+        )
+        # /complete records the LEASE. The run is a separate row and nothing
+        # else will move it, so without this the item reads "in progress"
+        # forever — plan 48 W3's shape, on a path that has decided the work
+        # is over.
+        if run_id:
+            self._mark_run_terminal(run_id, "failed", error=error, error_category=category)
+
+    # --- the executor child (plan 61 U1) ------------------------------- #
+
+    def _uses_executor(self, lease: "Lease") -> bool:
+        """Whether this lease's code runs in a child.
+
+        TWO CONDITIONS, AND THE SECOND IS NOT A COMPROMISE. The split exists to
+        keep the platform key away from code the worker did not write, and the
+        code the worker did not write arrives as a BUNDLE — which is to say, on
+        a lease carrying an ``agent_version``. A lease without one comes from
+        LocalDispatcher against a ``--agent-module FILE`` worker: single tenant,
+        a file the developer chose, on a machine that is theirs. There is no
+        bundle to hand a child and nothing a child would protect.
+
+        A bootstrap worker handed a version-less lease is a misconfiguration
+        and stays on the in-process path deliberately, so it keeps reporting
+        ``no_agent_module`` rather than a confusing executor error.
+        """
+        return self._executor_reuse != "off" and lease.agent_version is not None
+
+    def _executor_key(self, lease: "Lease") -> tuple:
+        """What an executor may be reused for.
+
+        ``version`` — one child per (account, agent, version). The default.
+        Per-ITEM would be the strongest isolation and the wrong default: it
+        pays an interpreter start plus a bundle import on every item, which is
+        free on a twenty-minute document and ruinous on a two-hundred
+        millisecond one. Reuse within one tenant's run of work amortizes that;
+        the account leads the key, so it is never reuse ACROSS tenants.
+
+        ``item`` — a fresh child per item, for anyone who wants the stronger
+        thing and can pay for it.
+        """
+        scope = self._account_scope(lease)
+        if self._executor_reuse == "item":
+            return (scope, lease.agent, lease.agent_version, lease.lease_id)
+        return (scope, lease.agent, lease.agent_version)
+
+    def _child_environment(self) -> dict:
+        """The env the executor gets. Scrubbed of the credential, by value.
+
+        Belt and braces: plan 60 S1c already re-execs the supervisor so its own
+        environment carries no key, and this filters by value anyway. The two
+        defend different mistakes — that one defends against ``/proc``, this
+        one against a future caller that hands Worker an api_key some other
+        way.
+        """
+        env = {
+            k: v for k, v in os.environ.items()
+            if not (self._api_key and v == self._api_key)
+        }
+        env.pop("PAPAYYA_API_KEY", None)
+        env.pop("PAPAYYA_PLATFORM_WORKER_KEY", None)
+        env.pop("PAPAYYA_WORKER_CREDENTIAL_FD", None)
+        return env
+
+    def _spawn_executor(self, key: tuple) -> "_ExecutorHandle":
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(write_fd, True)
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "-m", "papayya.runtime.executor",
+                    "--result-fd", str(write_fd),
+                ],
+                stdin=subprocess.PIPE,
+                # stdout and stderr are INHERITED on purpose: they are the
+                # customer's, and inheriting them is what keeps their print()
+                # and their tracebacks in the worker's log stream with no
+                # relaying code. The protocol has its own descriptor precisely
+                # so it cannot be corrupted — or forged — by what they write.
+                text=True,
+                bufsize=1,
+                pass_fds=(write_fd,),
+                env=self._child_environment(),
+            )
+        except Exception:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+        # The parent must drop its copy of the write end, or the read end never
+        # sees EOF when the child dies and read_report blocks forever.
+        os.close(write_fd)
+        handle = _ExecutorHandle(
+            key=key,
+            proc=proc,
+            results=os.fdopen(read_fd, "rb", buffering=0),
+            started_at=time.monotonic(),
+        )
+        log.info("executor started (pid=%s, key=%s)", proc.pid, key)
+        return handle
+
+    def _executor_for(self, lease: "Lease") -> "_ExecutorHandle":
+        """The child that may run this lease, spawning or recycling as needed."""
+        key = self._executor_key(lease)
+        cur = self._executor
+        if cur is not None and (cur.key != key or not cur.alive):
+            reason = "key change" if cur.key != key else "died"
+            log.info("recycling executor (%s): %s -> %s", reason, cur.key, key)
+            cur.close(grace=min(5.0, self.drain_timeout_seconds))
+            self._executor = None
+        if self._executor is None:
+            self._executor = self._spawn_executor(key)
+        return self._executor
+
+    def _close_executor(self, grace: float | None = None) -> None:
+        if self._executor is not None:
+            self._executor.close(
+                grace=self.drain_timeout_seconds if grace is None else grace
+            )
+            self._executor = None
+
+    def _run_in_executor(self, lease: "Lease", bundle, max_duration) -> dict:
+        """Hand one item to the child and wait for its report."""
+        job = {
+            "lease_id": lease.lease_id,
+            "run_id": (lease.payload or {}).get("run_id")
+            if isinstance(lease.payload, dict) else None,
+            "item_id": lease.item_id,
+            "agent": lease.agent,
+            "agent_version": lease.agent_version,
+            "payload": lease.payload,
+            "run_token": lease.run_token,
+            "bundle_path": str(bundle.path) if bundle is not None else None,
+            "entrypoint": (bundle.entrypoint or "agent.py") if bundle is not None else None,
+            "account_scope": self._account_scope(lease),
+            "max_duration": max_duration,
+        }
+        try:
+            handle = self._executor_for(lease)
+            handle.send(job)
+        except Exception as exc:  # noqa: BLE001 — spawn or pipe failure
+            # REFUSE IS THE DEFAULT, and it is the opposite call from the
+            # heartbeat's (plan 56 F2 falls back to a thread because a degraded
+            # heartbeat beats none). Here the degraded mode is "run customer
+            # code in the process holding the platform key", which is the
+            # vulnerability itself — so a container that cannot spawn fails its
+            # leases loudly and lets the TTL redistribute them, rather than
+            # quietly becoming insecure. `in-process` is available for an
+            # operator who has decided otherwise.
+            log.error("could not start an executor for item=%s: %s", lease.item_id, exc)
+            if self._executor_fallback == "in-process":
+                raise
+            return {
+                "kind": "failed",
+                "error": f"could not start an executor: {exc}",
+                "error_category": "executor_unavailable",
+            }
+        handle.items += 1
+        # The child's own SIGALRM fires at max_duration; this is the backstop,
+        # so it needs slack or it would race the graceful path and rob the
+        # customer's finally blocks of the chance to run.
+        budget = None if not max_duration else float(max_duration) + _EXECUTOR_GRACE_SECONDS
+        try:
+            return handle.read_report(budget)
+        except TimeoutError:
+            log.warning(
+                "executor exceeded its budget for item=%s; killing it", lease.item_id
+            )
+            self._close_executor(grace=0.5)
+            return {
+                "kind": "failed",
+                "error": f"timeout: agent ran for >{max_duration}s",
+                "error_category": "timeout",
+            }
+        except _ExecutorDied as exc:
+            log.warning("executor died running item=%s: %s", lease.item_id, exc)
+            self._close_executor(grace=0.5)
+            return {
+                "kind": "failed",
+                "error": f"executor died: {exc}",
+                "error_category": "executor_died",
+            }
 
     # --- main loop ----------------------------------------------------- #
 
@@ -962,6 +1381,11 @@ class Worker:
             # the deadline.
             self._hb_stop.set()
             self._stop_heartbeat()
+            # The child outlives nothing. A leaked executor would keep a
+            # customer's interpreter — and their run token — alive past the
+            # worker that is accountable for it, and on ECS it would sit
+            # inside the stop_timeout window doing nothing.
+            self._close_executor()
 
     def _maybe_log_idle(self) -> None:
         now = time.monotonic()
@@ -1361,7 +1785,16 @@ class Worker:
             # is loaded before resolving the registration. No-op when
             # agent_version is None (local-dev parity).
             try:
-                self._ensure_loaded(lease)
+                # OFF keeps the pre-plan-61 behaviour: import into THIS
+                # process. It is the escape hatch and the local
+                # ``--agent-module`` path, not a supported hosted mode — it
+                # puts customer code in the interpreter holding the platform
+                # key, which is the whole of plan 60 S1's remainder.
+                if self._uses_executor(lease):
+                    bundle = self._ensure_bundle(lease)
+                else:
+                    self._ensure_loaded(lease)
+                    bundle = None
             except _VersionNotFound as exc:
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 log.warning(
@@ -1454,6 +1887,11 @@ class Worker:
             # account to import a shared slug overwrites the first's
             # entry, and every later lease for *either* account would
             # get the survivor's function (plan 47 S1).
+            if self._uses_executor(lease):
+                return self._handle_lease_in_executor(
+                    lease, bundle, run_id, short, started_at
+                )
+
             resident = self._loaded_versions.get(self._residency_key(lease))
             registration = (
                 resident.registration

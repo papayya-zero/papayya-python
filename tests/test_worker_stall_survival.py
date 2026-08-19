@@ -251,7 +251,12 @@ def test_unreachable_bundle_endpoint_defers_the_item_rather_than_burning_it(
 def test_a_bundle_that_will_not_import_fails_its_item_and_spares_the_pool(
     monkeypatch,
 ):
-    w = _make_worker()
+    # executor_reuse="off" pins this to the IN-PROCESS path, which is the one
+    # _ensure_loaded belongs to. Plan 61 U1 moved the hosted import into a
+    # child, so the same property is asserted against the real child in
+    # tests/test_executor_split.py — the behaviour did not change, the seam
+    # that implements it did.
+    w = _make_worker(executor_reuse="off")
     monkeypatch.setattr(
         w, "_ensure_loaded",
         lambda lease: (_ for _ in ()).throw(
