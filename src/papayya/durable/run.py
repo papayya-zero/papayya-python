@@ -221,6 +221,37 @@ class Item:
         self._checks: list = []
         self._cache: dict[str, TaskEntry] = {}
         self._task_call_order: list[str] = []
+        # Plan 58 U — the reuse index, and the reason it is SEPARATE from
+        # _cache rather than replacing it.
+        #
+        # _cache is positional (`label#N`) and every existing consumer depends
+        # on that: _build_result walks _task_call_order, the taint inspector
+        # reads _cache.values() as "the steps before this one", and a resumed
+        # run re-finds its own work by recomputing the same sequence. None of
+        # that changes.
+        #
+        # What changes is how a REUSED entry — one copied here from another
+        # run, which never executed in this one — may be found. A positional
+        # key means what it means only while the loop runs from the top; page
+        # 17 is `read-photo#17` because the customer's `for page in range(...)`
+        # produced it seventeenth. Carry that key across runs and a customer
+        # who filters or reorders their pages gets page 17's text returned for
+        # page 22, silently, with the record claiming success. So reused
+        # entries are keyed on ``(item_id, base label)`` — the customer's own
+        # id for the record, which they already pass — and the positional
+        # lookup is not allowed to match them at all.
+        self._reuse_index: dict[tuple[str, str], TaskEntry] = {}
+        # The subset of _reuse_index whose steps are AGGREGATE — keyed to the
+        # run's own record rather than a sub-record's, so their inputs are
+        # everything that came before them. Computed at HYDRATION, against the
+        # run id the store handed back, rather than at call time against
+        # _run_item_id: that attribute is seeded from config and can legitimately
+        # still be None when the first step runs, and "None == None" would
+        # classify every anonymous step as item-scoped — the unsafe direction.
+        self._reuse_aggregate: set[tuple[str, str]] = set()
+        # Has anything actually EXECUTED in this pass yet? Gates aggregate
+        # reuse — see _pre_call.
+        self._executed_any = False
         self._initialized = False
         self._finished = False
         # Run-level item_id. Seeded from config; the first step that passes
@@ -397,6 +428,7 @@ class Item:
                     continue
                 self._cache[entry.label] = entry
                 self._task_call_order.append(entry.label)
+                self._index_if_reused(entry, existing.item_id)
         else:
             # Read the @agent wrapper's captured call args. None when the
             # caller bypassed the decorator (scripts, tests). Stays as-is
@@ -419,6 +451,7 @@ class Item:
                 for entry in self._latest_per_label(self._prepopulated_tasks):
                     self._cache[entry.label] = entry
                     self._task_call_order.append(entry.label)
+                    self._index_if_reused(entry, self._run_item_id)
 
             # Caller-supplied snapshot (iter() passes the item) wins; the
             # @agent path leaves it _UNSET and we read the captured call
@@ -632,6 +665,43 @@ class Item:
         """Key the *next* call of ``label`` would get, without consuming it."""
         n = self._label_occurrences.get(label, 0) + 1
         return label if n == 1 else f"{label}#{n}"
+
+    @staticmethod
+    def _base_label(label: str) -> str:
+        """Strip the positional occurrence suffix: ``read-photo#17`` → ``read-photo``.
+
+        The suffix is exactly what U exists to stop depending on, so the reuse
+        key is built from the customer's own string. The server guarantees the
+        pair is unique per run before it copies anything — two calls of one
+        label under one item_id collide here, and BOTH are excluded server-side
+        rather than one silently winning.
+        """
+        base, sep, tail = label.rpartition("#")
+        return base if sep and tail.isdigit() else label
+
+    def _index_if_reused(self, entry: TaskEntry, run_item_id: str | None) -> None:
+        """Index a hydrated entry for (item_id, label) lookup, if it was reused.
+
+        Entries this run executed are deliberately NOT indexed: they are found
+        positionally, exactly as before plan 58 U, and adding a second way to
+        match them would change resume/re-lease behaviour that is already
+        correct and already tested.
+
+        AGGREGATE STEPS ARE INDEXED TOO, and _pre_call gates them separately.
+        An aggregate step is one whose item_id is the RUN's id rather than a
+        sub-record's — ``validate`` reading forty findings under ``DOC-2001``,
+        against ``read-photo`` under ``DOC-2001#photo-17``. It is reusable only
+        while nothing has re-executed, because its inputs are everything that
+        came before it. Deciding that needs runtime state, so it cannot live in
+        the server's WHERE clause; recording WHICH entries are aggregate needs
+        only the two ids, so it happens here.
+        """
+        if entry.reused_from is None or entry.item_id is None:
+            return
+        key = (entry.item_id, self._base_label(entry.label))
+        self._reuse_index[key] = entry
+        if run_item_id is not None and entry.item_id == run_item_id:
+            self._reuse_aggregate.add(key)
 
     def _seed_attempts(self, tasks: list[TaskEntry]) -> None:
         """Seed the per-label attempt counter from stored task rows.
@@ -888,16 +958,68 @@ class Item:
             # the hydrated entries in the same order it wrote them.
             effective_label = self._resolve_step_label(label)
 
-            cached = self._cache.get(effective_label)
-            if cached is not None:
-                return cached.result, None
-
             # Resolve effective item_id: explicit per-step kwarg wins; else
             # inherit the run-level id. First step to supply an explicit id
             # also seeds the run-level id for later inheritance.
+            #
+            # RESOLVED BEFORE THE CACHE LOOKUP since plan 58 U, where it used
+            # to come after. The reuse key IS (item_id, label), so the lookup
+            # cannot happen until the id is known. The move is safe because
+            # nothing between the two lines reads it and the seeding side
+            # effect is idempotent.
             effective_item_id = item_id if item_id is not None else self._run_item_id
             if item_id is not None and self._run_item_id is None:
                 self._run_item_id = item_id
+
+            # ── The two-tier lookup (plan 58 U) ───────────────────────────
+            #
+            # Tier 1: reused work, matched on the customer's own id for the
+            # record. This is what makes a re-drive cost one page instead of
+            # forty, and what makes it safe to do so without a determinism
+            # sandbox — the key does not depend on the loop running from the
+            # top, so filtering or reordering pages produces a MISS and a
+            # re-execution rather than another page's answer.
+            cached = None
+            if effective_item_id is not None:
+                reuse_key = (effective_item_id, label)
+                candidate = self._reuse_index.get(reuse_key)
+                if candidate is not None:
+                    # An AGGREGATE step — one keyed to the run's own record
+                    # rather than a sub-record — consumed everything before it.
+                    # `validate` read forty findings; if any page re-executed,
+                    # its verdict is stale and reusing it returns yesterday's
+                    # answer for today's document. That is precisely the
+                    # silently-wrong failure this product exists to catch, so
+                    # aggregates are reusable only while nothing has run.
+                    #
+                    # Note this is strictly weaker than "nothing CHANGED": a
+                    # re-executed step may well produce an identical result.
+                    # Re-running an aggregate is cheap and always correct;
+                    # keeping a stale one is neither.
+                    if not (reuse_key in self._reuse_aggregate and self._executed_any):
+                        cached = candidate
+                        log.debug(
+                            "reusing %s for %s from run %s",
+                            label, effective_item_id, candidate.reused_from,
+                        )
+
+            # Tier 2: this run's OWN prior work, matched positionally, exactly
+            # as before U — a resume, a re-lease, a redelivery. A reused entry
+            # must never be reachable this way, or the positional key is back
+            # in force across runs and tier 1's whole guarantee is decorative.
+            if cached is None:
+                positional = self._cache.get(effective_label)
+                if positional is not None and positional.reused_from is None:
+                    cached = positional
+
+            if cached is not None:
+                return cached.result, None
+
+            # Anything that reaches here is about to EXECUTE. Recorded before
+            # the call rather than after, because the flag gates aggregate
+            # reuse and an aggregate that follows a step which raised must not
+            # be reused either — the exception is a change like any other.
+            self._executed_any = True
 
             runtime_reporter = get_current_reporter() if kind == "llm" else None
             call_token: object | None = None

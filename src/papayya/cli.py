@@ -1365,6 +1365,18 @@ def triage_acknowledge(ctx: click.Context, run_id: str) -> None:
         "(worst outcome != ok, or a failed/quarantined run) is replayable."
     ),
 )
+@click.option(
+    "--fresh",
+    "fresh",
+    is_flag=True,
+    default=False,
+    help=(
+        "Re-execute every step instead of reusing the completed ones "
+        "(plan 58 U). What replay meant unconditionally before reuse existed, "
+        "and what anyone debugging nondeterminism wants. A version change "
+        "(--latest) already reuses nothing."
+    ),
+)
 @click.option("--wait/--no-wait", "wait", default=True,
               help="Poll the new run to completion (default) or return "
                    "immediately after triggering.")
@@ -1376,6 +1388,7 @@ def replay_cmd(
     tenant: str | None,
     latest: bool,
     force: bool,
+    fresh: bool,
     wait: bool,
 ) -> None:
     """Replay work that didn't work, in the cloud.
@@ -1387,6 +1400,7 @@ def replay_cmd(
       papayya replay <run_id> --tenant acme   # one partition slice only
       papayya replay <run_id> --latest        # on the agent's current version
       papayya replay <run_id> --force         # re-drive even a clean run
+      papayya replay <run_id> --fresh         # re-execute everything
 
     Hosted replay (Plan 37 Unit R): mints a NEW run linked to the original
     via replayed_from and re-drives its captured item through the worker
@@ -1395,6 +1409,12 @@ def replay_cmd(
 
     Local single-item / --from-step replay ran off the SQLite ledger, which
     is deactivated (Plan 37) — replay is a cloud operation now.
+
+    Since plan 58 U a replay REUSES the source run's still-good completed
+    steps rather than recomputing them, so fixing page 17 of a 40-page
+    document costs one page and not forty. Reuse is keyed on the item_id you
+    already pass, never on step order, and stops at anything that didn't work,
+    anything tainted by something that didn't work, and any version change.
     """
     # Resolve the run id (positional wins over --run).
     if run_positional is not None and run_id is not None and run_positional != run_id:
@@ -1412,7 +1432,8 @@ def replay_cmd(
 
     try:
         try:
-            result = api.replay_run(target, tenant=tenant, latest=latest, force=force)
+            result = api.replay_run(
+                target, tenant=tenant, latest=latest, force=force, fresh=fresh)
         except PapayyaAPIError as exc:
             click.echo(f"Error: replay failed ({exc.status}): {exc}", err=True)
             sys.exit(1)
@@ -1420,6 +1441,16 @@ def replay_cmd(
         new_run_id = result.get("run_id", "unknown")
         click.echo(f"Replay triggered: {new_run_id}")
         click.echo(f"  Replayed from: {result.get('replayed_from', target)}")
+        # WHAT THIS RE-DRIVE WILL NOT REDO (plan 58 U). Printed here and not
+        # only at the end because it is the number the operator is deciding
+        # about — a 150-page document that reuses 149 is a different decision
+        # from one that reuses none, and waiting for the run to finish to find
+        # out which is the wrong time to learn it.
+        reused = result.get("reused_steps") or 0
+        if reused:
+            click.echo(f"  Reusing: {reused} completed step(s) — not re-executed")
+        elif fresh:
+            click.echo("  Reusing: nothing (--fresh)")
         click.echo(f"  Status: {result.get('status', 'unknown')}")
 
         if not wait:
@@ -3618,6 +3649,13 @@ def logs(ctx: click.Context, run_id: str, tail: int | None) -> None:
         run = api.get_run(run_id)
         steps = api.get_steps(run_id)
         total = len(steps)
+        # Held before --tail truncates, because the re-drive summary below is
+        # about the RUN and not about the window being displayed. Counting the
+        # visible slice would report "3 reused" on a 40-page document whose
+        # last three steps happened to be reused — a silently truncated NUMBER,
+        # which is worse than a silently truncated list because it carries no
+        # hint that anything is missing.
+        all_steps = steps
         if tail is not None and tail > 0 and total > tail:
             # Say what was hidden. A silently truncated list reads as a
             # complete one, and the operator counting steps would be counting
@@ -3698,11 +3736,35 @@ def logs(ctx: click.Context, run_id: str, tail: int | None) -> None:
                 if retry_reason:
                     click.echo(f"   Retried because: {retry_reason}")
 
+            # WHAT THE STEP DID NOT COST (plan 58 U). A reused step is on the
+            # record because the customer's document has forty pages whether or
+            # not this run computed them — but a row that looks identical to an
+            # executed one is a claim the work ran twice, which is the thing U
+            # exists to stop. Name the run it came from: "reused" without a
+            # source sends the operator to go and find it.
+            reused_from = s.get("reused_from_run_id")
+            if reused_from:
+                click.echo(f"   Reused from run {reused_from} — not re-executed")
+
             result = s.get("result")
             if result is not None:
                 rendered = result if isinstance(result, str) else json.dumps(result)
                 click.echo(f"   Result: {rendered[:300]}")
 
+            click.echo()
+
+        # THE COST OF THE RE-DRIVE, stated once (plan 58 U). The per-step lines
+        # above answer "which page", this answers "what did fixing it cost" —
+        # the number plan 57 D2 had to reconstruct by counting the customer's
+        # own print statements, because no surface in the product reported
+        # re-execution at all.
+        reused_count = sum(1 for s in all_steps if s.get("reused_from_run_id"))
+        if reused_count:
+            executed = len(all_steps) - reused_count
+            click.echo(
+                f"{reused_count} reused · {executed} executed"
+                f"  ({reused_count} step(s) this re-drive did not have to redo)"
+            )
             click.echo()
 
         _echo_run_verdict(run)

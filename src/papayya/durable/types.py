@@ -99,6 +99,20 @@ class TaskEntry:
     # five executions and reporting one.
     retry_count: int = 0
     retry_reason: str | None = None
+    # Plan 58 U — this entry was COPIED from another run, not executed here.
+    #
+    # Holds that run's id. The server decides WHAT may be copied (the policy is
+    # one SQL WHERE clause in CopyReusableCheckpoints, so it is not rewritten
+    # per SDK language); this field is how the SDK learns which hydrated
+    # entries are reused, and it changes how they may be MATCHED.
+    #
+    # A row this run executed can be found positionally — `label#N` — exactly
+    # as before. A REUSED row may only ever be matched on ``(item_id, label)``,
+    # because the positional key means what it means only while the loop runs
+    # from the top: reorder the pages and `read-photo#17` is a different page.
+    # That is the difference between reuse that is fast and reuse that is
+    # silently wrong, and it is enforced in _pre_call.
+    reused_from: str | None = None
 
 
 def latest_per_label(tasks: list[TaskEntry]) -> list[TaskEntry]:

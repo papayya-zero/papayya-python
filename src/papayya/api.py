@@ -225,6 +225,7 @@ class APIClient:
         tenant: str | None = None,
         latest: bool = False,
         force: bool = False,
+        fresh: bool = False,
     ) -> dict[str, Any]:
         """Replay a run: mint a new run that re-drives its captured item.
 
@@ -233,12 +234,19 @@ class APIClient:
         partition slice; ``latest`` re-runs on the agent's current version
         (default: the original run's version); ``force`` re-drives a clean
         run (default: only a run that didn't work is replayable).
+
+        ``fresh`` re-executes every step instead of reusing the source run's
+        completed ones (plan 58 U). Reuse is the default because the old
+        behaviour was not the conservative one — it wrote 39 of 40 pages
+        downstream a second time to fix the 40th.
         """
         params: dict[str, str] = {}
         if tenant is not None:
             params["tenant"] = tenant
         if latest:
             params["latest"] = "true"
+        if fresh:
+            params["fresh"] = "true"
         if force:
             params["force"] = "true"
         return self._request(

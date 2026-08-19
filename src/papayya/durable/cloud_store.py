@@ -280,6 +280,11 @@ class CloudStore:
                     attempt=cp.get("attempt", 1),
                     retry_count=cp.get("retry_count", 0),
                     retry_reason=cp.get("retry_reason"),
+                    # Plan 58 U. A control pane predating 106 sends no such
+                    # key, and None is exactly right there: nothing was
+                    # reused, because nothing could be — that binary's
+                    # replay recomputed everything by construction.
+                    reused_from=cp.get("reused_from_run_id"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
