@@ -81,6 +81,11 @@ runtime = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# `slow` marks tests that spend real wall-clock time on purpose. The GIL
+# starvation test (plan 56 F2) has to run ~18s of genuine backtracking —
+# a stub that released the GIL would measure nothing, since releasing it is
+# exactly what the passing case does.
+markers = ["slow: takes seconds of real wall-clock time by design"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/papayya"]

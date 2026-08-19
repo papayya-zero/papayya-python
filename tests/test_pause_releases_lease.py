@@ -40,6 +40,11 @@ class _RecordingWorker(Worker):
         )
         self.stop()
         self._hb_stop.set()
+        # Plan 56 F2: the constructor now starts a heartbeat PROCESS (a
+        # thread cannot heartbeat through a step that holds the GIL). These
+        # tests never run the poll loop, whose finally block would stop it,
+        # so they have to tear it down themselves or leak one child per test.
+        self._stop_heartbeat()
         self.releases: list[tuple[str, str]] = []
         self.completions: list[dict] = []
 

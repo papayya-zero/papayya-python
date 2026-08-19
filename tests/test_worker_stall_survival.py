@@ -43,6 +43,11 @@ def _make_worker(**kwargs) -> Worker:
     # The constructor starts a daemon heartbeat thread; stop it immediately.
     w.stop()
     w._hb_stop.set()
+    # Plan 56 F2: the constructor now starts a heartbeat PROCESS (a
+    # thread cannot heartbeat through a step that holds the GIL). These
+    # tests never run the poll loop, whose finally block would stop it,
+    # so they have to tear it down themselves or leak one child per test.
+    w._stop_heartbeat()
     return w
 
 

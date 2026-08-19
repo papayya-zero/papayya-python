@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -48,6 +49,11 @@ from urllib import request as urllib_request
 
 
 log = logging.getLogger("papayya.runtime")
+
+# Mirrors papayya.runtime.heartbeat.IDLE. Duplicated rather than imported so
+# the worker never pulls the child module into its own process — the child
+# must be startable even when this one is in a bad state.
+_HEARTBEAT_IDLE = "-"
 
 
 # Default heartbeat cadence. Must be well below the dispatcher's lease
@@ -515,14 +521,9 @@ class Worker:
                 "first lease's agent_version triggers first import)"
             )
 
-        # Heartbeat thread starts after module import so any import
-        # error fails fast without leaving a daemon thread behind.
-        self._hb_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name=f"papayya-worker-hb-{self.worker_id}",
-        )
-        self._hb_thread.start()
+        # Heartbeat starts after module import so any import error fails
+        # fast without leaving a heartbeat behind.
+        self._start_heartbeat()
 
     # --- agent module loading ------------------------------------------ #
 
@@ -944,7 +945,7 @@ class Worker:
             # thread reaches this point — clean shutdown short-circuits
             # the deadline.
             self._hb_stop.set()
-            self._hb_thread.join(timeout=2)
+            self._stop_heartbeat()
 
     def _maybe_log_idle(self) -> None:
         now = time.monotonic()
@@ -1313,10 +1314,13 @@ class Worker:
         if run_id:
             self._mark_run_running(run_id)
 
-        # Publish the lease so the heartbeat thread starts pinging
-        # /heartbeat for it. Cleared in the finally block.
+        # Publish the lease so the heartbeat starts pinging /heartbeat for
+        # it. Cleared in the finally block. The in-process copy is still
+        # tracked (the drain watchdog and the 410 reader both read it); the
+        # process gets told separately because it cannot see this object.
         with self._hb_lock:
             self._in_flight_lease = lease
+        self._publish_lease_to_heartbeat(lease.lease_id)
         try:
             # ADR-0003 § Worker #3 — make sure the lease's agent_version
             # is loaded before resolving the registration. No-op when
@@ -1493,6 +1497,7 @@ class Worker:
             reset_bootstrap_item_id(item_bootstrap_token)
             with self._hb_lock:
                 self._in_flight_lease = None
+            self._publish_lease_to_heartbeat(None)
             self._last_activity_at = time.monotonic()
             self._items_processed += 1
             self._check_recycle_thresholds()
@@ -1831,6 +1836,151 @@ class Worker:
         os._exit(1)
 
     # --- heartbeat ----------------------------------------------------- #
+
+    def _start_heartbeat(self) -> None:
+        """Start the out-of-process heartbeat, falling back to the thread.
+
+        THE PROCESS IS THE POINT (plan 56 F2). A background THREAD cannot run
+        while the customer's step holds the GIL inside a C loop, and measured
+        across three kinds of work it gets 1-6% of its due ticks against 97%
+        for I/O-bound work. That is not a monitoring gap: the lease expires,
+        the reaper re-queues the item, and a second worker starts the same
+        document again. Plan 55 D1 measured three concurrent 135-second
+        executions of one customer function, every checkpoint recorded
+        attempt=1, and the run finished `ok`.
+
+        A separate interpreter has its own GIL, so customer compute cannot
+        starve it.
+
+        THE FALLBACK IS THE THREAD, not an exception. If the child cannot be
+        spawned — a locked-down container, no /proc, an exotic sys.executable —
+        a degraded heartbeat is strictly better than no worker. The thread is
+        correct for every I/O-bound step, which is most of them, and the
+        dispatcher's reaper remains the backstop for the rest. Refusing to
+        start would turn a partial defence into an outage.
+        """
+        self._hb_proc: Optional[subprocess.Popen] = None
+        self._hb_thread: Optional[threading.Thread] = None
+        try:
+            self._hb_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "papayya.runtime.heartbeat",
+                    "--dispatcher-url", self.dispatcher_url,
+                    "--worker-id", self.worker_id,
+                    "--interval-seconds", str(self.heartbeat_interval_seconds),
+                    "--timeout-seconds", str(self.http_timeout_seconds),
+                ]
+                + (["--api-key", self._api_key] if self._api_key else []),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # line-buffered: the protocol is one line per message
+            )
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            log.warning(
+                "could not start the heartbeat process (%s); falling back to the "
+                "in-process thread, which cannot heartbeat through a step that "
+                "holds the GIL", exc,
+            )
+            self._hb_proc = None
+
+        if self._hb_proc is not None:
+            # Drain the child's stdout so a 410 clears in-flight tracking the
+            # same way the thread's own 410 branch does. Daemon: this thread
+            # only ever blocks on a pipe, never on customer code.
+            self._hb_reader = threading.Thread(
+                target=self._heartbeat_process_reader,
+                daemon=True,
+                name=f"papayya-worker-hb-reader-{self.worker_id}",
+            )
+            self._hb_reader.start()
+            log.info(
+                "heartbeat process started (pid=%s, interval=%.1fs)",
+                self._hb_proc.pid, self.heartbeat_interval_seconds,
+            )
+            return
+
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+            name=f"papayya-worker-hb-{self.worker_id}",
+        )
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Shut the heartbeat down, whichever form it took.
+
+        Closing stdin is the ordinary stop: the child sees EOF and exits. The
+        kill is for a child wedged in a socket timeout — it holds no state
+        worth draining, and a heartbeat that outlives its worker actively lies
+        to the dispatcher about a dead item.
+        """
+        proc = getattr(self, "_hb_proc", None)
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._hb_proc = None
+        thread = getattr(self, "_hb_thread", None)
+        if thread is not None:
+            thread.join(timeout=2)
+
+    def _publish_lease_to_heartbeat(self, lease_id: Optional[str]) -> None:
+        """Tell the heartbeat process which lease is in flight (None = idle).
+
+        A write failure means the child is gone. Log once and carry on: the
+        item in flight is still being processed, and killing the worker over a
+        dead heartbeat would abandon work the dispatcher would then have to
+        re-deliver — the very loop F2 exists to stop.
+        """
+        proc = getattr(self, "_hb_proc", None)
+        if proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(f"{lease_id or _HEARTBEAT_IDLE}\n")
+            proc.stdin.flush()
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            log.warning("heartbeat process is not accepting leases (%s)", exc)
+            self._hb_proc = None
+
+    def _heartbeat_process_reader(self) -> None:
+        """Apply the child's `gone <lease_id>` lines to in-flight tracking.
+
+        Same effect as the thread's 409/410 branch and for the same reason:
+        drop local tracking so a late /complete for a stolen item is not
+        reported. It does NOT stop the invocation — nothing can, the customer's
+        function is on the main thread inside C code — which is exactly why
+        plan 56 F3 fences the WRITES server-side rather than trusting this.
+        """
+        proc = self._hb_proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                parts = line.split()
+                if len(parts) != 2 or parts[0] != "gone":
+                    continue
+                lease_id = parts[1]
+                with self._hb_lock:
+                    if (
+                        self._in_flight_lease is not None
+                        and self._in_flight_lease.lease_id == lease_id
+                    ):
+                        log.warning(
+                            "lease %s rejected by dispatcher; worker dropping "
+                            "in-flight tracking", lease_id[:8],
+                        )
+                        self._in_flight_lease = None
+        except Exception:  # noqa: BLE001 — pipe closed on shutdown
+            return
 
     def _heartbeat_loop(self) -> None:
         """Background loop: ping /heartbeat for the in-flight lease.
