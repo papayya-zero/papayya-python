@@ -118,7 +118,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Project-scoped Papayya API key, sent as X-Api-Key on every "
             "dispatcher request. Falls back to the PAPAYYA_API_KEY env "
             "var when omitted. Required for the hosted dispatcher; "
-            "optional for the local dispatcher."
+            "optional for the local dispatcher. Either way the worker "
+            "immediately re-execs itself with the value stripped from argv "
+            "and environment, so it is not visible in /proc to the customer "
+            "code this process runs (plan 60 S1c)."
         ),
     )
     p.add_argument(
@@ -175,16 +178,161 @@ def _truthy(s: str | None) -> bool:
     return s.strip().lower() in {"1", "true", "yes"}
 
 
+
+# --- Scrubbing the key out of what /proc publishes (plan 60 S1c) -----------
+#
+# WHAT THE ADVERSARIAL TEST FOUND. An @agent deployed to the local stack and
+# asked for the platform worker key got it twice over, after S1a and S1b were
+# both closed:
+#
+#   argv_leak: ["python -m papayya.runtime --bootstrap ... --api-key papayya_platform_xCB8..."]
+#   proc_environ_leak: ["/proc/self/environ", "/proc/1/environ"]
+#
+# Two facts the earlier fixes did not account for:
+#
+#   * The WORKER'S OWN argv carries the key when an operator passes --api-key.
+#     S1b moved it off the HEARTBEAT child's command line; the parent's was
+#     never the child's.
+#   * ``os.environ.pop`` does not scrub ``/proc/<pid>/environ``. That file is
+#     the environment as it was at exec, and Python's pop only edits the
+#     interpreter's own copy. Production takes exactly this shape: ECS injects
+#     PAPAYYA_API_KEY from Secrets Manager, so the pop in Worker.__init__ has
+#     been cosmetic there all along.
+#
+# THE ONLY WAY TO CHANGE WHAT /proc PUBLISHES IS TO EXEC AGAIN. So the worker
+# re-execs itself once, with the key stripped from both argv and environment,
+# and passes it to its own successor down an inherited pipe — which has two
+# ends and customer code holds neither. After the re-exec /proc/self/cmdline
+# and /proc/self/environ are clean for the rest of the process's life, which
+# is the whole of the customer code's life.
+#
+# WHAT THIS STILL DOES NOT FIX, and it is the important sentence: the key is
+# in the memory of the interpreter that imports and calls the customer's
+# function, so `gc.get_objects()` finds it. No in-process measure closes that.
+# Only running customer code in a different process from the one holding the
+# key does — plan 60 S3's supervisor split. This closes the routes that need
+# no cleverness at all: an env read, a glob over /proc, a `ps`.
+
+_REEXEC_FD_ENV = "PAPAYYA_WORKER_CREDENTIAL_FD"
+
+
+def _scrub_credential_via_reexec(argv: list[str] | None) -> str | None:
+    """Re-exec with the credential moved to a pipe. Returns it after the exec.
+
+    Called before anything else in main(). Three cases:
+
+      * Already re-execed (``_REEXEC_FD_ENV`` set) — read the key off the fd
+        and carry on. This is the branch that actually runs the worker.
+      * No key anywhere — nothing to scrub, return None. Local dev.
+      * A key in argv or the environment — write it to a pipe and
+        ``os.execv`` ourselves with both scrubbed. Does not return.
+
+    ``argv`` is the caller-supplied argument list used by tests; when it is
+    None we are the real process and rewrite ``sys.argv``. A test that passes
+    its own argv is not the process being scrubbed, so the re-exec is skipped
+    and the key is returned as-is — re-execing the test runner would be
+    absurd, and the property under test there is the parser's, not /proc's.
+    """
+    inherited = os.environ.get(_REEXEC_FD_ENV)
+    if inherited is not None:
+        try:
+            with os.fdopen(int(inherited), "r") as f:
+                key = f.read().strip()
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(
+                f"papayya runtime: could not read the credential handed to the "
+                f"re-exec ({exc}); refusing to start rather than run unauthenticated\n"
+            )
+            raise SystemExit(2) from exc
+        # Not inherited any further: a customer subprocess must not receive it.
+        os.environ.pop(_REEXEC_FD_ENV, None)
+        return key or None
+
+    if argv is not None:
+        # Under test. Resolve the key the ordinary way and leave the process
+        # alone.
+        return _key_from(argv, os.environ)
+
+    key = _key_from(sys.argv[1:], os.environ)
+    if not key:
+        return None
+
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(read_fd, True)
+    with os.fdopen(write_fd, "w") as f:
+        f.write(key)
+
+    # SCRUBBED BY VALUE, NOT BY NAME, and the adversarial test is why. Removing
+    # PAPAYYA_API_KEY alone left the key in /proc/self/environ, because compose
+    # also passes it as PAPAYYA_PLATFORM_WORKER_KEY — the same secret under a
+    # second name. Any future deployment that adds a third name would
+    # re-open the hole silently, and a name list is a thing to forget to
+    # update. The value is the secret, so the value is what gets removed.
+    clean_env = {
+        k: v for k, v in os.environ.items() if v != key and k != "PAPAYYA_API_KEY"
+    }
+    clean_env[_REEXEC_FD_ENV] = str(read_fd)
+    # execve, not execv: the environment is half of what we are scrubbing, and
+    # execv would carry the current one through unchanged.
+    os.execve(sys.executable, _reexec_command(), clean_env)
+
+
+def _reexec_command() -> list[str]:
+    """The argv to exec, scrubbed, in whichever form we were started.
+
+    ``python -m papayya.runtime`` REWRITES sys.argv[0] to the absolute path of
+    __main__.py, so replaying [executable] + sys.argv runs that file as a
+    top-level script — and its `from .worker import ...` then fails with
+    "attempted relative import with no known parent package". The container
+    crash-looped on exactly this. ``__spec__`` is the thing that knows: it is
+    set only under -m, and its parent is the package to re-run.
+    """
+    args = _argv_without_api_key(sys.argv[1:])
+    spec = globals().get("__spec__")
+    if spec is not None and getattr(spec, "parent", ""):
+        return [sys.executable, "-m", spec.parent] + args
+    return [sys.executable, sys.argv[0]] + args
+
+
+def _key_from(args: list[str], env) -> str | None:
+    """The credential as the parser would resolve it, without running it."""
+    for i, a in enumerate(args):
+        if a == "--api-key" and i + 1 < len(args):
+            return args[i + 1] or None
+        if a.startswith("--api-key="):
+            return a.split("=", 1)[1] or None
+    return env.get("PAPAYYA_API_KEY") or None
+
+
+def _argv_without_api_key(argv: list[str]) -> list[str]:
+    """argv with --api-key and its value removed, preserving everything else."""
+    out: list[str] = []
+    skip = False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a == "--api-key":
+            skip = True
+            continue
+        if a.startswith("--api-key="):
+            continue
+        out.append(a)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
+    # FIRST, before argparse and before logging: this call may not return.
+    scrubbed_key = _scrub_credential_via_reexec(argv)
     args = _build_parser().parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    # CLI flag wins; env var is the containerized-deploy fallback (ECS
-    # task secret injection). Read here rather than via argparse default
-    # so changes to the env between import and parse take effect.
-    api_key = args.api_key or os.environ.get("PAPAYYA_API_KEY")
+    # The credential handed down the re-exec pipe, which is where it lives
+    # once _scrub_credential_via_reexec has run (plan 60 S1c). The argv/env
+    # fallbacks remain for the test path, which does not re-exec.
+    api_key = scrubbed_key or args.api_key or os.environ.get("PAPAYYA_API_KEY")
 
     # Bootstrap mode: hosted workers boot without --agent-module and
     # load every bundle on demand from the lease's agent_version
