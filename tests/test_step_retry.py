@@ -305,3 +305,80 @@ def test_async_backoff_does_not_block_the_event_loop(
 
     assert _no_real_sleeping == [1.0]
     assert slept_sync == [], "the async path must not call the blocking sleep"
+
+
+# ── R4: the retry reaches the RECORD, not just the log ────────────────────
+
+def test_a_retried_step_records_what_it_cost() -> None:
+    """A step that failed four times and succeeded on the fifth used to write a
+    checkpoint byte-identical to one that worked immediately — same
+    outcome_status, same attempt, same everything, because a failed in-process
+    attempt writes no row at all. The platform spent five executions of the
+    customer's function and every surface reported one.
+    """
+    run = _run()
+    run.step("read-photo", _flaky(3), item_id="DOC-2001#photo-17")()
+
+    entry = run._cache["read-photo"]
+    assert entry.retry_count == 3
+    assert entry.retry_reason is not None
+    assert "OcrUnavailable" in entry.retry_reason
+    assert "page 17" in entry.retry_reason, "the diagnostic, not just the count"
+    # Still ONE row, still attempt 1 — R4 records the cost, it does not change
+    # what `attempt` means.
+    assert entry.attempt == 1
+
+
+def test_a_clean_step_records_zero_not_null() -> None:
+    """0 is a fact — "ran once, first time" — and a consumer that has to tell
+    an absent field from a zero is a consumer that will get it wrong."""
+    run = _run()
+    run.step("classify", lambda: "photo_report")()
+
+    entry = run._cache["classify"]
+    assert entry.retry_count == 0
+    assert entry.retry_reason is None
+
+
+def test_the_last_failure_is_the_one_recorded() -> None:
+    """A step that hit a 429 and then a 503 is better described by the failure
+    that was still true when it finally worked."""
+    run = _run()
+    seq = [HttpErr(429), OcrUnavailable("ocr sidecar returned 503 for page 17")]
+    state = {"n": 0}
+
+    def fn():
+        if state["n"] < len(seq):
+            exc = seq[state["n"]]
+            state["n"] += 1
+            raise exc
+        return "ok"
+
+    run.step("read-photo", fn)()
+
+    entry = run._cache["read-photo"]
+    assert entry.retry_count == 2
+    assert "503" in (entry.retry_reason or ""), entry.retry_reason
+
+
+def test_a_second_loop_iteration_does_not_inherit_the_first_ones_tally() -> None:
+    """The tally lives on the per-call ctx, not on a closure the wrapper reuses
+    across invocations. `run.step("read-photo", ...)` called forty times is
+    forty independent tallies."""
+    run = _run()
+    run.step("read-photo", _flaky(2))()   # retried twice
+    run.step("read-photo", _flaky(0))()   # clean
+
+    assert run._cache["read-photo"].retry_count == 2
+    assert run._cache["read-photo#2"].retry_count == 0
+
+
+def test_the_retry_reason_is_bounded() -> None:
+    """A provider that returns a stack trace in its message must not push a row
+    past the column bound."""
+    run = _run()
+    huge = "x" * 50_000
+    run.step("call", _flaky(1, exc_factory=lambda: OcrUnavailable(huge)))()
+
+    reason = run._cache["call"].retry_reason or ""
+    assert len(reason) <= run_module._RETRY_REASON_MAX

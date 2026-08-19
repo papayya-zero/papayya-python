@@ -77,6 +77,8 @@ log = logging.getLogger("papayya.durable")
 DEFAULT_STEP_RETRIES = 4
 STEP_RETRY_BASE_SECONDS = 1.0
 STEP_RETRY_MAX_SECONDS = 8.0
+# Matches durable_runs.error's storage bound in the control pane.
+_RETRY_REASON_MAX = 2000
 
 
 # Module-level seams so a test can observe the backoff WITHOUT reaching
@@ -122,6 +124,13 @@ class _CallCtx:
     legacy_pre_count: int | None
     start: float
     cleanup_done: bool = False
+    # Plan 58 R4 — what this call cost. Incremented by the retry loop, read by
+    # _post_call_success onto the one row this call writes. On the ctx rather
+    # than a closure variable because the ctx is already the thing that spans
+    # the call boundary, and a step invoked twice in a loop must not inherit
+    # the previous invocation's tally.
+    retry_count: int = 0
+    retry_reason: str | None = None
 
 
 def _label_for_warning(label_or_fn: Any, fn: Any) -> str:
@@ -1104,6 +1113,8 @@ class Item:
                 tainted_reason=tainted_reason,
                 execution_token=execution_token,
                 attempt=attempt,
+                retry_count=ctx.retry_count,
+                retry_reason=ctx.retry_reason,
             )
 
             self._cache[ctx.effective_label] = entry
@@ -1181,7 +1192,7 @@ class Item:
             return min(STEP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
                        STEP_RETRY_MAX_SECONDS)
 
-        def _should_retry(exc: BaseException, attempt: int) -> bool:
+        def _should_retry(exc: BaseException, attempt: int, ctx: _CallCtx) -> bool:
             """Decide, log the decision, and sleep. Returns True to go again.
 
             THE LOG LINE IS NOT DECORATION. A retry that leaves no trace is the
@@ -1211,6 +1222,13 @@ class Item:
                 label, attempt, attempts_allowed,
                 type(exc).__name__, exc, wait,
             )
+            ctx.retry_count += 1
+            # The LAST failure wins, not the first: a step that hit a 429 and
+            # then a 503 is better described by the one that was still true
+            # when it finally worked. Truncated on the same rule as
+            # durable_runs.error — a provider that returns a stack trace in
+            # its message must not push a row over a column bound.
+            ctx.retry_reason = f"{type(exc).__name__}: {exc}"[:_RETRY_REASON_MAX]
             return True
 
         if is_async:
@@ -1232,7 +1250,7 @@ class Item:
                                     raise CreditExhausted(
                                         f"{label}: provider credits exhausted ({exc})"
                                     ) from exc
-                            if _should_retry(exc, attempt):
+                            if _should_retry(exc, attempt, ctx):
                                 # asyncio.sleep, not _time.sleep — blocking the
                                 # loop here would stall every other coroutine
                                 # in the same @agent body, including the ones
@@ -1267,7 +1285,7 @@ class Item:
                                 raise CreditExhausted(
                                     f"{ctx.effective_label}: provider credits exhausted ({exc})"
                                 ) from exc
-                        if _should_retry(exc, attempt):
+                        if _should_retry(exc, attempt, ctx):
                             _sleep(_retry_wait(attempt))
                             continue
                         raise

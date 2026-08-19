@@ -87,6 +87,18 @@ class TaskEntry:
     # first one's write was journaled and therefore invisible.
     execution_token: str = ""
     attempt: int = 1
+    # Plan 58 R4 — what this execution COST, on the execution.
+    #
+    # `retry_count` is how many in-process attempts failed before this one
+    # succeeded; `retry_reason` is the exception that caused them, one line.
+    # Both are about a single pass, and both are therefore distinct from
+    # `attempt` above, which counts re-executions ACROSS passes and is seeded
+    # from stored rows. A retried step writes ONE row (a failed attempt writes
+    # none), so without these two fields a step that ran five times and a step
+    # that ran once are byte-identical on the record — the platform spending
+    # five executions and reporting one.
+    retry_count: int = 0
+    retry_reason: str | None = None
 
 
 def latest_per_label(tasks: list[TaskEntry]) -> list[TaskEntry]:

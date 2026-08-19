@@ -3680,6 +3680,24 @@ def logs(ctx: click.Context, run_id: str, tail: int | None) -> None:
             if reason:
                 click.echo(f"   Reason: {reason}")
 
+            # WHAT THE STEP COST (plan 58 R4). A step that failed four times
+            # and succeeded on the fifth writes ONE checkpoint, byte-identical
+            # to one that worked immediately — a failed in-process attempt has
+            # no row. Without this line the platform spent five executions of
+            # the customer's function and every surface reported one.
+            #
+            # Printed on the step rather than summarised on the run, because
+            # "which page needed four tries" is the question, and it is the
+            # same question `Item:` above exists to answer.
+            retries = s.get("retry_count") or 0
+            if retries:
+                line = (f"   Retried: {retries}x "
+                        f"({retries + 1} executions of this step)")
+                click.echo(line)
+                retry_reason = s.get("retry_reason")
+                if retry_reason:
+                    click.echo(f"   Retried because: {retry_reason}")
+
             result = s.get("result")
             if result is not None:
                 rendered = result if isinstance(result, str) else json.dumps(result)

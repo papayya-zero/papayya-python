@@ -278,6 +278,8 @@ class CloudStore:
                     # leaves it empty — nothing downstream reads it off a
                     # loaded row, only off one being written.
                     attempt=cp.get("attempt", 1),
+                    retry_count=cp.get("retry_count", 0),
+                    retry_reason=cp.get("retry_reason"),
                 )
                 for cp in body.get("checkpoints") or []
             ],
@@ -353,6 +355,11 @@ class CloudStore:
             # that replaced it.
             "execution_token": entry.execution_token,
             "attempt": entry.attempt,
+            # Plan 58 R4 — what this execution cost. Omitted-safe on an older
+            # control pane: it ignores unknown keys, and 0/None is the honest
+            # reading of a row written before retries existed.
+            "retry_count": entry.retry_count,
+            "retry_reason": entry.retry_reason,
             "completed_at": entry.completed_at,
         }
         self._execute(
