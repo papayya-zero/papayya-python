@@ -334,7 +334,7 @@ def _extract_item_id(args: tuple[Any, ...]) -> Any:
     return args[0] if args else None
 
 
-def _resolve_item_id(args: tuple[Any, ...]) -> Any:
+def _resolve_item_id(args: tuple[Any, ...], kwargs: dict[str, Any] | None = None) -> Any:
     """The record's id for this invocation: the lease's DECLARED id when a
     worker injected one, else the legacy positional-arg convention.
 
@@ -354,6 +354,28 @@ def _resolve_item_id(args: tuple[Any, ...]) -> Any:
     declared = _BOOTSTRAP_ITEM_ID.get()
     if declared is not _UNSET_ITEM_ID:
         return declared
+
+    # THE LOCAL PATH'S DECLARATION CHANNEL (plan 56 F8, closing plan 54 N1).
+    #
+    # B2a's fix shipped only where a dispatcher could declare the id — the
+    # worker injects it into the contextvar above. Run locally there IS no
+    # dispatcher, so this fell through to args[0], which since B2a is the
+    # customer's INPUT. For any dict-shaped input that is an object where the
+    # wire wants a string, and `python agent.py` 400s. Onboarding step 4
+    # passes the literal "world", which is why it kept passing; a document
+    # pipeline is inherently dict-input, so the whole customer shape was dead
+    # at step 4 with no workaround.
+    #
+    # `partition_key` has read exactly this kwarg two functions down since it
+    # existed (_extract_partition_key). The channel was open for one field and
+    # closed for the other, in adjacent lines.
+    #
+    # Precedence bootstrap -> kwarg -> positional leaves the hosted path
+    # untouched: a worker-declared id still wins over anything the customer
+    # passes, which is what plan 43 B2b C11 requires.
+    if kwargs is not None and "item_id" in kwargs:
+        return kwargs["item_id"]
+
     return _extract_item_id(args)
 
 
@@ -640,7 +662,7 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
-                item_id_value = _resolve_item_id(args)
+                item_id_value = _resolve_item_id(args, kwargs)
                 partition_key_value = _extract_partition_key(kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,
@@ -722,7 +744,7 @@ def agent(
                     sig_for_snapshot, args, kwargs,
                 )
                 input_token = _AGENT_INPUT.set(snapshot)
-                item_id_value = _resolve_item_id(args)
+                item_id_value = _resolve_item_id(args, kwargs)
                 partition_key_value = _extract_partition_key(kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,

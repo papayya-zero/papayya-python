@@ -117,6 +117,50 @@ class CloudStoreConfig:
     platform_auth: bool = False
 
 
+def _raise_with_server_message(resp: "httpx.Response") -> None:
+    """raise_for_status, but say what the server said (plan 56 F8 / plan 54 N2).
+
+    httpx's own message is the request line and the status code. The
+    control-plane always sends a body explaining itself — ``{"error":
+    {"message": "invalid request body"}}`` — and raise_for_status throws it
+    away, so a customer whose input was rejected got a traceback ending in
+
+        httpx.HTTPStatusError: Client error '400 Bad Request' for url ...
+
+    with the one sentence that names the problem sitting unread in the
+    response. Plan 55 measured the cost: a dict-shaped input 400s (N1), and
+    the error named neither the field nor the reason.
+
+    Raises the SAME exception type with the same request/response attached, so
+    ``_is_transient`` and every other caller inspecting ``.response`` keep
+    working — this widens the message and changes nothing else.
+    """
+    if not resp.is_error:
+        return
+    detail = ""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("message") or "")
+            elif isinstance(err, str):
+                detail = err
+            if not detail:
+                detail = str(body.get("message") or "")
+    except Exception:  # noqa: BLE001 — a non-JSON body is not worth failing on
+        detail = ""
+    if not detail:
+        # Fall back to the raw body, trimmed. An HTML error page is still
+        # more use than a bare status code.
+        detail = (resp.text or "").strip()[:300]
+
+    message = f"{resp.status_code} from {resp.request.method} {resp.request.url}"
+    if detail:
+        message += f": {detail}"
+    raise httpx.HTTPStatusError(message, request=resp.request, response=resp)
+
+
 def _attach_lease_header(request: "httpx.Request") -> None:
     """Stamp X-Papayya-Lease on outbound writes when one is in scope.
 
@@ -473,7 +517,7 @@ class CloudStore:
         ``raise_for_status`` automatically, so we do.
         """
         resp = self._client.request(method, url, json=payload)
-        resp.raise_for_status()
+        _raise_with_server_message(resp)
         self._note_pause_from_response(url, resp)
         return resp
 
