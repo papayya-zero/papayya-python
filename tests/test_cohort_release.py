@@ -372,7 +372,7 @@ def test_cli_names_what_the_release_skipped(patched_api):
         runs={"n1": _run(outcome="ok")},
     ))
     result = _invoke("--agent", "enrich", "-y")
-    assert "Released 1 of 4 record(s)" in result.output
+    assert "Released 1 of 4 item(s)" in result.output
     assert "still running and were not re-driven" in result.output
     assert "no agent to route to" in result.output
 

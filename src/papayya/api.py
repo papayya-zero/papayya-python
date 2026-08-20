@@ -315,16 +315,16 @@ class APIClient:
         exist.
 
         ``flagged`` is legal alongside a selector on every door — it selects
-        records a human said were wrong (plan 43 B1, ADR 0009 D3), and
+        items a human said were wrong (plan 43 B1, ADR 0009 D3), and
         "everything like this record that someone also complained about" is the
         query backflow and search-by-example make together. On a selector door
-        it can only ever remove records, because the resolved outcome is
+        it can only ever remove items, because the resolved outcome is
         already ``any``.
         """
         if probe and drift_episode:
             raise ValueError(
                 "pass either probe or drift_episode, not both — each selects "
-                "its own records"
+                "its own items"
             )
 
         selector = "probe" if probe else ("drift_episode" if drift_episode else None)
@@ -341,7 +341,7 @@ class APIClient:
             offending = sorted(k for k, v in described.items() if v is not None)
             if offending:
                 raise ValueError(
-                    f"{selector} selects its own records; remove "
+                    f"{selector} selects its own items; remove "
                     + ", ".join(offending)
                 )
 
@@ -391,7 +391,7 @@ class APIClient:
         include_triaged: bool = False,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """Select records by predicate over a window (Plan 41 R4, ADR 0009 D7).
+        """Select items by predicate over a window (Plan 41 R4, ADR 0009 D7).
 
         Returns ``{members, total, truncated}``. ``total`` is the FULL
         cohort size ignoring ``limit``; ``truncated`` says whether
@@ -401,10 +401,10 @@ class APIClient:
 
         ``run_id`` is one optional predicate term, not the addressing
         scheme: nothing in the product mints a multi-item run, so a
-        run-keyed selection returns that single record.
+        run-keyed selection returns that single item.
 
-        ``flagged=True`` narrows to records a human said were wrong (plan 43
-        B1). It IMPLIES ``outcome="any"`` unless you pass one: the records
+        ``flagged=True`` narrows to items a human said were wrong (plan 43
+        B1). It IMPLIES ``outcome="any"`` unless you pass one: the items
         people flag are usually the ones that completed ok, so the default
         would answer zero and read as good news.
 
@@ -423,14 +423,14 @@ class APIClient:
         since: str | None = None,
         until: str | None = None,
     ) -> dict[str, Any]:
-        """Search by example: what selects everything like this record?
+        """Search by example: what selects everything like this item?
 
         ADR 0009 §4 step 3 — *"paste one known-bad record, get everything
         like it across the last 60 days. Writing a predicate against history
         is the power-user path; pointing at a bad one is what actually
         happens at 2am."*
 
-        Returns ``{record, agent, from, to, proposals, refusals,
+        Returns ``{item, agent, from, to, proposals, refusals,
         window_note}``. Each proposal carries a ``probe`` id to hand to
         :meth:`get_cohort` or :meth:`release_cohort`, and a ``count`` — the
         blast radius, which is what makes it something to decide about.
@@ -439,7 +439,7 @@ class APIClient:
         derived, each with its reason (most often: the population's baseline
         is still forming, so there is no trustworthy floor to compare
         against). They are returned rather than dropped because a silently
-        missing proposal is indistinguishable from a condition the record
+        missing proposal is indistinguishable from a condition the item
         did not satisfy.
 
         Writes nothing but the saved predicates; re-executes nothing.
@@ -465,7 +465,7 @@ class APIClient:
         include_triaged: bool = False,
         latest: bool = False,
     ) -> dict[str, Any]:
-        """Re-drive every record the predicate selects (Plan 41 R4 C5, C6).
+        """Re-drive every item the predicate selects (Plan 41 R4 C5, C6).
 
         Same predicate parser as :meth:`get_cohort` on the server, so what
         an operator previews is what they re-drive. Deliberately takes no
@@ -480,7 +480,7 @@ class APIClient:
         available outcome.
 
         ON THE PROBE PATH, THIS SELECTS SLIGHTLY FEWER RECORDS THAN THE
-        PREVIEW, deliberately. A by-example preview admits records that are
+        PREVIEW, deliberately. A by-example preview admits items that are
         themselves re-drives — an operator asking "what else looks like
         this" wants the truth about their whole history. Release excludes
         them, so nobody is offered a re-drive of a re-drive. It can only
@@ -489,18 +489,18 @@ class APIClient:
 
         ``flagged`` DOES NOT IMPLY AN OUTCOME HERE, unlike
         :meth:`get_cohort`. On a hand-written predicate the flag is
-        outcome-widening — the records people flag are usually the ones that
+        outcome-widening — the items people flag are usually the ones that
         completed ok — so a release that inherited the preview's implied
-        ``any`` would re-drive records the operator's own predicate excludes.
+        ``any`` would re-drive items the operator's own predicate excludes.
         Say which you mean. The server refuses the same request; this is the
         earlier, better-worded copy.
         """
         if flagged and outcome is None and not (probe or drift_episode):
             raise ValueError(
-                "flagged selects records that completed ok, so a re-drive "
-                "would act on records the default predicate excludes. Pass "
+                "flagged selects items that completed ok, so a re-drive "
+                "would act on items the default predicate excludes. Pass "
                 "outcome='any' to re-drive them, or outcome='not_ok' for the "
-                "flagged records that also failed."
+                "flagged items that also failed."
             )
         return self._request("POST", "/v1/durable/cohorts/replay", params=self._cohort_params(
             probe=probe, drift_episode=drift_episode, agent=agent, tenant=tenant,

@@ -1548,30 +1548,30 @@ def resume_cmd(ctx: click.Context, run_id: str) -> None:
 
 @main.command("pull")
 @click.option("--like", "like_record", default=None,
-              help="SEARCH BY EXAMPLE: paste one record id you know is bad and "
+              help="SEARCH BY EXAMPLE: paste one item id you know is bad and "
                    "see what selects everything like it, with the blast radius "
                    "of each. Writes nothing — pick one and pass --probe.")
 @click.option("--probe", "probe_id", default=None,
               help="Pull the cohort a derived predicate selects (from --like).")
 @click.option("--drift-episode", "drift_episode", default=None,
-              help="Pull the records a detected change moved.")
+              help="Pull the items a detected change moved.")
 @click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
 @click.option("--tenant", default=None,
               help="Narrow to one partition key (the customer's own tenant id).")
 @click.option("--run", "run_id", default=None,
-              help="Narrow to one run's records. One predicate term among "
+              help="Narrow to one run's items. One predicate term among "
                    "several, not the addressing scheme.")
 @click.option("--outcome", default=None,
               type=click.Choice(["not_ok", "any", "degraded", "failed"]),
               help="Verdict axis. Default not_ok — everything that didn't work.")
 @click.option("--flagged", is_flag=True, default=False,
-              help="Only records a human said were wrong — a thumbs-down, a "
+              help="Only items a human said were wrong — a thumbs-down, a "
                    "ticket, a refund. IMPLIES --outcome any unless you pass "
                    "one: what people flag usually completed fine.")
 @click.option("--since", default=None, help="Window start (RFC3339).")
 @click.option("--until", default=None, help="Window end (RFC3339).")
 @click.option("--include-triaged", is_flag=True, default=False,
-              help="Re-admit records someone already dispositioned. Off by "
+              help="Re-admit items someone already dispositioned. Off by "
                    "default so a pull doesn't resurrect handled work.")
 @click.option("--limit", type=int, default=None,
               help="Cap the number of fixtures written.")
@@ -1597,14 +1597,14 @@ def pull_cmd(
     out_dir: str,
     dry_run: bool,
 ) -> None:
-    """Pull a cohort of failed records to disk as reproducible fixtures.
+    """Pull a cohort of failed items to disk as reproducible fixtures.
 
     \b
     Describe the cohort yourself:
       papayya pull --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
 
     \b
-    Or point at one bad record and let the predicate be derived:
+    Or point at one bad item and let the predicate be derived:
       papayya pull --like 9c21e8b4-...        # what selects everything like it?
       papayya pull --probe bf88-...           # pull the one you picked
       papayya verify --fixtures ./fixtures --agent-module app
@@ -1654,7 +1654,7 @@ def pull_cmd(
             "include_triaged": include_triaged,
         }
         if flagged and outcome is None:
-            click.echo("Selecting flagged records at --outcome any: what a "
+            click.echo("Selecting flagged items at --outcome any: what a "
                        "human flags usually completed fine.", err=True)
         try:
             resp = api.get_cohort(
@@ -1675,7 +1675,7 @@ def pull_cmd(
         total = resp.get("total", len(members))
 
         if not members:
-            click.echo("No records matched. Nothing to pull.")
+            click.echo("No items matched. Nothing to pull.")
             # The advice has to match the door. On a derived predicate the
             # window is frozen server-side and --outcome is refused outright,
             # so telling an operator to widen or loosen it names two flags that
@@ -1688,7 +1688,7 @@ def pull_cmd(
                 # --outcome any is already applied, so naming it here would be
                 # a dead end — the same class of wrong advice the two lines
                 # above exist to avoid.
-                click.echo("  Nobody has flagged a record matching this yet. "
+                click.echo("  Nobody has flagged an item matching this yet. "
                            "Drop --flagged, or widen the window with --since.")
             else:
                 click.echo("  Widen the window with --since, or pass --outcome any.")
@@ -1699,13 +1699,13 @@ def pull_cmd(
         # by us, not by the data.
         if resp.get("truncated"):
             click.echo(
-                f"NOTE: cohort is {total} records; pulling {len(members)}. "
+                f"NOTE: cohort is {total} items; pulling {len(members)}. "
                 f"Raise --limit to take the rest.",
                 err=True,
             )
 
         if dry_run:
-            click.echo(f"Would pull {len(members)} of {total} record(s) into {out_dir}:")
+            click.echo(f"Would pull {len(members)} of {total} item(s) into {out_dir}:")
             for m in members[:20]:
                 # Both columns, same collapse as `release` prints — the
                 # selection response carries `status` beside
@@ -1736,7 +1736,7 @@ def pull_cmd(
             fixtures.append(fx)
 
         paths = write_fixtures(fixtures, out_dir)
-        click.echo(f"Pulled {len(paths)} of {total} record(s) into {out_dir}/")
+        click.echo(f"Pulled {len(paths)} of {total} item(s) into {out_dir}/")
         if no_input:
             click.echo(
                 f"  {no_input} fixture(s) have no recorded input and cannot be "
@@ -1751,16 +1751,16 @@ def pull_cmd(
 def _echo_probe_proposals(
     api: Any, record: str, since: str | None, until: str | None,
 ) -> None:
-    """Render `papayya pull --like <record>` — ADR 0009 §4 step 3.
+    """Render `papayya pull --like <item>` — ADR 0009 §4 step 3.
 
     The output IS the deliverable here, the same way the cohort report is for
-    a pull. An operator at 2am has one bad record and needs to know what it is
+    a pull. An operator at 2am has one bad item and needs to know what it is
     an example OF, and how much of it there is.
     """
     try:
         d = api.derive_probes(record, since=since, until=until)
     except PapayyaAPIError as exc:
-        click.echo(f"Error: could not read that record ({exc.status}): {exc}", err=True)
+        click.echo(f"Error: could not read that item ({exc.status}): {exc}", err=True)
         sys.exit(1)
 
     proposals = d.get("proposals", [])
@@ -1773,14 +1773,14 @@ def _echo_probe_proposals(
     # letting the operator assume whichever they were already thinking about.
     scope = (f"tenant {d['partition_key']}" if d.get("partition_key")
              else "all tenants")
-    click.echo(f"Records like {record} — agent {d.get('agent')}, {scope}")
+    click.echo(f"Items like {record} — agent {d.get('agent')}, {scope}")
     click.echo(f"  window {d.get('from')} → {d.get('to')}\n")
 
     if not proposals:
         # A REAL ANSWER, NOT AN ERROR. It means the platform's vocabulary has
         # no word for what is wrong with this output — which is worth saying
         # plainly rather than dressing up as a failure to try.
-        click.echo("No predicate fits this record.")
+        click.echo("No predicate fits this item.")
         click.echo("  Nothing about it is expressible in the vocabulary this "
                    "platform will commit to — how it broke (its error, or the "
                    "category of it), or what one of its steps did (missing, "
@@ -1794,7 +1794,7 @@ def _echo_probe_proposals(
     # "this record looks fine on that axis" are completely different answers,
     # and only one of them means come back later.
     if refusals:
-        click.echo("\nNot available for this record:")
+        click.echo("\nNot available for this item:")
         for r in refusals:
             click.echo(f"  {r.get('condition')}: {r.get('reason')}")
 
@@ -1841,7 +1841,7 @@ def verify_cmd(
     Runs your function over each fixture's recorded input in this process and
     re-derives the verdict with the same inspectors production used, so
     "fixed" means what "ok" means in the dashboard. Nothing is sent, nothing
-    is stored, no record is re-driven. Exits non-zero when any fixture is
+    is stored, no item is re-driven. Exits non-zero when any fixture is
     still not ok (or, under --strict, when any could not be verified).
 
     \b
@@ -1932,30 +1932,30 @@ def verify_cmd(
                    "themselves re-drives, so this is slightly narrower than "
                    "the same probe's pull.")
 @click.option("--drift-episode", "drift_episode", default=None,
-              help="Re-drive the records a detected change moved.")
+              help="Re-drive the items a detected change moved.")
 @click.option("--agent", default=None, help="Narrow the cohort to one agent slug.")
 @click.option("--tenant", default=None,
               help="Narrow to one partition key (the customer's own tenant id).")
 @click.option("--run", "run_id", default=None,
-              help="Narrow to one run's records. One predicate term among "
+              help="Narrow to one run's items. One predicate term among "
                    "several, not the addressing scheme.")
 @click.option("--outcome", default=None,
               type=click.Choice(["not_ok", "any", "degraded", "failed"]),
               help="Verdict axis. Default not_ok — everything that didn't work.")
 @click.option("--flagged", is_flag=True, default=False,
-              help="Only records a human said were wrong. On a hand-written "
+              help="Only items a human said were wrong. On a hand-written "
                    "predicate this REQUIRES --outcome: unlike `pull`, a "
                    "re-drive will not widen its own selection for you.")
 @click.option("--since", default=None, help="Window start (RFC3339).")
 @click.option("--until", default=None, help="Window end (RFC3339).")
 @click.option("--include-triaged", is_flag=True, default=False,
-              help="Re-admit records someone already dispositioned.")
+              help="Re-admit items someone already dispositioned.")
 @click.option("--latest", is_flag=True, default=False,
               help="Re-drive the whole cohort on the agent's CURRENT version. "
                    "This is the 'I shipped the fix' flag. Without it each "
                    "record replays on the version it originally ran.")
 @click.option("--wait/--no-wait", "wait", default=True,
-              help="Poll the re-driven records to completion and print the "
+              help="Poll the re-driven items to completion and print the "
                    "diff (default), or return the manifest immediately.")
 @click.option("--timeout", "timeout_s", type=int, default=600,
               help="Seconds to wait for the cohort to finish (default 600).")
@@ -1982,7 +1982,7 @@ def release_cmd(
     yes: bool,
     as_json: bool,
 ) -> None:
-    """Re-drive a cohort of failed records, then show what changed.
+    """Re-drive a cohort of failed items, then show what changed.
 
     \b
       papayya pull    --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
@@ -2020,7 +2020,7 @@ def release_cmd(
         # that was never releasable.
         if flagged and outcome is None and not (probe_id or drift_episode):
             click.echo(
-                "Error: --flagged selects records that completed ok, so a "
+                "Error: --flagged selects items that completed ok, so a "
                 "re-drive would act on records the default predicate excludes. "
                 "Pass --outcome any to re-drive them, or --outcome not_ok for "
                 "the flagged records that also failed.", err=True)
@@ -2043,7 +2043,7 @@ def release_cmd(
             sys.exit(1)
         total = preview.get("total", 0)
         if not total:
-            click.echo("No records matched. Nothing to release.")
+            click.echo("No items matched. Nothing to release.")
             return
         if not yes:
             version_note = ("the agent's CURRENT version" if latest
@@ -2059,7 +2059,7 @@ def release_cmd(
             # predicate exists to prevent.
             if probe_id:
                 click.echo(
-                    f"  {total} record(s) match this probe. Records that are "
+                    f"  {total} item(s) match this probe. Items that are "
                     f"themselves re-drives are excluded from a release, so "
                     f"fewer may go."
                 )
@@ -2087,7 +2087,7 @@ def release_cmd(
             # --json emits the diff and NOTHING else on stdout: every fact in
             # these lines is in the payload, and a progress line ahead of it
             # makes the output unparseable for the caller who asked for JSON.
-            click.echo(f"Released {len(diff.records)} of {diff.cohort_total} record(s).")
+            click.echo(f"Released {len(diff.records)} of {diff.cohort_total} item(s).")
         _echo_release_skips(diff)
 
         if wait:
@@ -2113,7 +2113,7 @@ def release_cmd(
                     break
                 if time.time() >= deadline:
                     click.echo(
-                        f"\nTimed out with {len(pending_run_ids(diff))} record(s) "
+                        f"\nTimed out with {len(pending_run_ids(diff))} item(s) "
                         f"still running. They are re-driving; re-read them in "
                         f"the dashboard or raise --timeout.",
                         err=True,
@@ -2137,7 +2137,7 @@ def release_cmd(
 
         counts = diff.counts
         click.echo(
-            f"\n{len(diff.records)} record(s): "
+            f"\n{len(diff.records)} item(s): "
             f"{counts.get(RECOVERED, 0)} recovered, "
             f"{counts.get(STILL_NOT_OK, 0)} still not ok, "
             f"{counts.get(NEWLY_BROKEN, 0)} newly broken, "
@@ -2154,7 +2154,7 @@ def release_cmd(
             # Loudest line in the output, deliberately. It is the fact an
             # operator is least likely to look for and most needs.
             click.echo(
-                f"\n{counts[NEWLY_BROKEN]} record(s) were fine before this "
+                f"\n{counts[NEWLY_BROKEN]} item(s) were fine before this "
                 f"re-drive and are not now.",
                 err=True,
             )
@@ -2166,14 +2166,14 @@ def _echo_release_skips(diff: Any) -> None:
     """Say what the release did NOT touch. Named, never silent."""
     if diff.skipped_not_terminal:
         click.echo(
-            f"  {diff.skipped_not_terminal} record(s) are still running and "
+            f"  {diff.skipped_not_terminal} item(s) are still running and "
             f"were not re-driven — they stay in the cohort, so release again "
             f"once they land.",
             err=True,
         )
     if diff.skipped_agent_missing:
         click.echo(
-            f"  {diff.skipped_agent_missing} record(s) have no agent to route "
+            f"  {diff.skipped_agent_missing} item(s) have no agent to route "
             f"to and were not re-driven.",
             err=True,
         )
@@ -2192,19 +2192,19 @@ def _echo_release_skips(diff: Any) -> None:
 
 @main.group()
 def runs() -> None:
-    """Runs — one invocation each (submit hosted).
+    """Runs — one submission each.
 
     A run is one invocation of an agent: one map() call, one cron fire,
     one submitted batch of items. `submit` sends a JSONL file to the
     hosted control plane.
 
-    To see what has already run, use `papayya items list` (one record per
+    To see what has already run, use `papayya items list` (one item per
     line) or the dashboard. This group's `list` read the local SQLite
     ledger and was deactivated with it; the help kept advertising it, so
     `papayya runs list` answered "No such command" to anyone who read the
     line above it.
 
-    BREAKING (0.3.0): this group used to operate on per-item records;
+    BREAKING (0.3.0): this group used to operate on per-item items;
     per-item inspection moved to `papayya items`.
     """
 
@@ -2223,7 +2223,7 @@ def runs() -> None:
 
 @main.group()
 def items() -> None:
-    """Inspect hosted items — one record each (list, get, stream)."""
+    """Inspect items — the unit below a run (list, get, stream)."""
 
 
 @items.command("list")
@@ -2233,9 +2233,9 @@ def items() -> None:
 @click.option("--tenant", "partition_key", default=None,
               help="Only items for this partition key.")
 @click.option("--item", "item_id", default=None,
-              help="Only the record with this id — YOUR id for it.")
+              help="Only the item with this id — YOUR id for it.")
 @click.option("--item-prefix", "item_id_prefix", default=None,
-              help="Every record whose id starts with this — `DOC-2001#` is "
+              help="Every item whose id starts with this — `DOC-2001#` is "
                    "every page of one document.")
 @click.option("--status", default=None,
               help="Only items in this run status (queued|running|completed|"
@@ -2250,7 +2250,7 @@ def items_list(
     item_id_prefix: str | None,
     status: str | None,
 ) -> None:
-    """List hosted items (NDJSON, one item per line).
+    """List items (NDJSON, one item per line).
 
     ``--run`` is the one `papayya status` has been pointing at all along: it
     prints "Items in this run: papayya items list", and until now that command
@@ -2276,7 +2276,7 @@ def items_list(
 @click.argument("item_id")
 @click.pass_context
 def items_get(ctx: click.Context, item_id: str) -> None:
-    """Fetch one record — by YOUR id for it, or by the run id.
+    """Fetch one item — by YOUR id for it, or by the run id.
 
     \b
       papayya items get DOC-2001                        # your own key
@@ -2335,7 +2335,7 @@ def items_get(ctx: click.Context, item_id: str) -> None:
 )
 @click.pass_context
 def items_stream(ctx: click.Context, item_id: str, from_step: int | None) -> None:
-    """Tail steps for a hosted item via SSE (NDJSON output).
+    """Tail steps for an item via SSE (NDJSON output).
 
     Yields one JSON object per server-sent event: ``{"event": "step" |
     "terminal" | "error", "data": {...}, "id": <step_number>}``. The
@@ -2374,7 +2374,7 @@ def _parse_json_option(raw: str | None, flag_name: str) -> Any:
 
 @main.group()
 def agents() -> None:
-    """Hosted agent CRUD (create, list, get, update)."""
+    """Agent CRUD (create, list, get, update)."""
 
 
 @agents.command("create")
@@ -2393,7 +2393,7 @@ def agents_create(
     description: str | None,
     config_raw: str | None,
 ) -> None:
-    """Create a hosted agent."""
+    """Create an agent."""
     config = _parse_json_option(config_raw, "--config")
     client = _make_papayya_client(ctx)
     try:
@@ -2498,7 +2498,7 @@ def _dollars_to_cents(dollars: float | None) -> int | None:
 
 @main.group()
 def schedules() -> None:
-    """Hosted cron schedules (create, list, get, update, enable/disable, delete)."""
+    """Cron schedules (create, list, get, update, enable/disable, delete)."""
 
 
 @schedules.command("create")
@@ -2680,7 +2680,7 @@ def schedules_disable(ctx: click.Context, schedule_id: str) -> None:
 
 @main.group()
 def triggers() -> None:
-    """Manage triggers — inbound invocation hooks (create, list, delete).
+    """Manage triggers — inbound hooks that start a run (create, list, delete).
 
     A trigger fires a run of an agent from an HTTP call (transport:
     signed webhook). Pre-0.3.0 spelling: `papayya webhooks` — kept as a
@@ -2765,13 +2765,13 @@ main.add_command(webhooks)
 
 @main.group()
 def projects() -> None:
-    """Hosted projects (list, get, update, delete). Create via `papayya envs create`."""
+    """Projects (list, get, update, delete). Create via `papayya envs create`."""
 
 
 @projects.command("list")
 @click.pass_context
 def projects_list(ctx: click.Context) -> None:
-    """List hosted projects (NDJSON)."""
+    """List projects (NDJSON)."""
     client = _make_papayya_client(ctx)
     try:
         items = client.projects.list()
@@ -2810,7 +2810,7 @@ def projects_get(ctx: click.Context, project_id: str) -> None:
 def projects_update(
     ctx: click.Context, project_id: str, name: str | None, slug: str | None
 ) -> None:
-    """Patch fields on a hosted project."""
+    """Patch fields on a project."""
     patch: dict[str, Any] = {}
     if name is not None:
         patch["name"] = name
@@ -2840,7 +2840,7 @@ def projects_update(
 )
 @click.pass_context
 def projects_delete(ctx: click.Context, project_id: str) -> None:
-    """Delete a hosted project (irreversible)."""
+    """Delete a project (irreversible)."""
     client = _make_papayya_client(ctx)
     try:
         client.projects.delete(project_id)
@@ -2859,7 +2859,7 @@ def projects_delete(ctx: click.Context, project_id: str) -> None:
 
 @main.group()
 def deployments() -> None:
-    """Inspect hosted deployments. Create via `papayya deploy`."""
+    """Inspect deployments. Create via `papayya deploy`."""
 
 
 @deployments.command("list")
@@ -3108,7 +3108,7 @@ def project_import(file: str) -> None:
         # batch/run/step (with the old per-item meaning of "run"). Accept
         # both so previously-exported files still validate.
         if kind not in ("run", "item", "step", "batch"):
-            click.echo(f"Line {i}: unknown record type {kind!r}", err=True)
+            click.echo(f"Line {i}: unknown item type {kind!r}", err=True)
             raise click.exceptions.Exit(1)
         counts[kind] = counts.get(kind, 0) + 1
 
@@ -3195,7 +3195,7 @@ def run(
     agent_id: str | None,
     agent_name: str | None,
 ) -> None:
-    """Trigger a cloud run.
+    """Trigger a run.
 
     \b
     Usage:
@@ -3260,7 +3260,7 @@ def run(
 
 
 def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str) -> None:
-    """Trigger a cloud run.
+    """Trigger a run.
 
     ``reg`` is an ``AgentRegistration`` produced by ``_discover_agents``;
     ``agent_id`` has already been resolved (slug → uuid) by the caller.
@@ -3385,10 +3385,10 @@ def _fmt_usd(amount: float) -> str:
 
 
 def _fmt_cost(record: dict[str, Any], amount: float) -> str:
-    """Cost for one record, or the reason there isn't one.
+    """Cost for one item, or the reason there isn't one.
 
     ``cost_priced`` is false when the amount is 0 only because nothing could
-    price it — a project with an empty rate card prices every record at 0, and
+    price it — a project with an empty rate card prices every item at 0, and
     printing ``$0.00`` for that is the silent-wrong-answer this product exists
     to catch (plan 51 / ``model.PricingFor``). The server already ships the
     verdict and a sentence to go with it; both are rendered rather than
@@ -3483,7 +3483,7 @@ def _echo_submission_status(api: "APIClient", run_id: str,
 def _fmt_run_cost(run: dict[str, Any]) -> str:
     """A RUN's cost, which is a SUM and so has its own unpriced rule.
 
-    ``cost_priced`` is a property of ONE record; a run is many, and its
+    ``cost_priced`` is a property of ONE item; a run is many, and its
     run-grain equivalent is ``unpriced_item_count``. The reading is asymmetric,
     and matches ``formatRunCost`` in the dashboard so the two surfaces cannot
     disagree about the same run: with SOME items unpriced the sum is a real
@@ -3624,7 +3624,7 @@ def logs(ctx: click.Context, run_id: str, tail: int | None) -> None:
     """Show step-by-step logs for a run.
 
     Prints the customer's own ``item_id`` per step, not just the step label —
-    "where did it stop" is a question about the record, and a 150-page
+    "where did it stop" is a question about the item, and a 150-page
     document dumps 150 entries without ``--tail``.
     """
     scope = _env_scope(ctx.obj)
@@ -4050,7 +4050,7 @@ def _iter_jsonl_items(path: str) -> Iterator[dict[str, Any]]:
 def _ago(iso: str | None) -> str:
     """A timestamp as "3m ago", the way a person reads a list.
 
-    Absolute times are the right thing on ONE record's page, where the question
+    Absolute times are the right thing on ONE item's page, where the question
     is "when exactly"; in a list the question is "which of these is recent",
     and 14 identical date prefixes answer it worse than a relative offset does.
     """
@@ -4075,7 +4075,7 @@ def _ago(iso: str | None) -> str:
 @click.option("--agent", "agent_slug", default=None,
               help="Only this agent's runs (slug, e.g. `triage`).")
 @click.option("--item", "item_id", default=None,
-              help="Only runs that touched this record — YOUR id for it "
+              help="Only runs that touched this item — YOUR id for it "
                    "(e.g. `DOC-2001`).")
 @click.option("--limit", type=int, default=20, show_default=True,
               help="How many runs to show, newest first.")
@@ -4087,12 +4087,12 @@ def runs_list(ctx: click.Context, agent_slug: str | None, item_id: str | None,
     """List your runs, newest first.
 
     The answer to "what have I run?". Until now the CLI had none: `items list`
-    prints per-record NDJSON, and `status` / `logs` both need a run id you had
+    prints per-item NDJSON, and `status` / `logs` both need a run id you had
     to keep — so losing the id `papayya run` printed left no way back to your
     own work (plan 52 G1).
 
     `--item` answers the narrower question the customer actually asks: "what
-    ran my document?" (plan 57 D5). A record that has been re-driven belongs to
+    ran my document?" (plan 57 D5). An item that has been re-driven belongs to
     two runs — the submission that failed and the replay that fixed it — and
     nothing joined them.
     """
@@ -4225,7 +4225,7 @@ def runs_submit(
     callback_url: str | None,
     idempotency_key: str | None,
 ) -> None:
-    """Submit a hosted run over the items in a JSONL file.
+    """Submit a run over the items in a JSONL file.
 
     Always uses the NDJSON streaming path — no item ceiling, only a 1 GiB
     byte guard enforced by the backend. Prints the run ID on success.

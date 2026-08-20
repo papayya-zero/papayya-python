@@ -55,7 +55,7 @@ def test_a_selector_and_a_description_are_refused_not_merged(selector, term):
     letting one win is how an operator approves one cohort and re-drives
     another. Refused client-side so it never travels; the server refuses it
     too — this is the earlier, better-worded copy, not the authority."""
-    with pytest.raises(ValueError, match="selects its own records"):
+    with pytest.raises(ValueError, match="selects its own items"):
         params(**selector, **term)
 
 
@@ -175,7 +175,7 @@ def test_like_says_so_plainly_when_no_predicate_fits(monkeypatch):
     monkeypatch.setenv("PAPAYYA_API_KEY", "cpk_00112233_" + "0" * 32)
     res = _run("pull", "--like", "r")
     assert res.exit_code == 0
-    assert "No predicate fits this record" in res.output
+    assert "No predicate fits this item" in res.output
 
 
 def test_like_and_probe_together_are_refused(fake_api):
@@ -208,4 +208,4 @@ def test_empty_cohort_advice_matches_the_door(fake_api):
 def test_the_doors_are_refused_at_the_cli_too(fake_api):
     res = _run("pull", "--probe", "pr-1", "--agent", "enrich")
     assert res.exit_code == 1
-    assert "selects its own records" in res.output
+    assert "selects its own items" in res.output
