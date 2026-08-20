@@ -390,7 +390,12 @@ def _safe_extractall(tar: tarfile.TarFile, dest: Path) -> None:
     dest = dest.resolve()
     for member in tar.getmembers():
         member_path = (dest / member.name).resolve()
-        if not str(member_path).startswith(str(dest)):
+        # is_relative_to, not startswith (plan 61 U6). A prefix test on the
+        # string admits a SIBLING whose name merely extends dest — extracting
+        # into "<dest>-evil" passes `startswith("<dest>")` while landing
+        # outside it. Python >= 3.12 takes the filter="data" branch above and
+        # never reaches here; this is the floor for older interpreters.
+        if not member_path.is_relative_to(dest):
             raise BundleVerificationError(
                 f"refusing to extract path-escaping tar entry: {member.name!r}"
             )
