@@ -1822,7 +1822,8 @@ def _echo_probe_proposals(
 @click.option("--strict", is_flag=True, default=False,
               help="Fail when a fixture could not be verified at all (no "
                    "recorded input, unknown agent, input that doesn't fit "
-                   "the signature). The CI setting.")
+                   "the signature), and — on a cohort pulled with --flagged "
+                   "— when no item's answer changed. The CI setting.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit the full result as JSON instead of a report.")
 def verify_cmd(
@@ -1831,7 +1832,7 @@ def verify_cmd(
     strict: bool,
     as_json: bool,
 ) -> None:
-    """Verify a fix against pulled fixtures — offline, no re-drive.
+    """Verify a fix against pulled fixtures, without re-driving production.
 
     \b
       papayya pull   --agent enrich --tenant acme --since 2026-08-01T00:00:00Z
@@ -1840,15 +1841,28 @@ def verify_cmd(
 
     Runs your function over each fixture's recorded input in this process and
     re-derives the verdict with the same inspectors production used, so
-    "fixed" means what "ok" means in the dashboard. Nothing is sent, nothing
-    is stored, no item is re-driven. Exits non-zero when any fixture is
-    still not ok (or, under --strict, when any could not be verified).
+    "fixed" means what "ok" means in the dashboard. No item is re-driven and
+    nothing is written to Papayya.
 
     \b
-    NOTE ON API SPEND: verify stops Papayya spending and stops the re-drive
-    from touching production. It does NOT stop YOUR function from calling
-    your LLM provider — that is your code, your keys, your process. Fixtures
-    are free to verify only when the failure reproduces without the provider.
+    TWO AXES, and a flagged cohort only has the second:
+      the VERDICT  — did the inspectors change their mind (fixed / still not
+                     ok / newly broken / still ok)
+      the ANSWER   — did your code produce something different from what
+                     production recorded
+
+    Items a human flagged are ones the inspectors already called ok, so their
+    verdict is "still ok" whatever you do to the code — the only evidence a fix
+    does anything there is that the answer moved. Under --strict a flagged
+    cohort where nothing moved fails: releasing it would re-drive every item to
+    reproduce exactly what was complained about.
+
+    \b
+    WHAT THIS COSTS: verify does not spend on Papayya and does not touch
+    production data through Papayya. It runs YOUR function in this process,
+    so every side effect that function has still happens — the database write,
+    the queue publish, the email, the call to your LLM provider, once per
+    fixture. Over a large cohort that is a real bill and a real set of writes.
     """
     from papayya.verify import (
         FIXED, NEWLY_BROKEN, STILL_NOT_OK, STILL_OK,
@@ -1878,10 +1892,16 @@ def verify_cmd(
         click.echo(line)
         if r.raised:
             click.echo(f"                raised {r.raised}")
-        if r.verdict == STILL_NOT_OK and r.output_changed is False:
+        if r.answered and r.output_changed is False:
             # Says more than the verdict does: the fix never reached this path.
-            click.echo("                output is UNCHANGED — the fix did not "
-                       "touch this record's path")
+            # Printed for EVERY answered verdict, not just `still_not_ok`. On a
+            # flagged cohort every verdict is `still_ok` by construction, so
+            # suppressing it there hid the only fact verify had (plan 59 D3).
+            click.echo("                output is UNCHANGED — this code answers "
+                       "exactly as the deployed code did")
+        elif r.answered and r.output_changed is True:
+            click.echo("                output CHANGED — this code produces a "
+                       "different answer than production recorded")
         if r.note:
             click.echo(f"                {r.note}")
         if (r.current_agent_version and r.recorded_agent_version
@@ -1898,6 +1918,14 @@ def verify_cmd(
         f"{counts.get(NEWLY_BROKEN, 0)} newly broken, "
         f"{counts.get(STILL_OK, 0)} still ok"
     )
+    if summary.answered:
+        # The second axis, always. The verdict axis says whether the INSPECTORS
+        # changed their mind; this one says whether the ANSWER moved. They are
+        # different questions and a flagged cohort can only answer the second.
+        click.echo(
+            f"{summary.moved} of {summary.answered} answered fixture(s) "
+            f"produced a different answer than production recorded"
+        )
     if summary.unanswered:
         click.echo(
             f"{summary.unanswered} fixture(s) could not be verified and are "
@@ -1912,8 +1940,30 @@ def verify_cmd(
             "the reason it could not run.",
             err=True,
         )
+    elif summary.flagged and summary.moved == 0:
+        # The case plan 59 D3 measured: a human said these items are wrong, the
+        # inspectors say they are ok, and this code answers them exactly as the
+        # deployed code did. `ok -> ok` is not evidence here — it is the only
+        # verdict this cohort can produce. Releasing would re-drive the whole
+        # cohort to reproduce the complaint, so this is the one place the
+        # command must NOT print its own next step.
+        click.echo(
+            f"\nNothing moved. All {summary.stalled} flagged item(s) produced "
+            f"the same answer this code is replacing, so a re-drive would "
+            f"reproduce what was flagged.\n"
+            f"  `still ok` is the only verdict a flagged cohort can return — "
+            f"`pull --flagged` selects items the inspectors called ok, and "
+            f"verify re-derives the inspectors' verdict.\n"
+            f"  Check the fix reaches this input before releasing"
+            + ("." if strict else ", or re-run with --strict to fail on it."),
+            err=True,
+        )
     elif summary.ok:
-        click.echo("\nVerified. Re-drive the cohort with `papayya release`.")
+        moved = (f" {summary.moved} of {summary.flagged} flagged item(s) "
+                 f"produced a different answer." if summary.flagged else "")
+        click.echo(
+            f"\nVerified.{moved} Re-drive the cohort with `papayya release`."
+        )
     sys.exit(0 if summary.ok else 1)
 
 

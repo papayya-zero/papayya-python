@@ -23,13 +23,18 @@ That store is a dict in this process and is discarded on return. The alternative
 produce a verdict from *different code than production ran*, which is the exact
 failure this product exists to catch.
 
-**The zero-spend caveat, stated rather than implied (C8).** ``verify`` stops
-*Papayya* from spending and stops the re-drive from touching production. It does
-**not** stop the customer's own function from calling their LLM provider — it is
-their code, run in their process, with their keys in their environment.
-"Verify at zero API spend" is true only for a failure that reproduces without
-the provider. Anyone running ``verify`` over 500 fixtures with a live key should
-expect their provider's bill, and this docstring is where we say so first.
+**The caveat, stated rather than implied (C8).** ``verify`` stops *Papayya*
+from spending and stops the re-drive from touching production. Every claim
+above is about Papayya, and none of them is a claim about the customer's own
+code: verify runs their function in this process, so **every side effect that
+function has still fires, once per fixture** — the database write, the queue
+publish, the email, the call to their LLM provider. Plan 59 D4 measured it at
+190 downstream writes and twenty-one minutes for a two-fixture cohort, from a
+command whose help then opened with the word "offline".
+
+The exposure is not only the bill. A command sold as offline wrote rows into a
+claims database whose owner had been told nothing was sent. Naming the tokens
+and not the writes named the smaller of the two.
 
 **Two deliberate divergences from ``replay``**, both because verify's purpose is
 the opposite of replay's:
@@ -123,6 +128,14 @@ class VerifyResult:
     # signal that earns the field. Falls back to return-vs-recorded_output
     # only for a fixture with no trace to compare.
     output_changed: bool | None = None
+    # Whether a human flagged the item this fixture was pulled from — read off
+    # the fixture's own cohort predicate, not re-queried. It is what makes
+    # `still_ok` readable: on a cohort the INSPECTORS called ok and a PERSON
+    # called wrong, `ok -> ok` is the expected verdict and carries no
+    # information, so the only evidence a fix did anything is `output_changed`.
+    # Without this flag verify cannot tell "fine before, fine now" from "the
+    # thing I was asked to fix, unfixed".
+    flagged: bool = False
     raised: str | None = None
     # Carried so a reader can tell a hosted reconstruction from a real request
     # (C4) without re-opening the fixture.
@@ -139,6 +152,17 @@ class VerifyResult:
     @property
     def answered(self) -> bool:
         return self.verdict in _ANSWERED
+
+    @property
+    def stalled(self) -> bool:
+        """A flagged item this code answers exactly as the deployed code did.
+
+        The one thing verify can say about a `still_ok` fixture, and the reason
+        `--strict` has anything to fail on over a flagged cohort. `None` is not
+        `False`: a fixture with no trace to compare is UNKNOWN, and reporting
+        unknown as "did not move" would be the silent wrong answer.
+        """
+        return self.flagged and self.answered and self.output_changed is False
 
 
 @dataclass
@@ -167,6 +191,28 @@ class VerifySummary:
         return len(self.results) - self.answered
 
     @property
+    def flagged(self) -> int:
+        """Fixtures pulled from items a human flagged."""
+        return sum(1 for r in self.results if r.flagged)
+
+    @property
+    def moved(self) -> int:
+        """Answered fixtures whose output differs from what production recorded.
+
+        On a flagged cohort this is the whole answer. The verdict axis is
+        `ok -> ok` there by construction — `pull --flagged` selects items the
+        inspectors called ok, and verify re-derives the inspectors' verdict —
+        so movement is the only evidence available that the new code does
+        anything at all.
+        """
+        return sum(1 for r in self.results if r.answered and r.output_changed is True)
+
+    @property
+    def stalled(self) -> int:
+        """Flagged fixtures this code answers exactly as the deployed code did."""
+        return sum(1 for r in self.results if r.stalled)
+
+    @property
     def ok(self) -> bool:
         """Whether this run should be treated as a pass.
 
@@ -178,10 +224,21 @@ class VerifySummary:
         run that verified nothing is the silent partial success this product
         exists to catch, and printing it would be us committing the failure we
         sell against.
+
+        And under ``strict``, a FLAGGED cohort where nothing moved fails. Plan
+        59 D3 measured the alternative: byte-identical output and exit 0 for
+        the broken code and the fix, on the one incident class where the fix is
+        the customer's own code. `ok -> ok` cannot distinguish them; movement
+        can, and it was already being computed. A cohort that moved on no item
+        is a re-drive guaranteed to reproduce what a person complained about —
+        at this product's own measured price, 300 step executions to change
+        nothing.
         """
         if any(r.verdict in (STILL_NOT_OK, NEWLY_BROKEN) for r in self.results):
             return False
         if self.strict and self.unanswered:
+            return False
+        if self.strict and self.flagged and self.moved == 0:
             return False
         return self.answered > 0
 
@@ -190,6 +247,9 @@ class VerifySummary:
             "fixtures": len(self.results),
             "answered": self.answered,
             "counts": self.counts,
+            "flagged": self.flagged,
+            "moved": self.moved,
+            "stalled": self.stalled,
             "ok": self.ok,
             "results": [asdict(r) for r in self.results],
         }
@@ -537,9 +597,21 @@ def verify_fixtures(
         registrations = _resolve_registrations(agent_module)
 
     summary = VerifySummary(strict=strict)
+
+    def add(result: VerifyResult, fx: Fixture) -> None:
+        """Every result carries the predicate that selected its fixture.
+
+        Stamped here rather than at each construction site so a new verdict
+        cannot be added without it — a result with `flagged` left False is
+        indistinguishable from one a human never complained about, and that is
+        precisely the distinction `--strict` now rests on.
+        """
+        result.flagged = bool(fx.cohort.get("flagged"))
+        summary.results.append(result)
+
     for fx in fixtures:
         if fx.input is None or fx.input_source == INPUT_MISSING:
-            summary.results.append(
+            add(
                 VerifyResult(
                     record_id=fx.record_id,
                     item_id=fx.item_id,
@@ -550,14 +622,16 @@ def verify_fixtures(
                     recorded_agent_version=fx.agent_version,
                     note="no input was recorded for this record; it is kept "
                          "for its trace and cannot be re-run",
-                )
+                ),
+                fx,
             )
             continue
 
         if handler is not None:
-            summary.results.append(
+            add(
                 _run_one(fx, handler, handler,
-                         body_exception_reason="loop_body_exception")
+                         body_exception_reason="loop_body_exception"),
+                fx,
             )
             continue
 
@@ -565,7 +639,7 @@ def verify_fixtures(
         reg = registrations.get(fx.agent)
         if reg is None:
             known = ", ".join(sorted(registrations)) or "(none)"
-            summary.results.append(
+            add(
                 VerifyResult(
                     record_id=fx.record_id,
                     item_id=fx.item_id,
@@ -576,13 +650,14 @@ def verify_fixtures(
                     recorded_agent_version=fx.agent_version,
                     note=f"no @agent named {fx.agent!r} in the module. "
                          f"Registered: {known}",
-                )
+                ),
+                fx,
             )
             continue
         outcome = _run_one(fx, reg.fn, reg.fn,
                            body_exception_reason="agent_body_exception")
         outcome.current_agent_version = getattr(reg, "agent_version", None)
-        summary.results.append(outcome)
+        add(outcome, fx)
 
     return summary
 

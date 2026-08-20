@@ -490,10 +490,21 @@ def test_cli_says_what_to_do_about_an_empty_directory(tmp_path, monkeypatch):
     assert "no fixtures found" in result.output.lower()
 
 
-def test_help_states_the_api_spend_caveat():
+def test_help_states_the_side_effect_caveat_not_just_the_spend():
+    """Plan 59 D4: the help led with "offline, no re-drive... nothing is sent"
+    on a command measured writing 190 downstream rows in one invocation. It ran
+    the customer's function, so it always did. The caveat it carried was about
+    LLM tokens, which is the smaller exposure of the two."""
     result = CliRunner().invoke(cli_module.main, ["verify", "--help"])
     assert result.exit_code == 0
-    assert "does NOT stop YOUR function" in result.output
+    assert "every side effect that function has still happens" in result.output
+    assert "offline" not in result.output.lower()
+
+
+def test_help_states_the_second_axis():
+    result = CliRunner().invoke(cli_module.main, ["verify", "--help"])
+    assert "did the inspectors change their mind" in result.output
+    assert "did your code produce something different" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -561,3 +572,163 @@ def test_a_genuinely_healthy_record_is_still_ok():
 
     assert [r.verdict for r in summary.results] == [STILL_OK]
     assert summary.ok
+
+
+# --- plan 64 D3: the second axis, and what --strict rests on ------------ #
+#
+# Plan 59 D3 measured `verify --strict` producing BYTE-IDENTICAL output and
+# exit 0 for the broken code and the fix, on a cohort pulled with --flagged.
+# It is structural: `pull --flagged` selects items the INSPECTORS called ok,
+# verify re-derives the inspectors' verdict, so `ok -> ok` is the only verdict
+# that cohort can return. `output_changed` was already computed and was read in
+# exactly one branch. These pin the fact that it is now the answer.
+
+
+def _flagged(**over):
+    """A fixture off a `pull --flagged` — the cohort a human, not an inspector,
+    said was wrong. No steps, so `output_changed` falls back to comparing the
+    return value against `recorded_output`, which is what makes these readable."""
+    over.setdefault("cohort", {"agent": "enrich", "flagged": True, "outcome": "any"})
+    over.setdefault("worst_outcome_status", "ok")
+    return _fx(**over)
+
+
+def test_a_flagged_cohort_that_did_not_move_fails_strict():
+    """The broken code, driven. Every verdict is `still_ok` and nothing moved,
+    so there is no evidence the fix does anything — and a release would re-drive
+    the cohort to reproduce exactly what was flagged."""
+    summary = verify_fixtures(
+        [_flagged(recorded_output=[{"id": 1}])],
+        handler=_handler([{"id": 1}]),
+        strict=True,
+    )
+    result = summary.results[0]
+    assert result.verdict == STILL_OK
+    assert result.output_changed is False
+    assert result.stalled
+    assert summary.moved == 0
+    assert summary.stalled == 1
+    assert not summary.ok
+
+
+def test_a_flagged_cohort_that_moved_passes_strict():
+    """The fix, driven. Same verdict, same statuses — the only difference in
+    the entire result is that the answer changed, and that is the difference."""
+    summary = verify_fixtures(
+        [_flagged(recorded_output=[{"id": 9}])],
+        handler=_handler([{"id": 1}]),
+        strict=True,
+    )
+    result = summary.results[0]
+    assert result.verdict == STILL_OK
+    assert result.output_changed is True
+    assert not result.stalled
+    assert summary.moved == 1
+    assert summary.ok
+
+
+def test_an_unflagged_still_ok_record_that_did_not_move_still_passes():
+    """The regression guard on the rule above. Outside a flagged cohort,
+    `still ok` and unchanged is the DESIRED state — a record that was fine
+    before and is fine now. Failing it would break every `--outcome not_ok`
+    pull, which is the default."""
+    summary = verify_fixtures(
+        [_fx(worst_outcome_status="ok", recorded_output=[{"id": 1}])],
+        handler=_handler([{"id": 1}]),
+        strict=True,
+    )
+    assert summary.results[0].verdict == STILL_OK
+    assert summary.results[0].output_changed is False
+    assert not summary.results[0].stalled     # not flagged, so not stalled
+    assert summary.stalled == 0
+    assert summary.ok
+
+
+def test_unknown_movement_is_not_counted_as_stalled():
+    """`output_changed is None` means verify could not compare — a fixture that
+    raised, or one with nothing to compare against. Counting unknown as "did
+    not move" would fail a cohort on the absence of evidence, which is the
+    silent wrong answer this product exists to catch."""
+    summary = verify_fixtures([_flagged()], handler=_handler(RuntimeError("boom")))
+    result = summary.results[0]
+    assert result.output_changed is None
+    assert not result.stalled
+    assert summary.stalled == 0
+
+
+def test_the_flag_is_carried_from_the_fixture_not_re_queried():
+    """Every result carries the predicate that selected its fixture, including
+    the ones verify could not answer — so a mixed directory cannot silently
+    turn one pull's cohort into another's."""
+    summary = verify_fixtures(
+        [_flagged(record_id="a"), _fx(record_id="b", input=None,
+                                      input_source=INPUT_MISSING)],
+        handler=_handler([{"id": 1}]),
+    )
+    by_id = {r.record_id: r for r in summary.results}
+    assert by_id["a"].flagged is True
+    assert by_id["b"].flagged is False
+    assert by_id["b"].verdict == SKIPPED_NO_INPUT
+    assert summary.flagged == 1
+
+
+# --- plan 64 D3, at the CLI: the two runs must not read the same --------- #
+
+_DEPLOYED_AGENT = (
+    "import papayya\n"
+    "@papayya.agent(name='enrich')\n"
+    "def enrich(run, item):\n"
+    "    return run.step('fetch', lambda: [{'id': 1, 'damage': 'none'}])()\n"
+)
+_FIXED_AGENT = (
+    "import papayya\n"
+    "@papayya.agent(name='enrich')\n"
+    "def enrich(run, item):\n"
+    "    return run.step('fetch', lambda: [{'id': 1, 'damage': 'dent'}])()\n"
+)
+_FLAGGED_FIXTURE_OUTPUT = [{"id": 1, "damage": "none"}]
+
+
+def _flagged_run(tmp_path, monkeypatch, body):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _lay_out(tmp_path, body, [
+        _fx(worst_outcome_status="ok",
+            recorded_output=_FLAGGED_FIXTURE_OUTPUT,
+            cohort={"agent": "enrich", "flagged": True, "outcome": "any"})
+    ])
+    monkeypatch.chdir(tmp_path)
+    return CliRunner().invoke(
+        cli_module.main, ["verify", "--fixtures", "fixtures", "--strict"]
+    )
+
+
+def test_cli_refuses_to_recommend_a_release_that_would_reproduce_the_complaint(
+    tmp_path, monkeypatch
+):
+    """Plan 59 D3's exact scenario. The deployed code, verified against the
+    cohort a human flagged: `ok -> ok`, nothing moved. The old build printed
+    'Verified. Re-drive the cohort with `papayya release`.' and exited 0."""
+    result = _flagged_run(tmp_path, monkeypatch, _DEPLOYED_AGENT)
+    assert result.exit_code == 1, result.output
+    assert "Nothing moved" in result.output
+    assert "papayya release" not in result.output
+    assert "0 of 1 answered fixture(s) produced a different answer" in result.output
+
+
+def test_cli_verifies_a_flagged_cohort_the_fix_actually_moved(tmp_path, monkeypatch):
+    result = _flagged_run(tmp_path, monkeypatch, _FIXED_AGENT)
+    assert result.exit_code == 0, result.output
+    assert "output CHANGED" in result.output
+    assert "1 of 1 flagged item(s) produced a different answer" in result.output
+    assert "papayya release" in result.output
+
+
+def test_the_broken_code_and_the_fix_do_not_produce_the_same_output(
+    tmp_path, monkeypatch
+):
+    """The measurement itself. `diff` of the two runs was empty; it is the one
+    thing verify must never do, and the one thing it did."""
+    a = _flagged_run(tmp_path / "a", monkeypatch, _DEPLOYED_AGENT)
+    b = _flagged_run(tmp_path / "b", monkeypatch, _FIXED_AGENT)
+    assert a.output != b.output
+    assert a.exit_code != b.exit_code
