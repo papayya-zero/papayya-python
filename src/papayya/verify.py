@@ -171,6 +171,26 @@ class VerifySummary:
 
     results: list[VerifyResult] = field(default_factory=list)
     strict: bool = False
+    # The cohort predicate every fixture in this set was pulled with, and the
+    # one agent they name. BOTH ARE None WHEN THE FIXTURES DISAGREE — a
+    # directory holding two pulls describes two cohorts, and a receipt that
+    # claimed one of them would be rendered next to a Release button for work
+    # it did not cover. Silence is the only honest answer to "which cohort was
+    # this?" when there are two.
+    cohort: dict[str, Any] | None = None
+    agent: str | None = None
+
+    @property
+    def agent_version(self) -> str | None:
+        """The version of the code this run VERIFIED, when the fixtures agree.
+
+        Read off the registration verify resolved, not off the fixtures: the
+        fixtures carry the version that PRODUCED the failure, and the whole
+        point of the command is that those differ.
+        """
+        seen = {r.current_agent_version for r in self.results
+                if r.current_agent_version}
+        return seen.pop() if len(seen) == 1 else None
 
     def count(self, verdict: str) -> int:
         return sum(1 for r in self.results if r.verdict == verdict)
@@ -597,6 +617,14 @@ def verify_fixtures(
         registrations = _resolve_registrations(agent_module)
 
     summary = VerifySummary(strict=strict)
+
+    # One cohort and one agent, or neither. See VerifySummary.cohort.
+    cohorts = [json.dumps(fx.cohort, sort_keys=True) for fx in fixtures]
+    if len(set(cohorts)) == 1:
+        summary.cohort = fixtures[0].cohort
+    agents = {fx.agent for fx in fixtures if fx.agent}
+    if len(agents) == 1:
+        summary.agent = agents.pop()
 
     def add(result: VerifyResult, fx: Fixture) -> None:
         """Every result carries the predicate that selected its fixture.

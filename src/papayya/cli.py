@@ -1826,11 +1826,19 @@ def _echo_probe_proposals(
                    "— when no item's answer changed. The CI setting.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit the full result as JSON instead of a report.")
+@click.option("--record/--no-record", "record", default=True,
+              help="Leave a receipt so the dashboard's Release button can say "
+                   "this cohort was verified, by whom and against what. Never "
+                   "changes the verdict or the exit code; --no-record makes "
+                   "verify reach the network not at all.")
+@click.pass_context
 def verify_cmd(
+    ctx: click.Context,
     fixtures_path: str,
     agent_module: str | None,
     strict: bool,
     as_json: bool,
+    record: bool,
 ) -> None:
     """Verify a fix against pulled fixtures, without re-driving production.
 
@@ -1863,6 +1871,16 @@ def verify_cmd(
     so every side effect that function has still happens — the database write,
     the queue publish, the email, the call to your LLM provider, once per
     fixture. Over a large cohort that is a real bill and a real set of writes.
+
+    \b
+    THE ONE THING IT SENDS: a receipt — the counts above and the cohort
+    predicate, never an input, an output or a step — so the dashboard's Release
+    button can say this cohort was verified, when, by whom and against which
+    version. Nobody re-drives in a browser knowing less than you know here.
+    Pass --no-record and verify reaches the network not at all. The receipt is
+    posted after the verdict is decided and can never change it or the exit
+    code — including when you have no credentials, which is a supported way to
+    run this command.
     """
     from papayya.verify import (
         FIXED, NEWLY_BROKEN, STILL_NOT_OK, STILL_OK,
@@ -1964,7 +1982,100 @@ def verify_cmd(
         click.echo(
             f"\nVerified.{moved} Re-drive the cohort with `papayya release`."
         )
+    if record:
+        _record_verification(ctx, summary)
+
     sys.exit(0 if summary.ok else 1)
+
+
+def _record_verification(ctx: click.Context, summary: Any) -> None:
+    """POST the receipt, and never let it matter.
+
+    THE FAILURE MODE THIS AVOIDS IS THE OBVIOUS ONE. verify's answer is
+    computed locally from the customer's own code; the network has no vote in
+    it. A verify that exited non-zero because a receipt did not post would fail
+    CI over a control-plane blip and teach everyone to pass --no-record, which
+    is how the dashboard ends up with no receipts at all.
+
+    So every failure here is a note on stderr and nothing else — including the
+    commonest one, which is not an error at all: `verify` is the one recovery
+    verb that works with no credentials, and plenty of people run it that way.
+    """
+    if summary.agent is None or summary.cohort is None:
+        click.echo(
+            "\nNo receipt recorded: these fixtures come from more than one "
+            "pull, so there is no single cohort to record against.",
+            err=True,
+        )
+        return
+
+    from papayya.verify import FIXED, NEWLY_BROKEN, STILL_NOT_OK, STILL_OK
+
+    counts = summary.counts
+    payload = {
+        "agent": summary.agent,
+        "cohort": summary.cohort,
+        "agent_version": summary.agent_version,
+        "fixtures": len(summary.results),
+        "answered": summary.answered,
+        "flagged": summary.flagged,
+        "moved": summary.moved,
+        "stalled": summary.stalled,
+        "fixed": counts.get(FIXED, 0),
+        "still_not_ok": counts.get(STILL_NOT_OK, 0),
+        "newly_broken": counts.get(NEWLY_BROKEN, 0),
+        "still_ok": counts.get(STILL_OK, 0),
+        "verdict": "passed" if summary.ok else "failed",
+        "strict": summary.strict,
+    }
+
+    # SystemExit IS IN THE CATCH, and leaving it out was measured breaking the
+    # command. `_make_papayya_client` does not raise when there is no key — it
+    # ends the process with the "run `papayya login`" message. `except
+    # Exception` does not catch that, so verify-with-no-credentials went from
+    # exit 0 to exit 1 with its verdict already printed above the error.
+    #
+    # That is the case this whole helper is written around: verify is the ONE
+    # recovery verb that works with no account at all, because it reads
+    # fixtures off disk and runs local code. A receipt is a convenience for a
+    # colleague in a browser. It does not get to take the command down.
+    try:
+        # APIClient, not `_make_papayya_client`, because `pull` and `release`
+        # — the verbs either side of this one in the loop — are built on it.
+        # `Papayya` is the SDK's user-facing object and does not carry the
+        # recovery verbs at all.
+        scope = _env_scope(ctx.obj)
+        api = APIClient(APIConfig(
+            api_key=_require_api_key(scope), base_url=scope.base_url))
+        try:
+            api.record_verification(payload)
+        finally:
+            api.close()
+    except (Exception, SystemExit) as exc:      # noqa: BLE001 — see above
+        detail = str(exc).strip() or type(exc).__name__
+        click.echo(
+            f"\nNo receipt recorded. The result above is unaffected — it was "
+            f"computed here, from your code — but the dashboard's Release "
+            f"button will say this cohort is not verified.\n  {detail}",
+            err=True,
+        )
+        return
+
+    # THE SENTENCE HAS TO MATCH THE VERDICT IT JUST STORED. A failed
+    # verification is recorded on purpose — "someone ran this fix forty seconds
+    # ago and it did not hold" is the most useful thing the Release button can
+    # say — and confirming it with the word "verified" would put the product's
+    # own summary line at odds with the row underneath it.
+    if summary.ok:
+        click.echo(
+            f"Receipt recorded — the Recovery page for {summary.agent} can now "
+            f"say this cohort was verified."
+        )
+    else:
+        click.echo(
+            f"Receipt recorded — the Recovery page for {summary.agent} will "
+            f"say this cohort was checked and did NOT verify."
+        )
 
 
 # ---------------------------------------------------------------------------

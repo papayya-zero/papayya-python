@@ -732,3 +732,134 @@ def test_the_broken_code_and_the_fix_do_not_produce_the_same_output(
     b = _flagged_run(tmp_path / "b", monkeypatch, _FIXED_AGENT)
     assert a.output != b.output
     assert a.exit_code != b.exit_code
+
+
+# --- plan 64 D2: the receipt, and the rule that it never matters -------- #
+
+
+def test_no_credentials_still_verifies_and_says_no_receipt(tmp_path, monkeypatch):
+    """MEASURED FAILURE, PINNED. `_make_papayya_client` does not raise when
+    there is no key — it ends the process. `except Exception` does not catch a
+    SystemExit, so verify-with-no-credentials went from exit 0 to exit 1 with
+    its own verdict already printed above the error.
+
+    verify is the one recovery verb that works with no account at all: it reads
+    fixtures off disk and runs local code. A receipt is a convenience for a
+    colleague in a browser and does not get to take the command down."""
+    def _no_key(scope):
+        # Verbatim shape of what `_require_api_key` does: it ENDS THE PROCESS
+        # rather than raising something a caller can see as an Exception.
+        raise SystemExit(
+            "No API key. Run `papayya login` to paste one, or set PAPAYYA_API_KEY"
+        )
+
+    monkeypatch.setattr(cli_module, "_require_api_key", _no_key)
+    _lay_out(tmp_path, _WORKING_AGENT, [_fx()])
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli_module.main, ["verify", "--fixtures", "fixtures"])
+    assert result.exit_code == 0, result.output
+    assert "1 fixed" in result.output
+    assert "No receipt recorded" in result.output
+    assert "papayya login" in result.output       # the reason, not just the fact
+
+
+def test_no_record_makes_no_call_at_all(tmp_path, monkeypatch):
+    calls = []
+    _capture_receipts(monkeypatch, calls)
+    _lay_out(tmp_path, _WORKING_AGENT, [_fx()])
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        cli_module.main, ["verify", "--fixtures", "fixtures", "--no-record"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+class _StubClient:
+    """Stands in for APIClient — the object `pull` and `release` are built on,
+    and therefore the one `verify` posts its receipt through."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def record_verification(self, payload):
+        self.sink.append(payload)
+        return payload
+
+    def close(self):
+        pass
+
+
+def _capture_receipts(monkeypatch, sink):
+    monkeypatch.setattr(cli_module, "APIClient", lambda config: _StubClient(sink))
+    monkeypatch.setattr(cli_module, "_require_api_key", lambda scope: "cpk_test")
+
+
+def test_the_receipt_carries_the_counts_and_the_predicate_and_nothing_else(
+    tmp_path, monkeypatch
+):
+    """What crosses the wire is the whole security argument for the feature.
+    A receipt carrying the values it compared would put a copy of the
+    customer's extracted documents in a table nobody thinks of as holding
+    documents, to render one sentence."""
+    sent = []
+    _capture_receipts(monkeypatch, sent)
+    _lay_out(tmp_path, _WORKING_AGENT, [
+        _fx(cohort={"agent": "enrich", "flagged": True, "outcome": "any"})
+    ])
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli_module.main, ["verify", "--fixtures", "fixtures"])
+    assert result.exit_code == 0, result.output
+
+    payload = sent[0]
+    assert payload["agent"] == "enrich"
+    assert payload["cohort"] == {"agent": "enrich", "flagged": True, "outcome": "any"}
+    assert payload["verdict"] == "passed"
+    assert payload["fixtures"] == 1 and payload["fixed"] == 1
+    assert payload["moved"] == 1 and payload["flagged"] == 1
+    forbidden = {"input", "output", "steps", "results", "recorded_output"}
+    assert forbidden.isdisjoint(payload), payload.keys()
+    assert "Receipt recorded" in result.output
+
+
+def test_a_failed_verification_is_recorded_too(tmp_path, monkeypatch):
+    """'Someone ran this fix forty seconds ago and it did not hold' is the most
+    useful thing the Release button can say. A door that only took passes would
+    make it unsayable."""
+    sent = []
+    _capture_receipts(monkeypatch, sent)
+    _lay_out(tmp_path, _BROKEN_AGENT, [_fx(recorded_output=[])])
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli_module.main, ["verify", "--fixtures", "fixtures"])
+    assert result.exit_code == 1
+    assert sent[0]["verdict"] == "failed"
+
+
+def test_fixtures_from_two_pulls_record_no_receipt(tmp_path, monkeypatch):
+    """Two pulls describe two cohorts, and a receipt claiming one of them would
+    be rendered next to a Release button for work it did not cover."""
+    sent = []
+    _capture_receipts(monkeypatch, sent)
+    _lay_out(tmp_path, _WORKING_AGENT, [
+        _fx(record_id="a", cohort={"agent": "enrich", "flagged": True}),
+        _fx(record_id="b", cohort={"agent": "enrich", "tenant": "acme"}),
+    ])
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli_module.main, ["verify", "--fixtures", "fixtures"])
+    assert result.exit_code == 0, result.output
+    assert sent == []
+    assert "more than one pull" in result.output
+
+
+def test_the_confirmation_line_matches_the_verdict_it_stored(tmp_path, monkeypatch):
+    """A failed verification is recorded on purpose, so confirming it with the
+    word "verified" would put the summary line at odds with its own row."""
+    sent = []
+    _capture_receipts(monkeypatch, sent)
+    _lay_out(tmp_path, _BROKEN_AGENT, [_fx(recorded_output=[])])
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli_module.main, ["verify", "--fixtures", "fixtures"])
+    assert sent[0]["verdict"] == "failed"
+    assert "did NOT verify" in result.output
+    assert "can now say this cohort was verified" not in result.output

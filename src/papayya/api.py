@@ -416,6 +416,32 @@ class APIClient:
             flagged=flagged, include_triaged=include_triaged, limit=limit,
         ))
 
+    def record_verification(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Leave a receipt saying a cohort was verified (plan 64 D2).
+
+        The one control-plane call ``papayya verify`` makes, and it happens
+        AFTER the verdict is computed: verify runs the customer's new code
+        locally and its answer is valid whether or not this succeeds. The
+        caller is expected to swallow failures for exactly that reason — see
+        the CLI's ``verify`` command.
+
+        ``receipt`` carries counts and the cohort predicate. It carries no
+        input, no output and no step trace; those are the customer's content
+        and the browser does not need them to render a sentence.
+        """
+        return self._request("POST", "/v1/durable/verifications", json=receipt)
+
+    def latest_verification(self, agent: str) -> dict[str, Any] | None:
+        """The newest receipt for one agent, or ``None`` if nobody has verified.
+
+        ``None`` rather than an exception: "not verified" is the commonest true
+        answer, and it is the answer the Release button most needs to render.
+        """
+        payload = self._request(
+            "GET", "/v1/durable/verifications/latest", params={"agent": agent}
+        )
+        return (payload or {}).get("receipt")
+
     def derive_probes(
         self,
         record: str,
