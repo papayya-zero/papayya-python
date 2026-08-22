@@ -443,3 +443,139 @@ def test_cli_json_mode_puts_nothing_but_json_on_stdout(patched_api):
     assert payload["released"] == 1
     # The skips still get said — on stderr, where they don't corrupt the feed.
     assert "still running and were not re-driven" in result.stderr
+
+
+# --- plan 64 D3/D5: the second axis, and what a re-drive cost ----------- #
+#
+# `release`'s verdict axis is the INSPECTORS' opinion, so on the incident class
+# this loop exists for — the customer's own code is the fix, nothing raised, no
+# inspector disagreed — it can only ever print `0 recovered … N still ok`. Plan
+# 59 D7 measured a re-drive that changed page 17 from `damage: none` to
+# `damage: dent` reported as `ok … still ok` inside `0 recovered`.
+
+
+def test_a_redrive_that_changed_the_answer_says_so_when_the_verdict_cannot():
+    diff = diff_from_release(_release(_member("s1", "n1", "DOC-5010", outcome="ok")))
+    merge_runs(diff, [("n1", {**_run(), "output_changed": True, "checkpoints": [{}] * 42})])
+
+    rec = diff.records[0]
+    # The verdict is not wrong — the inspectors genuinely did not change their
+    # mind, because they never disagreed in the first place.
+    assert rec.verdict == STILL_OK
+    assert diff.counts.get(RECOVERED, 0) == 0
+    # ...and the movement axis is the only one that can carry the answer.
+    assert rec.output_changed is True
+    assert diff.moved == 1
+
+
+def test_an_unchanged_answer_is_false_not_unknown():
+    diff = diff_from_release(_release(_member("s1", "n1", "DOC-5010", outcome="ok")))
+    merge_runs(diff, [("n1", {**_run(), "output_changed": False, "checkpoints": [{}] * 9})])
+
+    assert diff.records[0].output_changed is False
+    assert diff.moved == 0
+    assert diff.unmoved == 1
+
+
+def test_a_pending_redrive_has_no_movement_answer():
+    """A running re-drive has a PARTIAL trace; the server refuses to compare it
+    and the client must not invent one. Unknown is not "did not move"."""
+    diff = diff_from_release(_release(_member("s1", "n1", "co_1")))
+    assert diff.records[0].output_changed is None
+    assert diff.moved == 0 and diff.unmoved == 0
+
+
+def test_the_reuse_count_survives_into_the_diff():
+    """Plan 59 D5: the server computes reuse per record AND cohort-wide and puts
+    both on the response; the CLI parsed the payload and printed neither,
+    showing a dollar figure that is $0.00 in any unpriced project instead."""
+    m = {**_member("s1", "n1", "DOC-5010"), "reused_steps": 39}
+    diff = diff_from_release(_release(m, reused_steps=39))
+    assert diff.records[0].reused_steps == 39
+    assert diff.reused_steps == 39
+
+
+def test_executed_steps_is_the_total_minus_what_reuse_handed_it():
+    """The number plan 59 D2 put at "150 -> 300 step executions to fix one
+    line", and the one no surface printed."""
+    m = {**_member("s1", "n1", "DOC-5010"), "reused_steps": 39}
+    diff = diff_from_release(_release(m, reused_steps=39))
+    merge_runs(diff, [("n1", {**_run(), "checkpoints": [{}] * 42})])
+    assert diff.executed_steps == 3
+
+    # A version-gated re-drive reuses nothing and re-executes everything —
+    # correct, and the entire cost of the version gate.
+    gated = diff_from_release(_release(_member("s2", "n2", "DOC-5011")))
+    merge_runs(gated, [("n2", {**_run(), "checkpoints": [{}] * 42})])
+    assert gated.reused_steps == 0 and gated.executed_steps == 42
+
+
+def test_executed_steps_never_goes_negative():
+    """If reuse ever claims more than the run carries, one of the two is wrong.
+    A negative count in a summary line would be the first anyone heard of it."""
+    m = {**_member("s1", "n1", "DOC-5010"), "reused_steps": 99}
+    diff = diff_from_release(_release(m, reused_steps=99))
+    merge_runs(diff, [("n1", {**_run(), "checkpoints": [{}] * 5})])
+    assert diff.executed_steps == 0
+
+
+def test_cli_reports_movement_on_a_cohort_the_verdict_axis_is_blind_to(patched_api):
+    """Plan 59 D7, at the terminal. Two flagged items, both `ok` before and
+    after, both actually corrected by the fix. The old build printed
+    `0 recovered, 0 still not ok, 0 newly broken, 2 still ok` and stopped."""
+    patched_api(_FakeAPI(
+        total=2,
+        release=_release(
+            _member("s1", "n1", "DOC-5010", outcome="ok"),
+            _member("s2", "n2", "DOC-5011", outcome="ok"),
+        ),
+        runs={
+            "n1": {**_run(), "output_changed": True, "checkpoints": [{}] * 9},
+            "n2": {**_run(), "output_changed": False, "checkpoints": [{}] * 9},
+        },
+    ))
+    result = _invoke("--agent", "docproc", "--flagged", "--outcome", "any", "-y")
+    assert result.exit_code == 0, result.output
+    assert "2 still ok" in result.output          # the verdict axis, unchanged
+    assert "the answer CHANGED" in result.output
+    assert "the answer is UNCHANGED" in result.output
+    assert "1 of 2 finished item(s) produced a different answer" in result.output
+
+
+def test_cli_prints_what_the_redrive_cost_in_steps_not_only_dollars(patched_api):
+    """Plan 59 D5. `$0.00` is what an unpriced project always reads, and
+    unpriced is not free — the honest measure is on the payload already."""
+    m = {**_member("s1", "n1", "DOC-5010", outcome="ok"), "reused_steps": 39}
+    patched_api(_FakeAPI(
+        total=1,
+        release=_release(m, reused_steps=39),
+        runs={"n1": {**_run(), "checkpoints": [{}] * 42}},
+    ))
+    result = _invoke("--agent", "docproc", "-y")
+    assert "Work: 3 step(s) executed, 39 reused" in result.output
+
+
+def test_cli_says_why_a_version_gated_redrive_reused_nothing(patched_api):
+    """The gate is CORRECT — 39 pages of old code and one of new is the silently
+    wrong document — and plan 59 D1's finding was that NOTHING says so. The only
+    text in the product stating it was the help for `--fresh`, a flag this
+    customer never passes."""
+    patched_api(_FakeAPI(
+        total=1,
+        release=_release(_member("s1", "n1", "DOC-5010", outcome="ok")),
+        runs={"n1": {**_run(), "checkpoints": [{}] * 42}},
+    ))
+    result = _invoke("--agent", "docproc", "-y")
+    assert "Work: 42 step(s) executed, 0 reused" in result.output
+    assert "reuses nothing" in result.output
+
+
+def test_the_wait_default_exceeds_the_workload_the_product_is_built_around():
+    """Plan 59 D7: the default was 600s on a document that takes 1200. The
+    re-drive is not cancelled when the wait expires, so a short default costs
+    the operator the answer and buys nothing; --no-wait is the impatient path."""
+    result = CliRunner().invoke(cli_module.main, ["release", "--help"])
+    # Click wraps the help, so assert on fragments that survive a line break.
+    assert "default 1800" in result.output
+    assert "not" in result.output and "cancelled" in result.output
+    assert "--no-wait" in result.output

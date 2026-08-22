@@ -2118,8 +2118,11 @@ def _record_verification(ctx: click.Context, summary: Any) -> None:
 @click.option("--wait/--no-wait", "wait", default=True,
               help="Poll the re-driven items to completion and print the "
                    "diff (default), or return the manifest immediately.")
-@click.option("--timeout", "timeout_s", type=int, default=600,
-              help="Seconds to wait for the cohort to finish (default 600).")
+@click.option("--timeout", "timeout_s", type=int, default=1800,
+              help="Seconds to wait for the cohort to finish (default 1800). "
+                   "The re-drive is not cancelled when this expires — it is "
+                   "how long this command watches. Use --no-wait to get the "
+                   "manifest and go.")
 @click.option("--yes", "-y", is_flag=True, default=False,
               help="Skip the confirmation prompt.")
 @click.option("--json", "as_json", is_flag=True, default=False,
@@ -2273,10 +2276,16 @@ def release_cmd(
                 if not pending_run_ids(diff):
                     break
                 if time.time() >= deadline:
+                    still = len(pending_run_ids(diff))
                     click.echo(
-                        f"\nTimed out with {len(pending_run_ids(diff))} item(s) "
-                        f"still running. They are re-driving; re-read them in "
-                        f"the dashboard or raise --timeout.",
+                        f"\nStopped watching with {still} item(s) still "
+                        f"running — they were NOT cancelled and are still "
+                        f"re-driving.\n"
+                        f"  The answer lands whether or not this command is "
+                        f"watching. Re-read it with the same predicate:\n"
+                        f"    papayya release --no-wait   # the manifest\n"
+                        f"  or raise --timeout (currently "
+                        f"{timeout_s}s).",
                         err=True,
                     )
                     break
@@ -2295,6 +2304,18 @@ def release_cmd(
                 f"[{rec.before_status} -> {rec.after_status or '-'}]  "
                 f"{_fmt_usd(rec.before_cost_usd)} -> {_fmt_usd(rec.after_cost_usd)}"
             )
+            # THE SECOND AXIS, at the release end of the loop (plan 64 D3).
+            # The verdict beside it reads the INSPECTORS' opinion, and on the
+            # incident class this loop exists for they never disagreed — so
+            # `still ok` is all it can say about a re-drive that corrected the
+            # answer. Plan 59 D7 measured exactly that, on a record whose page
+            # 17 went from `damage: none` to `damage: dent`.
+            if rec.output_changed is True:
+                click.echo("                the answer CHANGED — this re-drive "
+                           "produced a different result than the run it replaced")
+            elif rec.output_changed is False:
+                click.echo("                the answer is UNCHANGED — this "
+                           "re-drive reproduced what it replaced")
 
         counts = diff.counts
         click.echo(
@@ -2305,6 +2326,30 @@ def release_cmd(
             f"{counts.get(STILL_OK, 0)} still ok"
             + (f", {counts[PENDING]} still running" if counts.get(PENDING) else "")
         )
+        answered = diff.moved + diff.unmoved
+        if answered:
+            click.echo(
+                f"{diff.moved} of {answered} finished item(s) produced a "
+                f"different answer than the run they replaced"
+            )
+
+        # WHAT THE RE-DRIVE COST, IN THE UNIT THAT IS ALWAYS TRUE.
+        #
+        # `reused_steps` is on the release manifest the CLI just parsed and was
+        # dropped in favour of a dollar figure that reads $0.00 in any unpriced
+        # project — and the standing rule is that unpriced is NOT free (plan
+        # 51). Steps are the honest measure here because `release` is the
+        # command that multiplies the version gate by the size of the cohort:
+        # a re-drive on a changed version reuses NOTHING, by design, and this
+        # is the line that says so.
+        executed = diff.executed_steps
+        if diff.reused_steps or executed:
+            click.echo(
+                f"Work: {executed} step(s) executed, {diff.reused_steps} reused"
+                + ("" if diff.reused_steps else
+                   " — a re-drive on a different agent version reuses nothing, "
+                   "which is correct and is the whole cost of the version gate")
+            )
         click.echo(
             f"Cost of the re-drive: {_fmt_usd(diff.after_cost_usd)} "
             f"(the originals cost {_fmt_usd(diff.before_cost_usd)})"

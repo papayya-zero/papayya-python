@@ -50,6 +50,23 @@ class RecordDiff:
     after_cost_usd: float
     verdict: str
     agent_version: str | None = None
+    # How many completed steps this re-drive inherited from its source rather
+    # than re-executing (plan 58 U). The server computes it per record and the
+    # CLI dropped it (plan 59 D5) in favour of a dollar figure that is $0.00 in
+    # any unpriced project — and unpriced is not free.
+    reused_steps: int = 0
+    # Whether the re-drive produced a DIFFERENT ANSWER than the run it replaced
+    # — plan 64 D3, the same axis `verify` reports and computed by the same
+    # rule (the step trace, in `(attempt, completed_at, seq)` order).
+    #
+    # None is UNKNOWN: still running, or neither run wrote a checkpoint. It is
+    # never "the answer did not move".
+    output_changed: bool | None = None
+    # Steps ON the re-drive, total. `after_steps - reused_steps` is what this
+    # re-drive actually EXECUTED, which is the number plan 59 D2 measured at
+    # "150 → 300 step executions to fix one line" and the number no surface
+    # printed. Zero until the run is polled.
+    after_steps: int = 0
 
 
 @dataclass
@@ -66,6 +83,11 @@ class CohortDiff:
     skipped_not_terminal: int = 0
     skipped_agent_missing: int = 0
     cohort_total: int = 0
+    # The cohort-wide reuse sum, straight off the release manifest. The one
+    # honest measure of what a re-drive cost: `papayya release` is the command
+    # that multiplies the version gate by the size of the cohort, and before
+    # plan 58 U this was always zero and never said so.
+    reused_steps: int = 0
 
     def count(self, verdict: str) -> int:
         return sum(1 for r in self.records if r.verdict == verdict)
@@ -89,6 +111,40 @@ class CohortDiff:
     def pending(self) -> int:
         return self.count(PENDING)
 
+    @property
+    def moved(self) -> int:
+        """Records that produced a different answer than the run they replaced.
+
+        THE ONLY COUNT THAT CAN BE NON-ZERO ON A COHORT A HUMAN FLAGGED. A
+        `recovered` requires the inspectors to change their mind, and a
+        customer fixing their own extraction logic does not change an
+        inspector's mind — plan 59 D7 measured a re-drive that corrected page
+        17 reported as `ok … still ok` inside a summary reading `0 recovered`.
+        """
+        return sum(1 for r in self.records if r.output_changed is True)
+
+    @property
+    def unmoved(self) -> int:
+        """Terminal records this re-drive did NOT change. Excludes unknowns."""
+        return sum(1 for r in self.records if r.output_changed is False)
+
+    @property
+    def executed_steps(self) -> int:
+        """Steps this re-drive actually ran, cohort-wide.
+
+        Total steps on the new runs minus what reuse handed them. This is the
+        number plan 59 D2 put at "150 → 300 step executions to fix one line",
+        and the one no surface printed: `release` was handed `reused_steps` and
+        printed a dollar figure instead, which reads $0.00 in any unpriced
+        project (plan 59 D5).
+
+        Never negative: a re-drive that somehow carries fewer steps than reuse
+        claims is a bug in one of them, and a negative count in a summary line
+        would be the first anyone heard of it — clamped and left to the
+        reused/total pair to expose.
+        """
+        return max(0, sum(r.after_steps for r in self.records) - self.reused_steps)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "released": len(self.records),
@@ -97,6 +153,10 @@ class CohortDiff:
             "pending": self.pending,
             "before_cost_usd": self.before_cost_usd,
             "after_cost_usd": self.after_cost_usd,
+            "moved": self.moved,
+            "unmoved": self.unmoved,
+            "reused_steps": self.reused_steps,
+            "executed_steps": self.executed_steps,
             "skipped_not_terminal": self.skipped_not_terminal,
             "skipped_agent_missing": self.skipped_agent_missing,
             "cost_note": self.cost_note,
@@ -170,6 +230,7 @@ def diff_from_release(
         skipped_not_terminal=release.get("skipped_not_terminal", 0),
         skipped_agent_missing=release.get("skipped_agent_missing", 0),
         cohort_total=release.get("cohort_total", 0),
+        reused_steps=int(release.get("reused_steps") or 0),
     )
     for member in release.get("members", []):
         new_id = member.get("new_run_id", "")
@@ -202,6 +263,8 @@ def diff_from_release(
                 after_run_status=run_status,
                 before_cost_usd=float(member.get("source_cost_usd") or 0.0),
                 after_cost_usd=float(fresh.get("budget_consumed_usd") or 0.0),
+                reused_steps=int(member.get("reused_steps") or 0),
+                output_changed=fresh.get("output_changed"),
                 verdict=verdict,
             )
         )
@@ -224,6 +287,11 @@ def merge_runs(
             continue
         rec.after_run_status = fresh.get("status")
         rec.after_cost_usd = float(fresh.get("budget_consumed_usd") or 0.0)
+        # Only becomes non-None once the run is terminal — the server refuses
+        # to compare a partial trace against a complete one, because that
+        # difference is about the clock rather than about the answer.
+        rec.output_changed = fresh.get("output_changed")
+        rec.after_steps = len(fresh.get("checkpoints") or [])
         rec.verdict = _verdict(
             rec.before_status, fresh.get("worst_outcome_status"), rec.after_run_status
         )
