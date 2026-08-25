@@ -57,11 +57,25 @@ import time
 from pathlib import Path
 from typing import Any
 
+from papayya.runtime.redact import redact, set_redactor as _set_redactor
+
 log = logging.getLogger("papayya.runtime.executor")
 
 # The descriptor the supervisor hands us for results. 0/1/2 are spoken for and
 # 3 is the first free one; the supervisor passes it via ``pass_fds``.
 RESULT_FD = 3
+
+# Names a project secret may not take. PAPAYYA_* is covered by prefix in
+# _apply_secrets; these are the ones the supervisor's allow-list lets through
+# because the child needs them to be a working Python process
+# (Worker._child_environment). A customer secret named PATH is a mistake; a
+# customer secret that REWRITES PATH is ours.
+_RESERVED_ENV = frozenset({
+    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TZ", "LANG", "USER",
+    "PYTHONPATH", "PYTHONHOME", "PYTHONHASHSEED", "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "VIRTUAL_ENV",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+})
 
 
 class _Job:
@@ -70,7 +84,7 @@ class _Job:
     __slots__ = (
         "run_id", "item_id", "agent", "agent_version", "payload",
         "run_token", "bundle_path", "entrypoint", "account_scope",
-        "lease_id", "max_duration",
+        "lease_id", "max_duration", "secrets",
     )
 
     def __init__(self, d: dict):
@@ -85,6 +99,9 @@ class _Job:
         self.account_scope: str = d.get("account_scope") or "_local"
         self.lease_id: str = d.get("lease_id") or ""
         self.max_duration: float | None = d.get("max_duration")
+        # The project's secrets for THIS item (plan 67 S1). See
+        # Executor._apply_secrets for why they arrive per job.
+        self.secrets: dict = d.get("secrets") or {}
 
     @property
     def agent_argument(self) -> Any:
@@ -107,6 +124,59 @@ class Executor:
         self._imported = False
         self._registration = None
         self._residency: str | None = None
+        # Names this process put into os.environ for the previous item, so the
+        # next item can take them back out. See _apply_secrets.
+        self._injected: set[str] = set()
+
+    # --- the customer's environment ------------------------------------ #
+
+    def _apply_secrets(self, job: _Job) -> None:
+        """Put this item's project secrets into ``os.environ``.
+
+        Plan 67 S1, and the reason it is the FIRST thing ``run_job`` does. The
+        line that motivated the whole unit is a module-scope one —
+
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+        — so the values have to be in place before ``_ensure_imported`` runs
+        the customer's module, not before their function is called. An
+        injection that lands one line later is an injection that does not work
+        for the shape it exists for.
+
+        REMOVE BEFORE ADDING. A child is reused across items for one
+        ``(account, agent, version)``, and the previous item's values are still
+        in ``os.environ`` when the next one arrives. If the customer deletes a
+        secret, or a redeploy moves an agent between projects, a stale value
+        would keep answering ``os.environ[...]`` for the life of the child —
+        the same "silently gets a credential that is not the right one" failure
+        this unit removes, with a different wrong credential. So each item
+        installs exactly its own set: names we injected last time and did not
+        get this time are popped.
+
+        A secret NEVER overwrites a name the allow-list let through
+        (``PAPAYYA_*``, ``PATH``, ``HOME``…). A project secret called ``PATH``
+        is a customer mistake; letting it rewrite the child's search path is
+        ours. It is skipped and logged rather than silently dropped, because a
+        secret that is set and does not arrive is exactly the confusion this
+        plan is about.
+        """
+        incoming = {k: v for k, v in (job.secrets or {}).items() if isinstance(v, str)}
+
+        for name in self._injected - set(incoming):
+            os.environ.pop(name, None)
+        self._injected = set()
+
+        for name, value in incoming.items():
+            if name.startswith("PAPAYYA_") or name in _RESERVED_ENV:
+                log.warning(
+                    "project secret %r is a reserved name and was not injected", name
+                )
+                continue
+            os.environ[name] = value
+            self._injected.add(name)
+
+        if self._injected:
+            _set_redactor(incoming)
 
     # --- the bundle ---------------------------------------------------- #
 
@@ -152,6 +222,7 @@ class Executor:
         have.
         """
         started_at = time.monotonic()
+        self._apply_secrets(job)
         try:
             self._ensure_imported(job)
         except Exception as exc:  # noqa: BLE001 — a bad bundle is one item
@@ -159,7 +230,7 @@ class Executor:
 
             return {
                 "kind": "failed",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": redact(f"{type(exc).__name__}: {exc}"),
                 "error_category": classify_exception(exc),
                 "duration_ms": int((time.monotonic() - started_at) * 1000),
             }

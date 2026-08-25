@@ -42,7 +42,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 from urllib import error as urllib_error
@@ -142,6 +142,13 @@ class Lease:
     # PAPAYYA_PLATFORM_WORKER_KEY. ``None`` on LocalDispatcher leases and on
     # any control-plane predating the mint.
     run_token: str | None = None
+    # The project's secrets, resolved by the dispatcher at lease time and put
+    # into the customer process's environment before their module is imported
+    # (plan 67 S1). Empty dict — not None — on every path that carries none, so
+    # the executor can tell "this lease declares no secrets" from "this worker
+    # predates the field" without a sentinel: both mean the same thing here,
+    # which is that nothing is injected.
+    secrets: dict[str, str] = field(default_factory=dict)
 
     @property
     def agent_argument(self) -> Any:
@@ -1179,21 +1186,78 @@ class Worker:
         return (scope, lease.agent, lease.agent_version)
 
     def _child_environment(self) -> dict:
-        """The env the executor gets. Scrubbed of the credential, by value.
+        """The env the executor gets: an ALLOW-LIST, not the worker's minus a
+        few names.
 
-        Belt and braces: plan 60 S1c already re-execs the supervisor so its own
-        environment carries no key, and this filters by value anyway. The two
-        defend different mistakes — that one defends against ``/proc``, this
-        one against a future caller that hands Worker an api_key some other
-        way.
+        Plan 67 S1. This used to start from ``os.environ`` and subtract the
+        platform key. Everything else came along, and the worker container is
+        started by an operator whose compose file passes their own provider
+        credentials in (``docker-compose.yml``: ``OPENAI_API_KEY``,
+        ``ANTHROPIC_API_KEY``). So a deployed ``@agent`` opening with the line
+        every agent opens with —
+
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+        — constructed a working client against the OPERATOR's key. Measured on
+        this path: the customer's process saw eleven names, and the tail of the
+        key it read was the worker container's, not the one the customer had
+        set as a project secret. It did not raise. The run reported
+        ``completed``, against someone else's credential and someone else's
+        bill. A missing secret is found in one run; a substituted one is found
+        on an invoice.
+
+        A deny-list cannot fix that, because the thing being leaked is whatever
+        the operator happens to export next. Only the direction of the default
+        fixes it: nothing reaches customer code unless it is named here, or the
+        customer set it as a project secret (:meth:`_lease_secrets`).
+
+        WHAT IS ON THE LIST, and why each one is not a credential:
+
+        * ``PATH``/``HOME``/``TMPDIR``/``TZ``/``LANG``/``LC_*`` — POSIX
+          furniture. Dropping ``HOME`` alone breaks any library that caches
+          under it.
+        * ``PYTHON*``/``PYTHONPATH``/``VIRTUAL_ENV`` — how the child finds an
+          interpreter and ``papayya`` itself. Dropping these breaks the child
+          in every layout except a system site-packages install.
+        * ``SSL_CERT_FILE``/``SSL_CERT_DIR``/``REQUESTS_CA_BUNDLE`` — trust
+          roots. A customer calling any HTTPS API needs them.
+        * ``PAPAYYA_*`` minus the three credential names, which is what the old
+          deny-list was for and is kept verbatim.
+
+        THE OPERATOR ESCAPE HATCH is ``PAPAYYA_EXECUTOR_ENV_PASSTHROUGH``, a
+        comma-separated list of additional names. It exists for the self-hosted
+        and local-development cases where ambient environment genuinely is the
+        configuration channel. It is deliberately opt-in and per-name: naming
+        ``OPENAI_API_KEY`` there is a decision an operator makes once, in
+        writing, rather than the default nobody chose.
         """
+        allowed_exact = {
+            "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "TZ", "LANG", "USER",
+            "PYTHONPATH", "PYTHONHOME", "PYTHONHASHSEED", "PYTHONIOENCODING",
+            "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "VIRTUAL_ENV",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+        }
+        allowed_exact.update(
+            name.strip()
+            for name in os.environ.get("PAPAYYA_EXECUTOR_ENV_PASSTHROUGH", "").split(",")
+            if name.strip()
+        )
+        allowed_prefixes = ("LC_", "PAPAYYA_")
+
         env = {
             k: v for k, v in os.environ.items()
-            if not (self._api_key and v == self._api_key)
+            if k in allowed_exact or k.startswith(allowed_prefixes)
         }
+        # The three credential names, and any value equal to the platform key
+        # whatever it is called. Unchanged from plan 60 S1c: the allow-list
+        # already excludes an unknown name carrying the key, this catches a
+        # future caller that hands Worker an api_key under a PAPAYYA_ one.
         env.pop("PAPAYYA_API_KEY", None)
         env.pop("PAPAYYA_PLATFORM_WORKER_KEY", None)
         env.pop("PAPAYYA_WORKER_CREDENTIAL_FD", None)
+        if self._api_key:
+            env = {k: v for k, v in env.items() if v != self._api_key}
         return env
 
     def _spawn_executor(self, key: tuple) -> "_ExecutorHandle":
@@ -1267,6 +1331,14 @@ class Worker:
             "entrypoint": (bundle.entrypoint or "agent.py") if bundle is not None else None,
             "account_scope": self._account_scope(lease),
             "max_duration": max_duration,
+            # Per JOB, not per spawn (plan 67 S1). The executor child is reused
+            # across items for one (account, agent, version), and a project's
+            # secrets are not a property of that key — putting them in the
+            # child's spawn environment would leave the first lease's values
+            # readable by every later one. Sending them with the item lets the
+            # child install exactly this project's set and remove the previous
+            # item's, which is what _apply_secrets does.
+            "secrets": lease.secrets,
         }
         try:
             handle = self._executor_for(lease)
@@ -1481,6 +1553,7 @@ class Worker:
             account_id=body.get("account_id"),
             project_id=body.get("project_id"),
             run_token=body.get("run_token"),
+            secrets=body.get("secrets") or {},
         ))
 
     def _report_complete(
@@ -1890,6 +1963,22 @@ class Worker:
             if self._uses_executor(lease):
                 return self._handle_lease_in_executor(
                     lease, bundle, run_id, short, started_at
+                )
+
+            # Plan 67 S1: project secrets are delivered to the EXECUTOR CHILD
+            # and nowhere else. The in-process path runs customer code in the
+            # supervisor, which holds the platform key; putting a customer's
+            # credentials into that process's environment would widen the
+            # blast radius of the very split plan 61 U1 created. So this path
+            # says so, once per lease, instead of quietly running the agent
+            # with a variable it expected to be set.
+            if lease.secrets:
+                log.warning(
+                    "lease %s carries %d project secret(s) that are NOT injected: "
+                    "this item is running in-process (executor_reuse=off or a "
+                    "version-less lease), and secrets are only delivered to the "
+                    "executor child",
+                    short, len(lease.secrets),
                 )
 
             resident = self._loaded_versions.get(self._residency_key(lease))

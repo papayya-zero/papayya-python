@@ -217,6 +217,32 @@ def _attach_lease_header(request: "httpx.Request") -> None:
         request.headers["X-Papayya-Lease"] = lease_id
 
 
+def _redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip injected secret values out of one outbound checkpoint body.
+
+    Plan 67 S1. Serialize once, filter the text, and parse back only when
+    something actually changed — a step whose snapshot happens to contain a key
+    is rare, and the common path must not pay for a round trip through JSON.
+
+    Encoding failures are swallowed on purpose. This is a redaction pass over a
+    body the caller already built and is entitled to send; a payload we cannot
+    re-encode is one we pass through unfiltered rather than one we drop.
+    """
+    from papayya.runtime.redact import redact
+
+    try:
+        raw = json.dumps(payload)
+    except (TypeError, ValueError):
+        return payload
+    cleaned = redact(raw)
+    if cleaned == raw:
+        return payload
+    try:
+        return json.loads(cleaned)
+    except ValueError:
+        return payload
+
+
 class CloudStore:
     """Checkpoint store that persists to the Papayya control plane via HTTP.
 
@@ -571,8 +597,15 @@ class CloudStore:
         Raising on 4xx/5xx is what makes ``_is_transient`` work for
         ``HTTPStatusError``. ``httpx.Client.request`` does not
         ``raise_for_status`` automatically, so we do.
+
+        THE ONE PLACE EVERY CHECKPOINT BODY PASSES (plan 67 S1). Injected
+        secret values are stripped here rather than at each of the six payload
+        builders above, because a filter that has to be remembered at six call
+        sites is a filter that will be missed at the seventh. Outside a hosted
+        executor nothing is installed and :func:`_redact_payload` returns the
+        same object.
         """
-        resp = self._client.request(method, url, json=payload)
+        resp = self._client.request(method, url, json=_redact_payload(payload))
         _raise_with_server_message(resp)
         self._note_pause_from_response(url, resp)
         return resp

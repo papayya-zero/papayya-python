@@ -227,50 +227,77 @@ def _preflight_dependencies(project_dir: str) -> None:
     """Fail the deploy if the bundle needs something the pool cannot import.
 
     ADR 0010. The managed worker pool carries a fixed dependency set and never
-    pip-installs a bundle, so a `requirements.txt` naming anything outside that
-    set is a run that will die on `import` — which is what plan 47 S2 recorded:
+    pip-installs a bundle, so a bundle needing anything outside that set is a
+    run that will die on `import` — which is what plan 47 S2 recorded:
     ModuleNotFoundError on item 1 of 200, after deploy had said success.
+    Deploy-time and named beats runtime and mysterious.
 
-    Deploy-time and named beats runtime and mysterious. Escape hatch for an
-    import that is genuinely conditional (`try: import pandas except: ...`),
-    because we are reading a manifest, not the code.
+    TWO CHECKS, AND THE SOURCE ONE IS THE PRIMARY (plan 67 S3). This used to
+    read `requirements.txt` and return immediately when there was not one —
+    and onboarding step 4 says "Save as agent.py", so a first user has one file
+    and never writes a manifest. The gate did not run for the person it was
+    built for, and a bundle importing `dotenv` deployed green and died at run
+    time. Reading the imports out of the code closes that, and keeps the
+    manifest as an additional signal for a bundle that declares a dependency it
+    has not imported yet.
+
+    The conditional-import escape hatch is now mostly unnecessary: reading the
+    code means `try: import pandas / except ImportError:` is RECOGNISED as
+    optional rather than worked around. PAPAYYA_SKIP_DEP_PREFLIGHT=1 remains
+    for everything else.
     """
     import os
 
-    from papayya.runtime.baked_deps import baked_distributions, unsupported_requirements
+    from papayya.runtime.baked_deps import (
+        baked_distributions,
+        unsupported_imports,
+        unsupported_requirements,
+    )
 
     manifest = Path(project_dir) / "requirements.txt"
-    if not manifest.is_file():
+    unsupported: list[str] = []
+    if manifest.is_file():
+        try:
+            unsupported = unsupported_requirements(manifest.read_text(encoding="utf-8"))
+        except OSError:
+            unsupported = []  # unreadable manifest is the bundler's problem
+
+    imports = unsupported_imports(project_dir)
+
+    if not unsupported and not imports:
         return
-    try:
-        unsupported = unsupported_requirements(manifest.read_text(encoding="utf-8"))
-    except OSError:
-        return  # unreadable manifest is the bundler's problem, not the gate's
-    if not unsupported:
-        return
+
+    # One list the customer reads, their own text quoted back: a manifest line
+    # as they wrote it, an import with the file it is in.
+    findings = [f"  {line}   (requirements.txt)" for line in unsupported]
+    findings += [f"  import {module}   ({where})" for module, where in imports]
 
     if os.getenv("PAPAYYA_SKIP_DEP_PREFLIGHT") == "1":
         click.echo(
-            "  Warning: requirements the hosted runtime does not carry "
-            f"({', '.join(unsupported)}) — preflight skipped, imports may fail at run time.",
+            "  Warning: this bundle needs dependencies the hosted runtime does "
+            "not carry — preflight skipped, imports may fail at run time:",
             err=True,
         )
+        for line in findings:
+            click.echo(line, err=True)
         return
 
     available = baked_distributions() or set()
     click.echo("", err=True)
     click.echo(
-        "Error: this bundle declares dependencies the hosted runtime does not carry:",
+        "Error: this bundle needs dependencies the hosted runtime does not carry:",
         err=True,
     )
-    for line in unsupported:
-        click.echo(f"  {line}", err=True)
+    for line in findings:
+        click.echo(line, err=True)
     click.echo(
         "\nThe managed worker pool ships: "
         + ", ".join(sorted(available))
-        + "\n(plus the Python standard library). Per-bundle dependency"
-        "\ninstallation is not available yet — see ADR 0010."
-        "\n\nIf the import is conditional, re-run with PAPAYYA_SKIP_DEP_PREFLIGHT=1.",
+        + "\n(plus their dependencies and the Python standard library)."
+        "\nPer-bundle dependency installation is not available yet — see ADR 0010,"
+        "\nso this needs a change to the agent rather than a new requirement."
+        "\n\nIf an import is genuinely optional, guard it with try/except ImportError"
+        "\n(which this check honours) or re-run with PAPAYYA_SKIP_DEP_PREFLIGHT=1.",
         err=True,
     )
     sys.exit(1)
@@ -858,17 +885,24 @@ def deploy(
         entrypoint = Path(file).name
 
     try:
+        # The dependency gate runs FIRST, before anything imports the bundle
+        # (plan 67 S3). It reads source with ast and needs no import, and
+        # _discover_agents below does import — so a bundle needing something
+        # this machine also lacks used to die on a bare ModuleNotFoundError
+        # from the discovery step, one line before the check that would have
+        # named the module, named the file, and said why the pool cannot carry
+        # it. Cheapest and most informative check first.
+        project_dir = str(Path(file).resolve().parent)
+        _preflight_dependencies(project_dir)
+
         # Discover @agent functions
         agents = _discover_agents(file)
         click.echo(f"Found {len(agents)} agent(s): {', '.join(a.name for a in agents)}")
 
         # Bundle the project (one bundle for all agents — they share code)
-        project_dir = str(Path(file).resolve().parent)
         click.echo(f"Bundling project from {project_dir}...")
         tarball, sha256 = bundle_project(project_dir, entrypoint=entrypoint)
         click.echo(f"  Archive: {len(tarball)} bytes (SHA256: {sha256[:16]}...)")
-
-        _preflight_dependencies(project_dir)
 
         # Resolve project ID for agent lookup/create. The --project-id flag
         # still wins; the scope is the floor, and it already applied the
@@ -3391,6 +3425,7 @@ def _resolve_agent_id(
 @click.option("--input", "input_flag", default=None, help="Input for the agent (alt to positional)")
 @click.option("--agent-id", default=None, help="Agent UUID (escape hatch; wins over positional)")
 @click.option("--name", "agent_name", default=None, help="Agent name (required when file declares multiple @agent functions)")
+@click.option("--item-id", "item_id", default=None, help="Your own name for this piece of work (e.g. DOC-2001#page-73)")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -3400,14 +3435,19 @@ def run(
     input_flag: str | None,
     agent_id: str | None,
     agent_name: str | None,
+    item_id: str | None,
 ) -> None:
-    """Trigger a run.
+    """Trigger a run on the deployed agent.
 
     \b
     Usage:
-      papayya run my-agent "hello"              # slug + positional input
-      papayya run my-agent "hello" --file a.py  # explicit file
-      papayya run <uuid> "hello"                # UUID also works
+      papayya run my-agent "hello"                          # slug + input
+      papayya run my-agent '{"id": "DOC-2001", "pages": 5}' # JSON object input
+      papayya run my-agent '{...}' --item-id DOC-2001       # name the work
+      papayya run <uuid> "hello"                            # UUID also works
+
+    A JSON object or array is sent as JSON; anything else — including 8173 —
+    is sent as a string.
 
     To run locally without the cloud, execute your file directly:
       python agent.py
@@ -3427,49 +3467,175 @@ def run(
         )
         sys.exit(1)
 
-    # Resolve file: --file wins; else auto-discover agent.py in cwd.
-    resolved_file = file
-    if resolved_file is None:
-        if Path("agent.py").exists():
-            resolved_file = "agent.py"
-        else:
-            click.echo(
-                "Error: --file required (or place agent.py in the current directory).",
-                err=True,
-            )
-            sys.exit(1)
-
-    registrations = _discover_agents(resolved_file)
-    if len(registrations) == 1:
-        reg = registrations[0]
-    else:
-        if not agent_name:
-            names = ", ".join(r.name for r in registrations)
-            click.echo(
-                f"Error: {resolved_file} declares {len(registrations)} agents ({names}).\n"
-                "  Pass --name <agent-name> to pick one.",
-                err=True,
-            )
-            sys.exit(1)
-        matches = [r for r in registrations if r.name == agent_name]
-        if not matches:
-            names = ", ".join(r.name for r in registrations)
-            click.echo(
-                f"Error: no @agent named '{agent_name}' in {resolved_file}. Available: {names}",
-                err=True,
-            )
-            sys.exit(1)
-        reg = matches[0]
-
     resolved_agent_id = _resolve_agent_id(agent, agent_id, ctx.obj)
-    _run_cloud(ctx, reg, resolved_file, input_text, resolved_agent_id)
+
+    # THE SERVER KNOWS THIS AGENT (plan 67 S2). This used to import the
+    # customer's module to read `model`, `max_steps` and `budget_usd` off the
+    # decorator — all three of which `papayya deploy` uploaded, and all three of
+    # which the dashboard renders in the agent's Configuration block. Importing
+    # to re-read them cost two things measured on the real path:
+    #
+    #   $ cd /tmp/elsewhere && papayya run docproc '{"id":"DOC-2001"}'
+    #   Error: --file required (or place agent.py in the current directory).
+    #
+    #   $ papayya run docproc "…"        # in the project dir, no local secret
+    #   Error: KeyError: 'OPENAI_API_KEY'
+    #
+    # You could not invoke a DEPLOYED agent without its source, and the exact
+    # class of code project secrets exist for — a client built at import from
+    # the environment — made the CLOUD invoke fail on the CALLER's environment.
+    # A CI job that triggers a run needed the repo and every production
+    # credential to send a string to a server that already had the answer.
+    #
+    # The local file is a fallback, not the path: it is read only when the
+    # server's record carries no config, or when --file names one explicitly.
+    reg = None
+    if file is None:
+        reg = _remote_registration(ctx.obj, resolved_agent_id)
+
+    resolved_file = file
+    if reg is None:
+        if resolved_file is None:
+            if Path("agent.py").exists():
+                resolved_file = "agent.py"
+            else:
+                click.echo(
+                    "Error: this agent's deployment carries no model config, and "
+                    "no local file was found to read one from.\n"
+                    "  Redeploy it, or pass --file <your-agent.py>.",
+                    err=True,
+                )
+                sys.exit(1)
+
+        registrations = _discover_agents(resolved_file)
+        if len(registrations) == 1:
+            reg = registrations[0]
+        else:
+            if not agent_name:
+                names = ", ".join(r.name for r in registrations)
+                click.echo(
+                    f"Error: {resolved_file} declares {len(registrations)} agents ({names}).\n"
+                    "  Pass --name <agent-name> to pick one.",
+                    err=True,
+                )
+                sys.exit(1)
+            matches = [r for r in registrations if r.name == agent_name]
+            if not matches:
+                names = ", ".join(r.name for r in registrations)
+                click.echo(
+                    f"Error: no @agent named '{agent_name}' in {resolved_file}. Available: {names}",
+                    err=True,
+                )
+                sys.exit(1)
+            reg = matches[0]
+
+    _run_cloud(ctx, reg, input_text, resolved_agent_id, item_id)
 
 
-def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_id: str) -> None:
+@dataclass(frozen=True)
+class _RemoteRegistration:
+    """An agent's invocation config as the SERVER holds it (plan 67 S2).
+
+    Duck-compatible with the fields ``_run_cloud`` reads off an
+    ``AgentRegistration``, so the two resolution paths converge before the
+    trigger and there is exactly one place that builds the request.
+    """
+
+    name: str
+    model: str
+    instructions: str = ""
+    max_steps: int = 50
+    budget_usd: float | None = None
+
+
+def _remote_registration(ctx_obj: dict, agent_id: str) -> "_RemoteRegistration | None":
+    """This agent's config from the control plane, or None if it has none.
+
+    None — not an error — on every failure: an unreachable server, an agent
+    row without a model, an old control plane. The caller falls back to the
+    local file, which is the behaviour that shipped before this existed. A
+    network hiccup must not turn `papayya run` into "go find your source".
+    """
+    scope = _env_scope(ctx_obj)
+    resolved_key = _require_api_key(scope)
+    api = APIClient(APIConfig(api_key=resolved_key, base_url=scope.base_url))
+    try:
+        record = api.get_agent(agent_id)
+    except Exception:
+        return None
+    finally:
+        api.close()
+
+    config = record.get("config") or {}
+    model = config.get("model")
+    if not model:
+        # A row deployed before model became part of the config, or created by
+        # hand. The decorator is the only source left, so say nothing and let
+        # the caller read the file.
+        return None
+    return _RemoteRegistration(
+        name=record.get("slug") or record.get("name") or agent_id,
+        model=model,
+        instructions=config.get("instructions") or record.get("instructions") or "",
+        max_steps=int(config.get("max_steps") or 50),
+        budget_usd=config.get("budget_usd"),
+    )
+
+
+def _coerce_input(text: str) -> Any:
+    """The CLI's input, coerced exactly as the dashboard's Run now dialog does.
+
+    Plan 67 S2. ``papayya run`` sent ``input_data=input_text`` — the raw
+    argument, never parsed — so a dict-shaped workload was unreachable from the
+    CLI entirely:
+
+        $ papayya run docproc '{"id": "DOC-2001", "kind": "estimate"}'
+        Run failed: TypeError: string indices must be integers, not 'str'
+
+    which is every document pipeline, and is the shape
+    ``papayya-examples/document-processing`` is written in. The dashboard has
+    had the right rule and the right sentence for it all along; this is that
+    rule, in the CLI, in the dialog's own words.
+
+    LEADING BRACE OR BRACKET, NOT "IS IT VALID JSON". ``8173`` and ``true`` and
+    ``null`` are all valid JSON and are all far more likely to be somebody's
+    ticket id than somebody's integer — coercing them would silently change the
+    argument a working agent receives. Objects and arrays have no such
+    ambiguity: nothing that starts with ``{`` is a plausible plain string
+    input, and an agent that wanted one can still send it with --input.
+
+    MALFORMED JSON IS AN ERROR, NOT A STRING. A user typing an object clearly
+    meant an object; passing their broken text through as a string would send
+    the agent something it cannot use and blame their code for it.
+    """
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return text
+    try:
+        return json.loads(stripped)
+    except ValueError as exc:
+        click.echo(
+            f"Error: input starts with '{stripped[0]}' so it was read as JSON, "
+            f"and it does not parse: {exc}\n"
+            "  Fix the JSON, or pass a plain string that does not start with { or [.",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _run_cloud(
+    ctx: click.Context,
+    reg: Any,
+    input_text: str,
+    agent_id: str,
+    item_id: str | None = None,
+) -> None:
     """Trigger a run.
 
-    ``reg`` is an ``AgentRegistration`` produced by ``_discover_agents``;
-    ``agent_id`` has already been resolved (slug → uuid) by the caller.
+    ``reg`` is whatever carries this agent's invocation config — a
+    ``_RemoteRegistration`` read from the control plane, or an
+    ``AgentRegistration`` produced by ``_discover_agents`` when the server had
+    none. ``agent_id`` has already been resolved (slug → uuid) by the caller.
     """
     scope = _env_scope(ctx.obj)
     resolved_key = _require_api_key(scope)
@@ -3490,9 +3656,10 @@ def _run_cloud(ctx: click.Context, reg: Any, file: str, input_text: str, agent_i
             # so `papayya run hello "world"` returned
             # "Hello, {'message': 'world'}!" where the same agent run locally
             # returned "Hello, world!". The two execution paths have to agree.
-            input_data=input_text,
+            input_data=_coerce_input(input_text),
             max_steps=reg.max_steps,
             budget_cents=budget_cents,
+            item_id=item_id,
         )
         run_id = result["id"]
         click.echo(f"Run triggered: {run_id}")

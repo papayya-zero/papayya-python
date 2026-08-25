@@ -190,15 +190,22 @@ class APIClient:
         input_data: Any,
         max_steps: int = 50,
         budget_cents: int = 500,
+        item_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", "/v1/runs", json={
+        body: dict[str, Any] = {
             "agent_id": agent_id,
             "model": model,
             "system_prompt": system_prompt,
             "input": input_data,
             "max_steps": max_steps,
             "budget_cents": budget_cents,
-        })
+        }
+        # Omitted rather than sent as null (plan 67 S2): the route treats an
+        # absent item_id as "the caller declared none" and mints a surrogate,
+        # which is a different thing from declaring the empty string.
+        if item_id:
+            body["item_id"] = item_id
+        return self._request("POST", "/v1/runs", json=body)
 
     def resume_run(self, run_id: str) -> dict[str, Any]:
         """Resume a paused run — clear the fence and re-drive what it stopped.
