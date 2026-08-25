@@ -756,17 +756,22 @@ def _write_synthetic_entry(run: "PapayyaRun", verdict: OutcomeVerdict) -> None:
 
     This is a THIRD writer, bypassing ``_post_call_success`` entirely, so
     it has to stamp its own execution identity (Plan 41 R3 §T7). It
-    deliberately does NOT touch ``run._attempts``: the label here is a
-    fresh uuid every call, so it is never re-executed and has no attempt
-    sequence to track — and polluting the dict would be indistinguishable
-    from a real step to everything downstream.
+    deliberately does NOT touch ``run._attempts``: a mark is not a step that
+    can be re-executed, so it has no attempt sequence to track — and polluting
+    the dict would be indistinguishable from a real step to everything
+    downstream. (Pre-plan-67 this said "the label here is a fresh uuid every
+    call"; the label is now the calling step's, and the reasoning is unchanged
+    because it never rested on uniqueness — a mark is not re-runnable either
+    way. ``run._mark_label`` still guarantees uniqueness, via an occurrence
+    count.)
 
     The bypass itself is a standing fragility: any per-step bookkeeping
     added to ``_post_call_success`` will silently miss ``papayya.mark_*``
     unless it is duplicated here. Worth a shared helper the next time
     something is added there.
     """
-    label = f"papayya.mark/{uuid.uuid4().hex[:8]}"
+    # Named after the step whose body called it, not a uuid (plan 67 S7).
+    label = run._mark_label()
     entry = TaskEntry(
         label=label,
         result=None,

@@ -191,6 +191,7 @@ class APIClient:
         max_steps: int = 50,
         budget_cents: int = 500,
         item_id: str | None = None,
+        partition_key: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "agent_id": agent_id,
@@ -205,6 +206,11 @@ class APIClient:
         # which is a different thing from declaring the empty string.
         if item_id:
             body["item_id"] = item_id
+        # The tenant this work belongs to. Onboarding calls it the concept that
+        # makes the product worth having, and neither cloud path could set it
+        # until plan 67 S10.
+        if partition_key:
+            body["partition_key"] = partition_key
         return self._request("POST", "/v1/runs", json=body)
 
     def resume_run(self, run_id: str) -> dict[str, Any]:

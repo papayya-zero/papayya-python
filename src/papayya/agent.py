@@ -425,6 +425,56 @@ def _resolve_item_id(args: tuple[Any, ...], kwargs: dict[str, Any] | None = None
     return _extract_item_id(args)
 
 
+def _accepts(sig: "inspect.Signature | None", name: str) -> bool:
+    """Whether a function can be called with ``name=`` as a keyword."""
+    if sig is None:
+        return True  # unknown signature: forward, as before
+    for p in sig.parameters.values():
+        if p.kind is p.VAR_KEYWORD:
+            return True
+        if p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
+            return True
+    return False
+
+
+def _strip_declaration_kwargs(
+    sig: "inspect.Signature | None", kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop ``item_id=`` / ``partition_key=`` when the agent cannot take them.
+
+    Plan 67 S10, and it is the fix for the ONE workaround a dict-input workload
+    had. `python agent.py` with a dict input sends the whole dict as item_id —
+    the server types that field as a string, so it answers `400 invalid request
+    body`, naming neither the field nor the reason. Plan 56 F8 opened the
+    `item_id=` kwarg as the local declaration channel and _resolve_item_id has
+    read it ever since, but the wrapper forwarded kwargs to the customer's
+    function VERBATIM:
+
+        >>> docproc({...}, item_id="DOC-1005")
+        TypeError: docproc() got an unexpected keyword argument 'item_id'
+
+    So the documented escape hatch failed closed unless you added an
+    `item_id=None` parameter you never read. `partition_key` has the identical
+    shape and survived only because onboarding puts it in the example
+    signature — which is why one of the two nouns this product is organised
+    around worked locally and the other did not.
+
+    CONDITIONAL, NOT UNCONDITIONAL. Popping always would silently stop
+    delivering `partition_key` to every agent that declares it and uses it —
+    onboarding's own example declares it. So the value is consumed by the
+    platform either way, and forwarded only to a function that asked for it.
+    """
+    if not kwargs:
+        return kwargs
+    drop = [k for k in ("item_id", "partition_key") if k in kwargs and not _accepts(sig, k)]
+    if not drop:
+        return kwargs
+    trimmed = dict(kwargs)
+    for k in drop:
+        trimmed.pop(k, None)
+    return trimmed
+
+
 def _extract_partition_key(kwargs: dict[str, Any]) -> Any:
     """Pull ``partition_key`` out of kwargs if the caller passed it.
 
@@ -710,6 +760,9 @@ def agent(
                 input_token = _AGENT_INPUT.set(snapshot)
                 item_id_value = _resolve_item_id(args, kwargs)
                 partition_key_value = _extract_partition_key(kwargs)
+                # Both values are now the PLATFORM's. Forward them to the
+                # customer's function only if it asked for them (plan 67 S10).
+                kwargs = _strip_declaration_kwargs(sig_for_snapshot, kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,
                     item_id=item_id_value,
@@ -792,6 +845,9 @@ def agent(
                 input_token = _AGENT_INPUT.set(snapshot)
                 item_id_value = _resolve_item_id(args, kwargs)
                 partition_key_value = _extract_partition_key(kwargs)
+                # Both values are now the PLATFORM's. Forward them to the
+                # customer's function only if it asked for them (plan 67 S10).
+                kwargs = _strip_declaration_kwargs(sig_for_snapshot, kwargs)
                 baggage_token = set_papayya_baggage(
                     workload=name,
                     item_id=item_id_value,

@@ -294,3 +294,124 @@ def test_papayya_and_its_transitive_deps_are_available(tmp_path):
         from papayya import agent
     """)
     assert unsupported_imports(tmp_path) == []
+
+
+# --------------------------------------------------------------------------- #
+#  S7 — the step carrying the verdict had an unreadable name
+# --------------------------------------------------------------------------- #
+
+class _FakeRun:
+    """Just enough PapayyaRun for the label helper."""
+
+    def __init__(self):
+        from papayya.durable.run import PapayyaRun
+
+        self._active_steps = []
+        self._mark_occurrences = {}
+        self._mark_label = PapayyaRun._mark_label.__get__(self)
+        self._enter_step = PapayyaRun._enter_step.__get__(self)
+        self._leave_step = PapayyaRun._leave_step.__get__(self)
+
+
+def test_a_mark_is_named_after_the_step_that_raised_it():
+    """`papayya.mark/<uuid8>` made the ONE row carrying the run's verdict the
+    one row in the step list with an unreadable name, attributed to nothing."""
+    run = _FakeRun()
+    run._enter_step("extract")
+    assert run._mark_label() == "papayya.mark/extract"
+    run._leave_step()
+
+
+def test_two_marks_in_one_step_do_not_collide():
+    run = _FakeRun()
+    run._enter_step("extract")
+    assert run._mark_label() == "papayya.mark/extract"
+    assert run._mark_label() == "papayya.mark/extract#2"
+
+
+def test_a_mark_outside_any_step_is_still_named():
+    run = _FakeRun()
+    assert run._mark_label() == "papayya.mark/agent-body"
+
+
+def test_the_step_stack_is_a_stack():
+    """A step may call another step; the mark belongs to the inner one."""
+    run = _FakeRun()
+    run._enter_step("outer")
+    run._enter_step("inner")
+    assert run._mark_label() == "papayya.mark/inner"
+    run._leave_step()
+    assert run._mark_label() == "papayya.mark/outer"
+
+
+def test_leaving_an_empty_stack_does_not_raise():
+    """The wrapper's finally must not turn a customer exception into a
+    different one."""
+    _FakeRun()._leave_step()
+
+
+def test_the_prefix_survives_because_the_server_keys_on_it():
+    """store/checkpoints.go excludes `papayya.mark/%` from the steps a resume
+    re-executes. A nicer suffix must not cost that."""
+    run = _FakeRun()
+    run._enter_step("extract")
+    assert run._mark_label().startswith("papayya.mark/")
+
+
+# --------------------------------------------------------------------------- #
+#  S10 — the local declaration channel failed closed
+# --------------------------------------------------------------------------- #
+
+def test_item_id_kwarg_is_not_forwarded_to_an_agent_that_cannot_take_it():
+    """Plan 56 F8 opened `item_id=` as the local channel and _resolve_item_id
+    read it — but the wrapper forwarded kwargs VERBATIM, so using the
+    documented escape hatch raised TypeError unless you added a parameter you
+    never read."""
+    import inspect
+
+    from papayya.agent import _strip_declaration_kwargs
+
+    def docproc(run, doc: dict) -> dict:
+        return {}
+
+    sig = inspect.signature(docproc).replace(
+        parameters=[p for p in inspect.signature(docproc).parameters.values()
+                    if p.name != "run"]
+    )
+    out = _strip_declaration_kwargs(sig, {"item_id": "DOC-1005", "partition_key": "acme"})
+    assert out == {}
+
+
+def test_a_declared_partition_key_is_still_delivered():
+    """Onboarding's own example declares partition_key and may read it.
+    Popping unconditionally would have silently stopped delivering it."""
+    import inspect
+
+    from papayya.agent import _strip_declaration_kwargs
+
+    def triage(ticket: dict, partition_key=None) -> str:
+        return ""
+
+    sig = inspect.signature(triage)
+    out = _strip_declaration_kwargs(sig, {"item_id": "t-1", "partition_key": "acme"})
+    assert out == {"partition_key": "acme"}
+
+
+def test_var_keyword_agents_receive_everything():
+    import inspect
+
+    from papayya.agent import _strip_declaration_kwargs
+
+    def anything(doc, **kw):
+        return None
+
+    sig = inspect.signature(anything)
+    passed = {"item_id": "x", "partition_key": "y"}
+    assert _strip_declaration_kwargs(sig, passed) == passed
+
+
+def test_an_unknown_signature_forwards_unchanged():
+    from papayya.agent import _strip_declaration_kwargs
+
+    passed = {"item_id": "x"}
+    assert _strip_declaration_kwargs(None, passed) == passed

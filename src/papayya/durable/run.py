@@ -259,6 +259,14 @@ class Item:
         # unless they pass an explicit override (which applies to that step
         # only — the run-level id does not change mid-run).
         self._run_item_id: str | None = config.item_id
+        # The step labels currently executing, innermost last (plan 67 S7).
+        # `papayya.mark_degraded()` reads this so its synthetic checkpoint can
+        # name the step whose body called it instead of a uuid. A STACK, not a
+        # scalar: a step may call another step, and the mark belongs to the one
+        # actually running. Occurrence counts keep two marks in one step from
+        # colliding on a label.
+        self._active_steps: list[str] = []
+        self._mark_occurrences: dict[str, int] = {}
         # ADR-0002 #7: agent version pinned at run creation. On replay this
         # is read from the loaded checkpoint, NOT recomputed — otherwise
         # replay would silently rewrite the version onto rows that were
@@ -650,6 +658,45 @@ class Item:
     # execution frameworks (Temporal, Inngest, DBOS); `task` is retained
     # as an alias so existing user code keeps working unchanged.
     step = task
+
+    def _enter_step(self, label: str) -> None:
+        """Mark ``label`` as the innermost executing step (plan 67 S7)."""
+        self._active_steps.append(label)
+
+    def _leave_step(self) -> None:
+        """Pop the innermost executing step. Never raises on an empty stack —
+        the wrapper's ``finally`` must not turn a customer exception into a
+        different one."""
+        if self._active_steps:
+            self._active_steps.pop()
+
+    def _mark_label(self) -> str:
+        """The label for a synthetic outcome mark.
+
+        Plan 67 S7. This was ``papayya.mark/<uuid8>``, so the ONE row carrying
+        the run's verdict — the amber dot, the customer's own sentence — was
+        the one row in the step list with an unreadable name, no version and no
+        duration. Worse, it was attributed to nothing: the mark is written
+        while the step's body runs, so it lands BEFORE that step's own
+        checkpoint, and the list read as "something marked this degraded
+        between read-page#5 and extract."
+
+        Naming it after the step that called it makes those two rows adjacent
+        and legible — `papayya.mark/extract` above `extract`.
+
+        The `papayya.mark/` PREFIX IS LOAD-BEARING and is kept: the control
+        plane excludes `papayya.mark/%` from the steps a resume re-executes
+        (store/checkpoints.go), because a mark is not a step that can be
+        re-run. That reasoning is unchanged by a nicer suffix.
+
+        Occurrence-suffixed, because two marks in one step would otherwise
+        share a label and an execution token.
+        """
+        base = self._active_steps[-1] if self._active_steps else "agent-body"
+        label = f"papayya.mark/{base}"
+        seen = self._mark_occurrences.get(label, 0) + 1
+        self._mark_occurrences[label] = seen
+        return label if seen == 1 else f"{label}#{seen}"
 
     def _resolve_step_label(self, label: str) -> str:
         """Consume the next occurrence of ``label`` and return its cache key.
@@ -1360,6 +1407,7 @@ class Item:
                 cache_hit, ctx = _pre_call()
                 if ctx is None:
                     return cache_hit
+                self._enter_step(ctx.effective_label)
                 try:
                     for attempt in range(1, attempts_allowed + 1):
                         try:
@@ -1383,6 +1431,7 @@ class Item:
                         return _post_call_success(result, ctx, args, kwargs)
                     raise AssertionError("unreachable: retry loop fell through")
                 finally:
+                    self._leave_step()
                     _ensure_cleanup(ctx)
 
             return async_wrapper
@@ -1392,6 +1441,7 @@ class Item:
             cache_hit, ctx = _pre_call()
             if ctx is None:
                 return cache_hit
+            self._enter_step(ctx.effective_label)
             try:
                 for attempt in range(1, attempts_allowed + 1):
                     try:
@@ -1414,6 +1464,7 @@ class Item:
                     return _post_call_success(result, ctx, args, kwargs)
                 raise AssertionError("unreachable: retry loop fell through")
             finally:
+                self._leave_step()
                 _ensure_cleanup(ctx)
 
         return sync_wrapper

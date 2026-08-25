@@ -3426,6 +3426,7 @@ def _resolve_agent_id(
 @click.option("--agent-id", default=None, help="Agent UUID (escape hatch; wins over positional)")
 @click.option("--name", "agent_name", default=None, help="Agent name (required when file declares multiple @agent functions)")
 @click.option("--item-id", "item_id", default=None, help="Your own name for this piece of work (e.g. DOC-2001#page-73)")
+@click.option("--partition-key", "partition_key", default=None, help="The tenant this work belongs to (e.g. northwind-mutual)")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -3436,6 +3437,7 @@ def run(
     agent_id: str | None,
     agent_name: str | None,
     item_id: str | None,
+    partition_key: str | None,
 ) -> None:
     """Trigger a run on the deployed agent.
 
@@ -3444,6 +3446,7 @@ def run(
       papayya run my-agent "hello"                          # slug + input
       papayya run my-agent '{"id": "DOC-2001", "pages": 5}' # JSON object input
       papayya run my-agent '{...}' --item-id DOC-2001       # name the work
+      papayya run my-agent '{...}' --partition-key acme     # name the tenant
       papayya run <uuid> "hello"                            # UUID also works
 
     A JSON object or array is sent as JSON; anything else — including 8173 —
@@ -3529,7 +3532,7 @@ def run(
                 sys.exit(1)
             reg = matches[0]
 
-    _run_cloud(ctx, reg, input_text, resolved_agent_id, item_id)
+    _run_cloud(ctx, reg, input_text, resolved_agent_id, item_id, partition_key)
 
 
 @dataclass(frozen=True)
@@ -3629,6 +3632,7 @@ def _run_cloud(
     input_text: str,
     agent_id: str,
     item_id: str | None = None,
+    partition_key: str | None = None,
 ) -> None:
     """Trigger a run.
 
@@ -3660,6 +3664,7 @@ def _run_cloud(
             max_steps=reg.max_steps,
             budget_cents=budget_cents,
             item_id=item_id,
+            partition_key=partition_key,
         )
         run_id = result["id"]
         click.echo(f"Run triggered: {run_id}")
