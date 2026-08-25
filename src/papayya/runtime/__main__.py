@@ -17,6 +17,7 @@ from .worker import (
     _DEFAULT_DRAIN_TIMEOUT_SECONDS,
     _DEFAULT_HEARTBEAT_INTERVAL,
     _DEFAULT_HTTP_TIMEOUT_SECONDS,
+    _DEFAULT_LEASE_WAIT_SECONDS,
     _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
     _DEFAULT_MAX_RSS_PERCENT_BEFORE_RECYCLE,
     Worker,
@@ -109,6 +110,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "under load; keep it below the 30s lease TTL. Falls back to "
             "PAPAYYA_HTTP_TIMEOUT_SECONDS env var (default: "
             f"{_DEFAULT_HTTP_TIMEOUT_SECONDS}). Plan 48 W1."
+        ),
+    )
+    p.add_argument(
+        "--lease-wait-seconds",
+        type=float,
+        default=float(
+            os.environ.get("PAPAYYA_LEASE_WAIT_SECONDS")
+            or _DEFAULT_LEASE_WAIT_SECONDS
+        ),
+        help=(
+            "Seconds to ask the dispatcher to HOLD an empty lease poll open "
+            "before it answers 'no work' (plan 65 L1). This is what stops an "
+            "idle worker issuing ~18 lease queries a second; work still "
+            "dispatches immediately because the server is woken by a Postgres "
+            "notification, not by this timer. Clamped to the server's 25s "
+            "ceiling. 0 restores the old immediate-204 hot poll. Also the "
+            "worst-case delay between SIGTERM and an idle worker exiting. "
+            "Falls back to PAPAYYA_LEASE_WAIT_SECONDS env var (default: "
+            f"{_DEFAULT_LEASE_WAIT_SECONDS})."
         ),
     )
     p.add_argument(
@@ -386,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_interval_seconds=args.heartbeat_interval_seconds,
         drain_timeout_seconds=args.drain_timeout_seconds,
         http_timeout_seconds=args.http_timeout_seconds,
+        lease_wait_seconds=args.lease_wait_seconds,
         executor_reuse=args.executor_reuse,
         executor_fallback=args.executor_fallback,
         api_key=api_key,

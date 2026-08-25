@@ -83,6 +83,31 @@ _DEFAULT_DRAIN_TIMEOUT_SECONDS = 30.0
 # so a single stalled call cannot outlive the lease it is about.
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 
+# Seconds the dispatcher is asked to HOLD an empty lease poll open (plan 65 L1).
+#
+# Before this, an empty queue answered instantly and the worker slept 50ms, so
+# one idle worker issued ~18 lease requests a second forever — each one a
+# write-path transaction against runtime_pending. Measured on an idle local
+# stack: `polls=1065 granted=0` in a 60s window, from a single worker.
+#
+# With a wait, the server blocks until work arrives (delivered by a Postgres
+# NOTIFY, so latency is unchanged) or the wait elapses. 20s puts an idle worker
+# at ~3 requests a minute.
+#
+# WHY NOT LONGER. The server caps it at 25s because its own write timeout and
+# request-timeout middleware are both 30s. And this is the worst-case delay
+# between SIGTERM and an IDLE worker exiting, because that is where it is
+# blocked when the signal lands — 20s sits inside the 30s drain window.
+#
+# Set to 0 to restore the old hot-poll behaviour; the server treats an absent
+# or zero `wait` as the pre-L1 contract and answers immediately.
+_DEFAULT_LEASE_WAIT_SECONDS = 20.0
+
+# The server's own ceiling (dispatcher.MaxLeaseWait). Clamped rather than
+# rejected on both sides, so a mismatched pair degrades to the smaller value
+# instead of failing every poll.
+_MAX_LEASE_WAIT_SECONDS = 25.0
+
 
 # Bundle downloads get their own, longer budget: this one transfers a
 # tarball rather than a small JSON body, so it is sized for bytes on the
@@ -550,8 +575,12 @@ class Worker:
         agent_module_path: Path to the customer's ``.py`` file containing
             ``@agent``-decorated function(s). Imported once on construction.
         worker_id: Stable id for this worker (defaults to a random short id).
-        poll_idle_seconds: Sleep between empty-lease polls. Keep small for
-            responsive iteration loop; tune in Phase 2 from real load data.
+        poll_idle_seconds: Sleep between empty-lease polls. Only paid when
+            the dispatcher answers an empty poll IMMEDIATELY — i.e. against a
+            server that does not honour ``lease_wait_seconds``.
+        lease_wait_seconds: Seconds to ask the dispatcher to hold an empty
+            lease poll open before answering 204 (plan 65 L1). 0 disables,
+            restoring the pre-L1 hot poll.
     """
 
     _idle_log_interval = 30.0
@@ -567,6 +596,7 @@ class Worker:
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
         http_timeout_seconds: float = _DEFAULT_HTTP_TIMEOUT_SECONDS,
+        lease_wait_seconds: float = _DEFAULT_LEASE_WAIT_SECONDS,
         api_key: Optional[str] = None,
         bundle_url_base: Optional[str] = None,
         max_items_before_recycle: int = _DEFAULT_MAX_ITEMS_BEFORE_RECYCLE,
@@ -582,6 +612,14 @@ class Worker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.drain_timeout_seconds = drain_timeout_seconds
         self.http_timeout_seconds = http_timeout_seconds
+        self.lease_wait_seconds = max(
+            0.0, min(float(lease_wait_seconds), _MAX_LEASE_WAIT_SECONDS)
+        )
+        # How long the last lease poll actually took. Read by
+        # _idle_sleep_seconds to tell a server that HELD the poll from one that
+        # ignored ?wait= and answered instantly — which is what keeps this
+        # worker from hot-spinning against an older control plane.
+        self._last_poll_seconds = 0.0
         self._bundle_timeout_seconds = max(
             _DEFAULT_BUNDLE_TIMEOUT_SECONDS, http_timeout_seconds
         )
@@ -1431,7 +1469,7 @@ class Worker:
                         log.info("dispatcher reachable again; resuming normal poll cadence")
                     self._reconnect_backoff.on_success()
                     self._maybe_log_idle()
-                    time.sleep(self.poll_idle_seconds)
+                    time.sleep(self._idle_sleep_seconds())
                     continue
                 # UNREACHABLE — connection refused or timeout.
                 was_healthy = self._reconnect_backoff.current == 0.0
@@ -1458,6 +1496,34 @@ class Worker:
             # worker that is accountable for it, and on ECS it would sit
             # inside the stop_timeout window doing nothing.
             self._close_executor()
+
+    def _idle_sleep_seconds(self) -> float:
+        """How long to sleep after an empty poll.
+
+        THE SLEEP AND THE SERVER-SIDE WAIT ARE THE SAME BUDGET, PAID ONCE. When
+        the dispatcher honours ``wait`` it has already blocked for us, so
+        sleeping again on top of it would just add dispatch latency to work
+        that has been sitting in the queue.
+
+        The check is on ELAPSED TIME, not on a version handshake, and that is
+        deliberate: an older control plane — or a proxy that strips the query
+        string, or a deployment where the parameter is clamped to zero —
+        ignores ``wait`` and answers instantly. Negotiating a capability would
+        leave the failure mode of a worker spinning at 100% CPU against a
+        server that agreed and then didn't. Measuring what actually happened
+        cannot be lied to: if the poll came back fast, we pace it ourselves.
+
+        Half the requested wait is the threshold because the server may hold
+        for less than we asked (it clamps at 25s) and a real grant-adjacent
+        poll may return early — but nothing that genuinely blocked comes back
+        in under half.
+        """
+        if (
+            self.lease_wait_seconds > 0
+            and self._last_poll_seconds >= self.lease_wait_seconds / 2
+        ):
+            return 0.0
+        return self.poll_idle_seconds
 
     def _maybe_log_idle(self) -> None:
         now = time.monotonic()
@@ -1530,20 +1596,35 @@ class Worker:
         seconds. ``URLError`` and ``TimeoutError`` are both ``OSError``, so
         one clause covers the request phase and the response phase alike.
         """
+        wait = self.lease_wait_seconds
         url = f"{self.dispatcher_url}/lease?worker_id={self.worker_id}"
+        if wait > 0:
+            url += f"&wait={wait:g}"
         req = urllib_request.Request(url, headers=self._auth_headers())
+        # The lease call is the ONE request that is allowed to outlive
+        # http_timeout_seconds, and it is safe precisely because it holds
+        # nothing: no lease, no checkpoint, no run token. The timeout that
+        # matters for those is unchanged. Here the budget is the wait we asked
+        # for plus the normal per-request budget for the round trip around it —
+        # so a server that holds the full wait is not mistaken for a dead one.
+        timeout = self.http_timeout_seconds + wait
+        started = time.monotonic()
         try:
-            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds) as resp:
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 204:
+                    self._last_poll_seconds = time.monotonic() - started
                     return (_PollOutcome.IDLE, None)
                 if resp.status != 200:
                     log.warning("unexpected lease status: %s", resp.status)
+                    self._last_poll_seconds = time.monotonic() - started
                     return (_PollOutcome.IDLE, None)
                 body = json.loads(resp.read().decode("utf-8"))
         except OSError as exc:
             log.debug("lease poll failed: %s", exc)
+            self._last_poll_seconds = time.monotonic() - started
             return (_PollOutcome.UNREACHABLE, None)
 
+        self._last_poll_seconds = time.monotonic() - started
         return (_PollOutcome.LEASED, Lease(
             lease_id=body["lease_id"],
             agent=body["agent"],

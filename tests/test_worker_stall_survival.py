@@ -185,7 +185,7 @@ def test_run_loop_backs_off_through_a_stall_instead_of_exiting(monkeypatch):
 def test_default_request_budget_is_ten_seconds(monkeypatch):
     """2s was not a budget a busy control plane could be held to."""
     assert _DEFAULT_HTTP_TIMEOUT_SECONDS == 10.0
-    w = _make_worker()
+    w = _make_worker(lease_wait_seconds=0)
     stall = _Stall()
     monkeypatch.setattr(worker_mod.urllib_request, "urlopen", stall)
 
@@ -195,7 +195,7 @@ def test_default_request_budget_is_ten_seconds(monkeypatch):
 
 
 def test_request_budget_is_configurable(monkeypatch):
-    w = _make_worker(http_timeout_seconds=25.0)
+    w = _make_worker(http_timeout_seconds=25.0, lease_wait_seconds=0)
     stall = _Stall()
     monkeypatch.setattr(worker_mod.urllib_request, "urlopen", stall)
 
@@ -203,6 +203,32 @@ def test_request_budget_is_configurable(monkeypatch):
     w._mark_run_running("run-1")
 
     assert stall.calls == [25.0, 25.0]
+
+
+def test_lease_budget_is_the_request_budget_plus_the_wait_it_asked_for(
+    monkeypatch,
+):
+    """The ONE exception to the budget above, added by plan 65 L1.
+
+    A long-polling lease is supposed to be slow: the server holds it open for
+    up to `lease_wait_seconds` precisely so an idle worker stops asking ~18
+    times a second. Timing it out at the ordinary per-request budget would
+    abort every poll at 10s and reintroduce the hot loop through the reconnect
+    path, which is a worse version of the problem this was meant to fix.
+
+    Plan 48 W1's actual property is preserved and is the second assertion: the
+    lease call holds NOTHING — no lease, no checkpoint, no run token — so a
+    longer budget here cannot strand work. Every call that does hold something
+    is still on the unchanged 10s.
+    """
+    w = _make_worker(lease_wait_seconds=20.0)
+    stall = _Stall()
+    monkeypatch.setattr(worker_mod.urllib_request, "urlopen", stall)
+
+    w._poll_lease()
+    w._mark_run_running("run-1")
+
+    assert stall.calls == [30.0, 10.0]
 
 
 def test_bundle_budget_is_a_floor_not_an_override():
