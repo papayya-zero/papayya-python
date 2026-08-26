@@ -35,6 +35,7 @@ import inspect
 import json
 import logging
 import os
+import platform
 import select
 import signal
 import subprocess
@@ -82,6 +83,14 @@ _DEFAULT_DRAIN_TIMEOUT_SECONDS = 30.0
 # sleeping does the same thing. 10s is comfortably under the 30s lease TTL
 # so a single stalled call cannot outlive the lease it is about.
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
+
+# How long a canary import may take before it is called a failure (plan 69 P1).
+#
+# Generous on purpose. A cold bundle pulls its provider SDK into the import
+# graph and 30s is comfortable for that on a busy worker. It is also a real
+# finding when exceeded: module-level code runs on EVERY worker that loads the
+# agent, so an import slow enough to trip this is slow on every lease too.
+_DEFAULT_CANARY_TIMEOUT_SECONDS = 60.0
 
 # Seconds the dispatcher is asked to HOLD an empty lease poll open (plan 65 L1).
 #
@@ -484,6 +493,58 @@ class _ExecutorDied(RuntimeError):
     """The child went away mid-item, or never started."""
 
 
+# --------------------------------------------------------------------------- #
+#  The canary import (plan 69 P1).
+#
+#  `papayya deploy` used to decide whether a bundle could run on the managed
+#  pool by reading the process the CLI was running in — the customer's machine.
+#  Walk 4 of papayya-examples/tests measured three ways for the two
+#  interpreters to disagree, and in two of them the deploy said "Deployed ->",
+#  exited 0, and the run failed on item 1 blamed on the customer's code.
+#
+#  So the pool answers instead. A worker fetches the bundle, imports it, and
+#  reports; the deployment does not reach `ready` until one has. That covers
+#  every way to be unimportable, including the ones nobody has enumerated,
+#  because it is the pool doing the thing.
+# --------------------------------------------------------------------------- #
+
+# Run in a CHILD, never in the worker. This is code we have positive reason to
+# think is broken — that is the entire point of asking — and an import that
+# hangs, segfaults or calls sys.exit() in the supervisor would take down a pool
+# that serves every account. Plan 61 U1 split execution into a child for this
+# reason; the canary is the same argument at deploy time.
+#
+# `import_bundle_module` rather than a bare `import`: the real import path
+# registers the bundle root with the meta-path finder and names the module by
+# account and version. Verifying with a DIFFERENT import than the one the lease
+# will use would be another proxy, and proxies are what this plan is about.
+_CANARY_CHILD_SRC = r"""
+import json, platform, sys, traceback
+from pathlib import Path
+
+job = json.loads(sys.stdin.read())
+out = {"ok": False, "error": "", "python_version": platform.python_version()}
+try:
+    from papayya.runtime.worker import import_bundle_module
+    import_bundle_module(
+        bundle_path=Path(job["bundle_path"]),
+        entrypoint=job["entrypoint"],
+        agent_name=job["agent"],
+        agent_version=job["version"],
+        account_scope=job["account_scope"],
+    )
+    out["ok"] = True
+except BaseException as exc:  # noqa: BLE001 — SystemExit at import counts too
+    # The exception VERBATIM. A customer needs the SyntaxError with its line
+    # number and the ModuleNotFoundError with its module name; a paraphrase
+    # would cost exactly the diagnosis this exists to deliver.
+    out["error"] = "".join(
+        traceback.format_exception_only(type(exc), exc)
+    ).strip()
+sys.stdout.write("__PAPAYYA_CANARY__" + json.dumps(out))
+"""
+
+
 class _ExecutorHandle:
     """One live executor child, pinned to one (account, agent, version).
 
@@ -596,6 +657,7 @@ class Worker:
         heartbeat_interval_seconds: float = _DEFAULT_HEARTBEAT_INTERVAL,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
         http_timeout_seconds: float = _DEFAULT_HTTP_TIMEOUT_SECONDS,
+        canary_timeout_seconds: float = _DEFAULT_CANARY_TIMEOUT_SECONDS,
         lease_wait_seconds: float = _DEFAULT_LEASE_WAIT_SECONDS,
         api_key: Optional[str] = None,
         bundle_url_base: Optional[str] = None,
@@ -612,6 +674,7 @@ class Worker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.drain_timeout_seconds = drain_timeout_seconds
         self.http_timeout_seconds = http_timeout_seconds
+        self.canary_timeout_seconds = canary_timeout_seconds
         self.lease_wait_seconds = max(
             0.0, min(float(lease_wait_seconds), _MAX_LEASE_WAIT_SECONDS)
         )
@@ -1440,6 +1503,20 @@ class Worker:
 
         try:
             while self._running:
+                # Before the item poll, not after: a deploy is waiting on this
+                # answer with a customer watching a spinner, and an item lease
+                # can hold this thread for the length of a whole run.
+                canary = self._poll_canary()
+                if canary is not None:
+                    try:
+                        self._handle_canary(canary)
+                    except Exception:  # noqa: BLE001 — one deploy, not the pool
+                        log.error("worker %s: unhandled error on canary %s",
+                                  self.worker_id,
+                                  canary.get("deployment_id", "?")[:8],
+                                  exc_info=True)
+                    continue
+
                 outcome, lease = self._poll_lease()
                 if outcome == _PollOutcome.LEASED:
                     if self._reconnect_backoff.current > 0.0:
@@ -1496,6 +1573,132 @@ class Worker:
             # worker that is accountable for it, and on ECS it would sit
             # inside the stop_timeout window doing nothing.
             self._close_executor()
+
+
+    # ── the canary import (plan 69 P1) ──────────────────────────────────── #
+
+    def _poll_canary(self) -> dict | None:
+        """Ask whether any deployment is waiting to be import-checked.
+
+        Called before each lease poll. 204 is the common case and costs one
+        cheap query — deploys are rare and item leases are not, which is also
+        why the canary is its own endpoint rather than a branch inside
+        ``attemptLease``.
+
+        Never raises. A dispatcher that cannot answer this must not disturb
+        the item loop, which has its own backoff and is the thing that
+        actually matters.
+        """
+        url = f"{self.dispatcher_url}/canary?worker_id={self.worker_id}"
+        req = urllib_request.Request(url, headers=self._auth_headers())
+        try:
+            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds) as resp:
+                if resp.status != 200:
+                    return None
+                return json.loads(resp.read().decode("utf-8"))
+        except OSError as exc:
+            log.debug("canary poll failed: %s", exc)
+            return None
+        except (ValueError, KeyError) as exc:
+            log.debug("canary poll returned something unreadable: %s", exc)
+            return None
+
+    def _report_canary(self, deployment_id: str, verdict: dict) -> None:
+        url = f"{self.dispatcher_url}/canary/{deployment_id}"
+        body = json.dumps(verdict).encode("utf-8")
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        req = urllib_request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib_request.urlopen(req, timeout=self.http_timeout_seconds):
+                pass
+        except OSError as exc:
+            # The claim goes stale and another worker picks it up. Losing a
+            # verdict costs a re-import; failing the deploy over a transient
+            # network blip would be worse than the bug P1 closes.
+            log.warning("could not report canary verdict for %s: %s",
+                        deployment_id[:8], exc)
+
+    def _handle_canary(self, canary: dict) -> None:
+        """Fetch a deployment's bundle, import it in a child, report."""
+        deployment_id = canary["deployment_id"]
+        agent = canary["agent"]
+        version = canary["version"]
+        account_id = canary.get("account_id")
+        project_id = canary.get("project_id")
+        short = deployment_id[:8]
+
+        verdict = {"ok": False, "error": "", "python_version": platform.python_version()}
+        try:
+            from papayya.runtime import _bundle_cache
+
+            version_int = self._parse_version(version)
+            bundle = _bundle_cache.ensure_bundle(
+                account_id=account_id or _bundle_cache.LOCAL_SCOPE,
+                agent_slug=agent,
+                version=version_int,
+                fetch=lambda: self._fetch_bundle(
+                    agent, version_int, account_id=account_id,
+                    project_id=project_id),
+            )
+            entrypoint = canary.get("entrypoint") or getattr(
+                bundle, "entrypoint", None) or "agent.py"
+
+            job = {
+                "bundle_path": str(bundle.path),
+                "entrypoint": entrypoint,
+                "agent": agent,
+                "version": version,
+                "account_scope": account_id or _bundle_cache.LOCAL_SCOPE,
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", _CANARY_CHILD_SRC],
+                input=json.dumps(job), capture_output=True, text=True,
+                timeout=self.canary_timeout_seconds,
+                # The child gets the platform's own environment and NOT the
+                # customer's project secrets. An import must not need them —
+                # that is C2's whole subject — and handing them to a bundle we
+                # have not verified would give unverified code a credential.
+                env=self._canary_child_environment(),
+            )
+            marker = "__PAPAYYA_CANARY__"
+            if marker in proc.stdout:
+                verdict = json.loads(proc.stdout.rsplit(marker, 1)[1])
+            else:
+                # The child died without answering: a segfault, an OOM kill, a
+                # C-level abort. Report it as the bundle's failure, because it
+                # is — but say what we actually observed rather than inventing
+                # an exception the customer never raised.
+                tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+                verdict["error"] = (
+                    f"the import did not survive: the interpreter exited "
+                    f"{proc.returncode} without completing it"
+                    + (f"\n{tail}" if tail else "")
+                )
+        except subprocess.TimeoutExpired:
+            verdict["error"] = (
+                f"importing this bundle did not finish within "
+                f"{self.canary_timeout_seconds:.0f}s. Module-level code runs on "
+                f"every worker that loads your agent — move slow work inside "
+                f"the function."
+            )
+        except _VersionNotFound as exc:
+            verdict["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — one deployment, not the pool
+            # Our failure, not theirs. Leave the claim to go stale so another
+            # worker retries rather than recording a verdict we did not earn.
+            log.warning("canary %s: could not be checked: %s", short, exc)
+            return
+
+        log.info("canary %s: %s (%s@%s)", short,
+                 "ok" if verdict["ok"] else "FAILED", agent, version)
+        self._report_canary(deployment_id, verdict)
+
+    def _canary_child_environment(self) -> dict:
+        """The platform's own environment, with no customer secrets in it."""
+        env = dict(os.environ)
+        for name in ("PAPAYYA_RUN_TOKEN",):
+            env.pop(name, None)
+        return env
 
     def _idle_sleep_seconds(self) -> float:
         """How long to sleep after an empty poll.

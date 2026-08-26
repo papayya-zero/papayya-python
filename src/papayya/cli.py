@@ -8,6 +8,8 @@ import os
 import re
 import sys
 import time
+import contextlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -29,6 +31,52 @@ from papayya._defaults import DEFAULT_BASE_URL, DEFAULT_DASHBOARD_URL
 from papayya.api import APIClient, APIConfig, PapayyaAPIError, resolve_config
 
 
+@contextmanager
+def _project_on_syspath(filepath: Path) -> "Iterator[None]":
+    """Make the entrypoint's own directory importable, the way running it does.
+
+    Plan 69 P2. ``python agent.py`` puts the script's directory on
+    ``sys.path[0]``; ``spec_from_file_location`` + ``exec_module`` does not.
+    So a project of more than one file ran locally and could not be deployed::
+
+        $ python agent.py          # from helpers import shout — fine
+        $ papayya deploy           # ModuleNotFoundError: No module named 'helpers'
+
+    ...and the error named the helper rather than the cause. The worker never
+    had this problem: ``runtime/_bundle_loader`` resolves bundle-local imports
+    through a meta-path finder, so the pool could run precisely the bundles
+    this refused to upload.
+
+    The worker uses a finder rather than ``sys.path`` because it holds two
+    versions of the same slug resident at once and their ``helpers.py`` files
+    would collide in ``sys.modules`` (see that module's docstring). The CLI
+    loads one bundle in a short-lived process, so plain ``sys.path`` is both
+    sufficient and exactly what the customer's own interpreter does.
+
+    Cleans up on the way out: ``sys.path`` is restored, and any module that
+    resolved *out of this directory* is dropped from ``sys.modules`` so a
+    second discovery pass in the same process cannot bind a stale ``helpers``.
+    """
+    project_dir = str(filepath.parent)
+    before = set(sys.modules)
+    sys.path.insert(0, project_dir)
+    try:
+        yield
+    finally:
+        try:
+            sys.path.remove(project_dir)
+        except ValueError:  # something else already removed it
+            pass
+        for name in set(sys.modules) - before:
+            module = sys.modules.get(name)
+            origin = getattr(module, "__file__", None) or ""
+            # Only the bundle's own modules. A third-party package imported
+            # for the first time during this exec is left alone — dropping it
+            # would re-execute it on the next import for no reason.
+            if origin.startswith(project_dir + os.sep):
+                sys.modules.pop(name, None)
+
+
 def _load_agent_from_file(path: str) -> Any:
     """Import a Python file and return the `agent` variable (legacy)."""
     filepath = Path(path).resolve()
@@ -42,7 +90,8 @@ def _load_agent_from_file(path: str) -> Any:
         sys.exit(1)
 
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with _project_on_syspath(filepath):
+        spec.loader.exec_module(mod)
 
     agent = getattr(mod, "agent", None)
     if agent is None:
@@ -50,6 +99,49 @@ def _load_agent_from_file(path: str) -> Any:
         sys.exit(1)
 
     return agent
+
+
+_SECRET_LOOKING = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_URL", "_DSN")
+
+
+def _explain_import_failure(exc: BaseException, path: Path) -> None:
+    """Turn a bare import-time exception into the sentence that fixes it.
+
+    Plan 69 C2. Reading a secret at module level reads an environment that does
+    not have it yet: the worker imports your bundle, and the lease that carries
+    your project's secrets arrives after. Deploy already refused this — with::
+
+        Error: KeyError: 'OPENAI_API_KEY'
+          Run with PAPAYYA_DEBUG=1 for a full traceback.
+
+    ...which is true, unhelpful, and connects to nothing. The name is right
+    there in the exception and the feature that fixes it is one command away,
+    so say both.
+
+    Only fires for a name that LOOKS like a credential. A genuine `KeyError`
+    on a dict in module-level code is a different bug and must not be dressed
+    up as this one.
+    """
+    if not isinstance(exc, KeyError) or not exc.args:
+        return
+    name = str(exc.args[0])
+    if not (name.isupper() and any(name.endswith(sfx) for sfx in _SECRET_LOOKING)):
+        return
+    click.echo("", err=True)
+    click.echo(
+        f"Error: {path.name} reads {name} when it is IMPORTED, and project "
+        f"secrets are\n"
+        f"       injected when your agent is leased — so it is not set yet at "
+        f"import time.\n\n"
+        f"  Move the read inside your function, or into a helper it calls:\n\n"
+        f"      def _client():\n"
+        f"          return OpenAI(api_key=os.environ[{name!r}])\n\n"
+        f"  The value is not missing if you have set it — check with "
+        f"`papayya secrets list`.\n"
+        f"  Only the timing is wrong.",
+        err=True,
+    )
+    sys.exit(1)
 
 
 def _discover_agents(path: str) -> list:
@@ -74,7 +166,12 @@ def _discover_agents(path: str) -> list:
         sys.exit(1)
 
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with _project_on_syspath(filepath):
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as exc:  # noqa: BLE001 — re-raised unless recognised
+            _explain_import_failure(exc, filepath)
+            raise
 
     agents = list(get_registry().values())
 
@@ -187,40 +284,94 @@ def _project_id_from_api_key(api_key: str | None, base_url: str) -> str | None:
 
 
 _DEPLOY_POLL_SECONDS = 1
-_DEPLOY_TIMEOUT_SECONDS = 60
+# Long enough to out-wait a canary reclaim (dispatcher canaryStaleAfter=20s)
+# plus a cold bundle fetch and import, so a worker that dies mid-import costs
+# one retry rather than a failed deploy for a bundle that is fine.
+_DEPLOY_TIMEOUT_SECONDS = 120
 
 
 def _await_ready(api: APIClient, deployment_id: str) -> tuple[str, str]:
-    """Read a deployment's terminal state. Returns ``(state, detail)``.
+    """Wait until the pool has imported this bundle. Returns ``(state, detail)``.
 
-    A deployment is terminal the moment the row exists: the server writes
-    ``ready`` at creation, after the artifact upload has already returned, and
-    ``ready`` now means "the bundle endpoint can serve this version" — which is
-    the only property the worker actually tests at lease time.
+    THE STATE THIS WAITS FOR IS THE WHOLE POINT (plan 69 P1). It used to return
+    the instant the row existed, because the server wrote ``ready`` at creation
+    and ``ready`` meant "the bundle endpoint can serve this version" — true,
+    and not the question a customer is asking. A file with 3.13 syntax and a
+    file importing a stdlib module 3.12 removed both got ``Deployed →`` and
+    exit 0 here, then failed on item 1 blamed on the customer's code.
 
-    This was ``_await_build``, polling every 3s for up to 15 minutes while an
-    async ``docker build`` ran server-side. That build's base image had been
-    deleted on purpose, so it always failed, every row said ``failed``, and
-    deploy exited 1 saying "was NOT deployed" about a bundle that was live
-    (plan 48 W2). Plan 49 deleted the build.
+    Now the server writes ``verifying`` and a worker actually imports the
+    bundle before it becomes ``ready``. So this loop waits on the pool rather
+    than on a write we already knew had happened.
 
-    The loop is kept, short, because ``failed`` is still a legal value on rows
-    written before that change, and a first read can still race a slow write.
+    ``ready_unverified`` is a SUCCESS. It means nobody picked the canary up —
+    an empty pool, every worker busy — which is our problem and not the
+    bundle's. Blocking a deploy on that would be worse than the bug P1 closes.
+
+    Before that this was ``_await_build``, polling for 15 minutes while an
+    async ``docker build`` ran against a base image that had been deleted on
+    purpose, so every row said ``failed`` and deploy exited 1 about a bundle
+    that was live (plan 48 W2). Plan 49 deleted the build.
     """
     deadline = time.monotonic() + _DEPLOY_TIMEOUT_SECONDS
+    announced = False
     while True:
         status = api.get_deployment(deployment_id)
         state = status.get("status", "unknown")
         if state == "ready":
-            return "ready", f"v{status.get('version', '?')}"
+            detail = f"v{status.get('version', '?')}"
+            pool_python = status.get("pool_python_version")
+            build_python = status.get("build_python_version")
+            if pool_python:
+                detail += f", imported on Python {pool_python}"
+                # Plan 69 P4: say it when they differ, and only then. A
+                # mismatch is usually fine — 3.10 code on a 3.12 pool is the
+                # normal case — so this is a note, never a warning.
+                if build_python and _minor(build_python) != _minor(pool_python):
+                    detail += f" (you built on {build_python})"
+            return "ready", detail
+        if state == "ready_unverified":
+            return "ready_unverified", (
+                "no worker was free to import it, so nothing has confirmed it "
+                "loads on the pool"
+            )
         if state == "failed":
-            return "failed", status.get("error_message", "unknown error")
+            detail = status.get("error_message", "unknown error")
+            # Name BOTH interpreters when they differ (plan 69 P3/P4). The
+            # canary reports the pool's version on every verdict, including
+            # this one, so the message can say why the customer's machine
+            # disagreed instead of leaving them to guess. This is the whole
+            # diagnosis for the two failures walk 4 found:
+            #
+            #   SyntaxError: expected '(' (agent.py, line 4)
+            #     the pool imports on Python 3.12.14; you built on 3.13.5.
+            #
+            # Without the second line that reads as "your file is broken",
+            # which is what the run record used to say, and it is wrong.
+            pool_python = status.get("pool_python_version")
+            build_python = status.get("build_python_version")
+            if pool_python:
+                note = f"the pool imports on Python {pool_python}"
+                if build_python and _minor(build_python) != _minor(pool_python):
+                    note += f"; you built on {build_python}"
+                detail = f"{detail}\n  {note}."
+            return "failed", detail
+        if state == "verifying" and not announced:
+            # One line, once. The wait is usually short and a spinner that
+            # explains itself beats a spinner that does not.
+            click.echo("  Waiting for a worker to import it...")
+            announced = True
         if time.monotonic() >= deadline:
             return "timed out", (
                 f"still {state!r} after {_DEPLOY_TIMEOUT_SECONDS}s — "
                 f"deployment {deployment_id}"
             )
         time.sleep(_DEPLOY_POLL_SECONDS)
+
+
+def _minor(version: str) -> str:
+    """``3.12.14`` → ``3.12``. Patch differences are never worth a sentence."""
+    return ".".join(version.split(".")[:2])
 
 
 def _preflight_dependencies(project_dir: str) -> None:
@@ -964,7 +1115,11 @@ def deploy(
             click.echo(f"  Version: {result.get('version', '?')}")
 
             state, detail = _await_ready(api, deployment_id)
-            if state != "ready":
+            if state == "ready_unverified":
+                # Deployed, and honest that nothing checked it. Never block on
+                # our own failure — an empty pool is not the bundle's fault.
+                click.echo(f"  Warning: {detail}", err=True)
+            elif state != "ready":
                 # NOT deployed: skip the success line and keep it out of
                 # `deployed`, so nothing downstream treats it as live.
                 click.echo(f"  Deployment {state}: {detail}", err=True)
@@ -973,7 +1128,8 @@ def deploy(
 
             slug = reg.name.lower().replace(" ", "-")
             deployed[slug] = resolved_agent_id
-            click.echo(f"  Deployed {slug} → {resolved_agent_id}")
+            suffix = f"  ({detail})" if state == "ready" and "," in detail else ""
+            click.echo(f"  Deployed {slug} → {resolved_agent_id}{suffix}")
 
         # Stop here, BEFORE reconciling triggers. A failed build used to fall
         # through to the success line, the "Next: papayya run ..." nudge and
@@ -985,8 +1141,13 @@ def deploy(
             click.echo("", err=True)
             for name, why in failed_deploys:
                 # First line only. The full detail already went out above;
-                # repeating it whole buries the one sentence that matters.
-                headline = why.strip().splitlines()[0] if why.strip() else "unknown error"
+                # repeating it whole buries the one sentence that matters —
+                # EXCEPT the interpreter note (plan 69 P3), which is the second
+                # line and is the entire diagnosis when the two Pythons differ.
+                lines = why.strip().splitlines() if why.strip() else []
+                headline = lines[0] if lines else "unknown error"
+                if len(lines) > 1 and "Python" in lines[1]:
+                    headline += f" — {lines[1].strip()}"
                 click.echo(f"Error: {name} was NOT deployed — {headline}", err=True)
             sys.exit(1)
 
@@ -1922,9 +2083,26 @@ def verify_cmd(
     )
 
     try:
-        summary = run_verify(
-            fixtures_path, agent_module=agent_module, strict=strict
-        )
+        if as_json:
+            # THE REPORT AND THE CODE SHARE A STDOUT (plan 69 T2). verify runs
+            # the customer's function in THIS process, and a function that
+            # prints — papayya-examples/document-processing prints one line per
+            # page on purpose, because that print IS the downstream write —
+            # interleaves with the report. `papayya verify --json | jq` then
+            # reads log lines and dies.
+            #
+            # Their output is not suppressed, only moved: it still reaches the
+            # terminal on stderr, where a pipe does not see it. A command that
+            # says --json has promised stdout is JSON, and that promise is
+            # worth more than the stream their print happened to pick.
+            with contextlib.redirect_stdout(sys.stderr):
+                summary = run_verify(
+                    fixtures_path, agent_module=agent_module, strict=strict
+                )
+        else:
+            summary = run_verify(
+                fixtures_path, agent_module=agent_module, strict=strict
+            )
     except VerifyError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)

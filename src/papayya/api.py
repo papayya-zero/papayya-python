@@ -585,12 +585,21 @@ class APIClient:
         runtime: str = "python",
         entrypoint: str = "agent.py",
     ) -> dict[str, Any]:
-        """Upload a deployment artifact (multipart)."""
+        """Upload a deployment artifact (multipart).
+
+        Sends the interpreter this bundle was built on (plan 69 P4). The server
+        stamps the pool's own version beside it when a worker imports the
+        bundle, so a version skew is diagnosable from the deployment row rather
+        than reconstructed from a support thread. Recorded, never enforced —
+        3.10 code on a 3.12 pool is the normal case and stays allowed.
+        """
         import io
+        import platform
         resp = self._http.post(
             f"/v1/agents/{agent_id}/deploy",
             files={"file": ("artifact.tar.gz", io.BytesIO(tarball), "application/gzip")},
-            data={"runtime": runtime, "entrypoint": entrypoint},
+            data={"runtime": runtime, "entrypoint": entrypoint,
+                  "build_python_version": platform.python_version()},
         )
         if not resp.is_success:
             raise PapayyaAPIError(resp.status_code, resp.text)

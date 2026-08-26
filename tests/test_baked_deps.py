@@ -102,3 +102,97 @@ def test_normalize_follows_pep503():
     # different distribution from `openai` and must not be treated as baked.
     assert normalize("open_ai") == "open-ai"
     assert unsupported_requirements("open_ai") == ["open_ai"]
+
+
+# --------------------------------------------------------------------------- #
+#  Plan 69 P2 — the entrypoint's own directory is importable.
+#
+#  `python agent.py` puts the script's directory on sys.path[0]. The CLI's
+#  loader used spec_from_file_location + exec_module and did not, so a project
+#  of more than one file ran locally and could not be deployed — while the
+#  WORKER resolved it fine through runtime/_bundle_loader's meta-path finder.
+#  The pool could run bundles the CLI refused to upload.
+# --------------------------------------------------------------------------- #
+def _multifile_project(tmp_path):
+    (tmp_path / "helpers.py").write_text(
+        "def shout(x):\n    return {'v': str(x).upper()}\n")
+    (tmp_path / "agent.py").write_text(
+        "from papayya import agent\n"
+        "from helpers import shout\n\n\n"
+        "@agent(name='multifile', model='claude-sonnet-5')\n"
+        "def multifile(run, x):\n"
+        "    return run.step('s', shout, item_id=str(x))(x)\n")
+    return tmp_path / "agent.py"
+
+
+def test_discover_agents_resolves_a_sibling_module(tmp_path):
+    from papayya.cli import _discover_agents
+
+    agents = _discover_agents(str(_multifile_project(tmp_path)))
+    assert [a.name for a in agents] == ["multifile"]
+
+
+def test_discovery_restores_sys_path(tmp_path):
+    import sys
+
+    from papayya.cli import _discover_agents
+
+    before = list(sys.path)
+    _discover_agents(str(_multifile_project(tmp_path)))
+    assert sys.path == before, "the project directory outlived the import"
+
+
+def test_discovery_does_not_leave_a_stale_sibling_in_sys_modules(tmp_path):
+    """Two projects, each with their own `helpers`, discovered in one process.
+
+    Without the sys.modules cleanup the first `helpers` wins forever and the
+    second project silently gets the first one's function — which is plan 47
+    S1's shape, in the CLI instead of the worker.
+    """
+    import sys
+
+    from papayya.cli import _discover_agents
+
+    first = tmp_path / "first"
+    first.mkdir()
+    _discover_agents(str(_multifile_project(first)))
+    assert "helpers" not in sys.modules
+
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / "helpers.py").write_text(
+        "def shout(x):\n    return {'v': 'SECOND'}\n")
+    (second / "agent.py").write_text(
+        "from papayya import agent\n"
+        "from helpers import shout\n\n\n"
+        "@agent(name='second', model='claude-sonnet-5')\n"
+        "def second(run, x):\n"
+        "    return run.step('s', shout, item_id=str(x))(x)\n")
+    _discover_agents(str(second / "agent.py"))
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_probe", second / "helpers.py")
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    assert probe.shout("x") == {"v": "SECOND"}
+
+
+def test_a_third_party_import_is_left_in_sys_modules(tmp_path):
+    """Only the bundle's OWN modules are dropped.
+
+    Evicting an unrelated package that happened to be imported for the first
+    time during the exec would re-execute it on the next import for no reason.
+    """
+    import sys
+
+    from papayya.cli import _discover_agents
+
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from papayya import agent\n\n\n"
+        "@agent(name='usesjson', model='claude-sonnet-5')\n"
+        "def usesjson(run, x):\n"
+        "    return run.step('s', lambda v: {'v': json.dumps(v)}, "
+        "item_id=str(x))(x)\n")
+    _discover_agents(str(tmp_path / "agent.py"))
+    assert "json" in sys.modules
